@@ -1,8 +1,10 @@
 # Watchtower — Design Specification
 
-**Date:** 2026-07-14
-**Status:** Draft for review
+**Date:** 2026-07-14 (v2 — revised after adversarial design review, same day)
+**Status:** Ready for review
 **Context:** Take-home exercise for Polylane (see `INSTRUCTIONS.md`). Build and deploy a working AI agent on Cloudflare Workers that does something genuinely useful for understanding, monitoring, or investigating software infrastructure.
+
+**v2 changelog (from adversarial review — 5 lenses, 47 confirmed findings):** honest detection-latency math with a hard-trip fast path; D1 write budget recomputed with index/delete amplification and volume cut ~10×; explicit Sonnet 5 thinking/effort policy and prompt caching; resume-fidelity persistence design; chat hardened as the primary abuse surface; stuck-investigation watchdog and status lifecycle; fault stacking disabled by design; reset sequencing; seeded first-visit incident; phases reordered so the demo ships before chat.
 
 ---
 
@@ -12,17 +14,17 @@ Watchtower is a **self-demoing production watchdog**. A single Cloudflare Worker
 
 - A simulated multi-service production system ("Acme Shop") emitting realistic, causally-correlated telemetry (traces, logs, metrics, deploy events).
 - A **chaos panel** where a reviewer injects faults with one click.
-- A **watchdog agent** that maintains a statistical memory of "normal," detects drift on its own, opens an investigation, works the problem with real tools (metrics → logs → traces → deploys), and publishes a structured incident report — with the investigation streaming live in the UI.
+- A **watchdog agent** that maintains a statistical memory of "normal," detects drift on its own (typically within ~1–2.5 minutes), opens an investigation, works the problem with real tools (metrics → logs → traces → deploys), and publishes a structured incident report — with the investigation streaming live in the UI.
 - A **chat mode** exposing the same agent core for ad-hoc questions.
 
-The reviewer's instinct to "try to break it" *is* the demo: click "ship a bad deploy," watch the agent notice within a minute, investigate, and explain the causal chain.
+The reviewer's instinct to "try to break it" *is* the demo: click "ship a bad deploy," watch the detector trip, then watch the agent investigate and explain the causal chain.
 
 ## 2. Goals
 
 1. Satisfy every hard requirement: runs on Cloudflare Workers; a real agent loop with tools across multiple steps; usable at a public URL with no login.
 2. Score maximally on the stated rubric: works when poked; strong agent design (tool boundaries, loop control, context management, failure handling); visible judgment; clear code; platform features used only where they earn their place.
 3. Address the explicit hint that "producing realistic telemetry to investigate is part of the exercise, and we will notice if it is done well."
-4. Keep idle cost ≈ $0: detection is statistical; the LLM runs only when something is worth investigating or a user chats.
+4. Keep idle **LLM** cost ≈ $0: detection is statistical; the model runs only when something is worth investigating or a user chats. (D1 background writes are budgeted explicitly in §6 and stay inside the plan's included quota.)
 
 ## 3. Non-goals (deliberate, documented in README)
 
@@ -31,12 +33,14 @@ The reviewer's instinct to "try to break it" *is* the demo: click "ship a bad de
 - Alert delivery (Slack/email/PagerDuty).
 - Multi-tenancy; one shared world per deployment.
 - Cloudflare Workflows. Considered for the investigation loop; rejected in favor of a Durable Object because the loop is short-lived (1–3 min), the DO gives us streaming state persistence for free, and hand-rolled control flow is easier to defend line-by-line in the walkthrough.
+- **Compound-fault handling.** One chaos scenario may be active at a time; other buttons disable while a fault runs (tooltip: "one incident at a time — compound faults are in next steps"). This converts the weakest demo path into a documented scope decision.
+- Free-tier operation. The telemetry volume requires Workers Paid: D1's free tier allows 100k rows written/day and **returns errors on all queries** once the cap is hit — the simulator would exhaust it in under an hour. A `SIM_RATE` knob exists, but free-tier support is explicitly out of scope.
 - Pixel-perfect UI.
 
 ## 4. Constraints
 
-- Cloudflare Workers, paid plan ($5/mo) available; design must degrade gracefully to free-tier limits where trivial.
-- LLM: Anthropic API (`claude-sonnet-5`), key held as a Worker secret. Model ID configurable via env var.
+- Cloudflare Workers, **paid plan** ($5/mo) — required, see §3.
+- LLM: Anthropic API, `claude-sonnet-5` ($3/$15 per MTok; intro $2/$10 through 2026-08-31), key held as a Worker secret, model ID configurable via env var.
 - Roughly one day of focused work; phases ordered so the project is submittable early and each later phase only raises quality.
 - Follow-up interview is a live code walkthrough: every dependency and abstraction must be defensible. Prefer hand-rolled-but-simple over framework magic.
 
@@ -47,16 +51,19 @@ One Worker, one `wrangler deploy`, TypeScript everywhere.
 ```
 ┌─────────────────────────── Cloudflare Worker ────────────────────────────┐
 │  Static assets (React UI, built by Vite)                                 │
-│  API router (Hono)                                                       │
+│  API router (Hono) — run_worker_first: ["/api/*"] so browser-navigated   │
+│  API GETs hit the Worker, not the SPA shell                              │
 │                                                                          │
 │  SimulatorDO ──(alarm ~20s)──► telemetry batches ──► D1 (telemetry)      │
-│      ▲ fault state                                     ▲                 │
-│      │                                                 │ SQL             │
-│  POST /api/chaos/*                                Query layer            │
-│                                                        ▲                 │
-│  Cron (1 min) ──► Detector ──anomaly──► InvestigatorDO (agent loop)      │
-│                   (statistical,           │  Anthropic Messages API      │
-│                    zero LLM cost)         └─► steps + report → D1        │
+│      ▲ owns: fault state, cooldowns, world status,                       │
+│      │       backfill progress (single writer, serialized)               │
+│  POST /api/chaos/* ──► SimulatorDO                                       │
+│                                                                          │
+│  Cron (1 min) ──► detect → baselines → retention (isolated subtasks)     │
+│                     └─anomaly─► InvestigatorDO (agent loop)              │
+│                                  │  Anthropic Messages API               │
+│                                  │  (prompt-cached, adaptive thinking)   │
+│                                  └─► steps → D1; convo state → DO storage│
 │                                                                          │
 │  POST /api/chat (SSE) ────────────────► same agent core, chat persona    │
 └──────────────────────────────────────────────────────────────────────────┘
@@ -66,20 +73,20 @@ One Worker, one `wrangler deploy`, TypeScript everywhere.
 
 | Component | Runs as | Responsibility |
 |---|---|---|
-| Simulator | Durable Object (`SimulatorDO`), sub-minute alarm | Generates each window's telemetry from the service topology + current fault state; owns fault state; backfills history on reset |
-| Telemetry store | D1 | Spans, logs, 1-minute rollups, deploy events, incidents, investigation steps; retention tiers |
+| Simulator | Durable Object (`SimulatorDO`), sub-minute alarm | Generates each window's telemetry from topology + fault state; **sole owner** of fault state, chaos cooldowns, world status (`running`/`seeding`/`resetting`), and backfill; all chaos/restore/reset mutations route through it and serialize |
+| Telemetry store | D1 | Spans, logs, rollups, deploys, incidents, fingerprints, investigation steps; retention tiers |
 | Query layer | Plain TS module over D1 | Typed query functions; the **only** way anything (tools, UI, detector) reads telemetry |
-| Detector | Cron handler (1 min) | Baseline comparison, anomaly detection, dedupe, incident creation, auto-resolve |
-| Investigator | Durable Object (`InvestigatorDO`) | The agent loop; persists every step; enforces budgets; produces the structured report |
-| Chat | Worker request handler (SSE) | Same agent core + tools, conversational persona, client-held history |
+| Detector | Cron handler (1 min) | Three isolated subtasks in order: detection → baseline recompute (every 15 min) → retention sweep (chunked deletes with watermark). Also: stuck-investigation watchdog, auto-resolve |
+| Investigator | Durable Object (`InvestigatorDO`) | The agent loop; persists steps to D1 (UI projection) and raw conversation to DO storage (resume fidelity); enforces budgets |
+| Chat | Worker request handler (SSE) | Same agent core + tools, hardened input handling, conversational persona |
 | UI | Static assets (React + Vite + Tailwind) | Topology/health view, chaos panel, incident feed + live investigation timeline, chat |
 
 ### Why these platform features (and no others)
 
-- **Durable Objects**: the simulator needs a single writer with owned state and a sub-minute timer (cron can't go below 1 min); the investigator needs serialized execution, persisted progress, and alarm-based resumption if evicted mid-investigation. Both are textbook DO fits.
+- **Durable Objects**: the simulator needs a single serialized writer for fault state and a sub-minute timer (cron can't go below 1 min); the investigator needs serialized execution, persisted progress, and alarm-based recovery. Both are textbook DO fits.
 - **Cron trigger**: the detector is a periodic, stateless sweep — exactly what cron is for.
-- **D1**: the agent's tools are fundamentally SQL questions (aggregate this window, find exemplars, search logs). A relational store is the honest fit. KV/R2/Queues/Workflows add nothing here and are deliberately absent.
-- **SSE streaming**: chat tokens stream; investigation timelines poll (2s) because step-granular updates don't benefit from a held connection. Streaming where it matters, polling where it doesn't.
+- **D1**: the agent's tools are fundamentally SQL questions. KV/R2/Queues/Workflows add nothing here and are deliberately absent.
+- **SSE streaming**: chat tokens stream; investigation timelines poll (2s) because step-granular updates don't benefit from a held connection.
 
 ## 6. The demo universe
 
@@ -92,38 +99,46 @@ gateway ──► checkout ──► payments ──► payments-db
    └──► catalog
 ```
 
-Six services. `email-provider` is modeled as an external dependency (no internal spans, only call results). Each service has 2–3 endpoints with distinct latency/error profiles (e.g., `payments.charge`, `payments-db.query`, `gateway GET /api/browse`).
+Six services; `email-provider` is an external dependency (no internal spans, only call results). Each service has 2–3 operations with distinct latency/error profiles.
 
 ### Generation model
 
-- **Traffic**: base rate ~4 req/s at peak with a diurnal curve (0.4–1.0× multiplier by hour) plus small noise. Each simulator tick (~20s) generates that window's requests.
-- **Traces**: each request produces a trace with correct parent/child spans along the dependency graph (trace_id, span_id, parent_span_id, service, operation, start, duration, status).
-- **Latency**: per-(service, operation) log-normal distributions; child durations nest inside parents.
-- **Errors**: per-operation base error rates (~0.1–0.5%); errors propagate up the call chain realistically (a payments-db failure surfaces as a payments 500 and a checkout timeout).
-- **Logs**: request logs plus error logs with realistic, cause-specific messages ("connection pool exhausted: 25/25 in use, acquire timeout 5000ms"), linked to trace/span IDs.
-- **Deploys**: occasional benign deploy events for background realism; fault scenarios emit their own.
-- **Rollups**: the simulator maintains 1-minute rollups (service, operation, minute, count, error_count, p50, p95, p99) at write time — the same pre-aggregation pattern real observability stores use.
+- **Traffic**: ~1.5 req/s at peak with a mild diurnal curve (0.5–1.0× by hour) plus noise → ~95k requests/day. All generated requests feed **rollups** (metrics reflect full traffic); only a subset of raw traces persists (below).
+- **Traces**: correct parent/child spans along the dependency graph; log-normal latencies per (service, operation); child durations nest inside parents; errors propagate up the chain realistically.
+- **Telemetry honesty calibration** (the graders build observability tools — planted confessions would show): error logs are *symptom*-realistic ("connection pool exhausted: 25/25 in use, acquire timeout 5000ms") but never name the root cause; scenario 1's answer requires **correlating the deploy event with the regression onset** across tools, not reading a log. Ambient error noise (~0.2–0.5% baseline) and an occasional benign deploy (a red herring near incident windows) are always present. Scenarios 3 and 4 are log-silent by design.
+- **Deploys**: occasional benign deploy events; fault scenarios emit their own.
+- **Rollups**: 1-minute rollups per (service, operation) computed in-memory from full traffic and written once per minute-close by the simulator — the pre-aggregation pattern real observability stores use.
+
+### Raw persistence (sampled, budget-driven)
+
+- Persist **all error traces** plus a **10% sample** of healthy traces (with their logs). Rollups always reflect 100% of traffic. `find_traces`/`get_trace` operate on persisted traces; sampling is disclosed in the README (it's what real systems do).
+- **D1 write budget** (billable rows = inserts × (1 + indexes) + deletes): spans ~43k/day ×3 (two indexes) + logs ~40k/day ×2 (one index) + rollups ~22k/day ×2 + retention deletes ~250k/day ≈ **~0.5M billable rows/day ≈ 15M/month — ~30% of Workers Paid's included 50M**. Stated here so the number is defensible in the walkthrough.
 
 ### Backfill & retention
 
-- On deploy/reset: backfill **48h of rollups** (~50k rows) plus sampled exemplar traces/logs (every ~10 min) so the watchdog has a learned "normal" from minute one.
-- Retention (enforced by the cron sweep): raw spans/logs **6h**; rollups **72h**; incidents/investigations kept indefinitely.
-- Volume estimate at steady state: ~300–500 spans + ~100 logs per tick → ~1.5–2M raw rows/day written, ~450k live after retention; well inside D1 paid limits, and the write batches are chunked per tick.
+- On deploy/reset: backfill **24h of rollups + sampled exemplars** (~25k rows), **chunked across SimulatorDO alarm ticks** (~4h of history per tick; D1 caps at 100 bound params/statement and 1,000 statements/invocation, so single-shot backfill is not viable). Reset returns immediately; `/api/state` exposes `seeding` progress; the world is live in ~2–3 min.
+- Backfill ends with a **synchronous baseline recompute** — the detector is never armed without baselines.
+- The backfill also **seeds one resolved incident** with a full investigation timeline and report, so a reviewer's first 10 seconds show the end product without waiting for a live cycle.
+- Retention (chunked deletes in the cron sweep, watermark in `meta`, bounded rows per run): raw spans/logs **6h**; rollups **72h**; incidents/investigations kept indefinitely.
 
 ### The honesty boundary
 
-The world is simulated so reviewers get deterministic, causally-rich incidents — but **the agent never knows**. It consumes telemetry exclusively through the query-layer tools, which present the same shape a real backend (Sentry, OTel store) would. Swap the D1-backed query layer for a real connector and the agent is unchanged. Stated plainly in the README.
+The world is simulated so reviewers get deterministic, causally-rich incidents — but **the agent never knows**. It consumes telemetry exclusively through the query-layer tools, which present the same shape a real backend would. Swap the D1-backed query layer for a real connector and the agent is unchanged. Stated plainly in the README.
 
-### Fault scenarios (each a chaos-panel button)
+### Fault scenarios (each a chaos-panel button; one active at a time)
 
 | # | Scenario | Mechanism | What it tests in the agent |
 |---|---|---|---|
-| 1 | **Bad deploy** | Deploy event `payments@v2.4.1`, then payments latency ×6 + pool-exhaustion errors → checkout timeouts → gateway 5xx | Change correlation: tie the regression to the deploy |
-| 2 | **Dependency outage** | `email-provider` goes to 100% errors; notifications degrade; checkout unaffected | Blast-radius scoping: "low customer impact" is the right answer |
-| 3 | **Latency creep** | `payments-db` p95 degrades gradually over ~20 min | Sensitivity vs noise; drift without a sharp edge |
+| 1 | **Bad deploy** | Deploy event `payments@v2.4.1`, then payments latency ×6 + pool-exhaustion errors → checkout timeouts → gateway 5xx | Change correlation across tools (logs name symptoms only) |
+| 2 | **Dependency outage** | `email-provider` → 100% errors; notifications degrade; checkout unaffected | Blast-radius scoping: "low customer impact" is the right answer |
+| 3 | **Latency creep** (labeled "slow burn: ~5 min") | `payments-db` p95 degrades over ~4 min | Drift without a sharp edge |
 | 4 | **Traffic spike** | 5× load on gateway; elevated latency everywhere; no defect | Root cause = load, not a bug |
 
-Plus **Restore world** (clear all fault state; metrics recover; incidents auto-resolve) and **Reset world** (wipe + re-backfill; admin-ish, cooldown-protected). Scenarios may be stacked; faults compose and the agent handles compound incidents as best it can (honest rough edge, noted in README).
+Plus **Restore world** (clears fault state; always allowed; metrics recover; incidents auto-resolve) and **Reset world** (wipe + re-backfill; cooldown-protected). While a scenario is active, other scenario buttons return `409 scenario_active` and render disabled.
+
+### Reset sequencing (the most predictable "break it" move)
+
+Reset executes **inside SimulatorDO** so it serializes with ticks and chaos calls: set status `resetting` → cancel pending alarm → mark any active investigation `failed` ("world reset", partial timeline preserved) → wipe **telemetry tables only** (incidents and investigation steps are kept) → chunked backfill → synchronous baseline recompute → status `running`, alarm re-armed. The detector no-ops unless the world status (fetched from SimulatorDO at sweep start) is `running`. DO input gates do **not** protect across D1/fetch awaits, so the wipe+backfill sequence runs under `blockConcurrencyWhile` for the state transitions and tags chunk writes with a world-generation counter; stale-generation writes are discarded.
 
 ## 7. Data model (D1)
 
@@ -132,41 +147,55 @@ spans(trace_id, span_id, parent_span_id, service, operation, start_ms, duration_
 logs(ts_ms, service, level, message, trace_id?, span_id?)
 rollups(service, operation, minute_ts, count, error_count, p50_ms, p95_ms, p99_ms)
 deploys(id, service, version, ts_ms, note)
-incidents(id, fingerprint, status: open|investigating|resolved|failed, severity,
-          opened_at, resolved_at?, trigger_json, report_json?)
-investigation_steps(incident_id, step_no, kind: thought|tool_call|tool_result|report|error,
+incidents(id, status, severity, opened_at, reported_at?, resolved_at?, trigger_json, report_json?, follow_up_of?)
+incident_fingerprints(incident_id, fingerprint, first_seen_ms, delivered_to_agent)
+investigation_steps(incident_id, step_no, kind: tool_call|tool_result|note|report|error,
                     content_json, ts_ms, tokens_in, tokens_out)
-baselines(service, operation, metric, hour_bucket?, median, mad, computed_at)
-meta(key, value)  -- world state: fault flags, sim cursor, counters
+baselines(service, operation, metric, median, mad, computed_at)
+meta(key, value)   -- retention watermarks, guardrail counters, world generation
 ```
 
-Indexes on `spans(service, start_ms)`, `spans(trace_id)`, `logs(service, ts_ms)`, `rollups(service, operation, minute_ts)`.
+Indexes: `spans(service, start_ms)`, `spans(trace_id)`, `logs(service, ts_ms)`, `rollups(service, operation, minute_ts)`. No third span index — write amplification is budgeted in §6.
+
+- `incidents.severity` is assigned by the **detector at open time** from breach magnitude (`warning` = sustained-rule trip, `critical` = hard-trip or multi-service fingerprints); the agent's report may comment but doesn't change it; the UI displays it.
+- Fingerprints are a **set** per incident via `incident_fingerprints` (scenario 1's cascade produces several at open time).
+- Fault state lives in **SimulatorDO storage only** — `meta` never holds fault flags (single source of truth).
+- Raw conversation state for resume lives in **InvestigatorDO storage**, not D1 (see §9); `investigation_steps` is the human-readable UI projection.
 
 ## 8. Detection: statistics decide *when* to think
 
-- **Baselines**: per (service, operation, metric ∈ {req_rate, error_rate, p95}) — median + MAD over the trailing 48h of rollups, with an hour-of-day adjustment factor for req_rate (traffic is diurnal; latency and error rate are not). Recomputed every 15 min by the cron sweep.
-- **Rules** (evaluated each minute over the last completed minutes):
-  - `error_rate > max(5%, baseline + 6×MAD)` sustained 2 consecutive minutes → anomaly.
-  - `p95 > 2.5 × baseline` sustained 3 consecutive minutes → anomaly.
-  - `req_rate > 4 × hour-adjusted baseline` sustained 2 minutes → anomaly.
-- **Fingerprint & dedupe**: anomaly fingerprint = `(service, metric_class)`. An open incident whose fingerprint set covers the anomaly suppresses re-firing. New fingerprints during an active investigation are appended to the incident's trigger context rather than opening a parallel incident (one world, one storyline at a time — compound faults become one richer investigation).
-- **Auto-resolve**: all fingerprints of an open incident healthy for 5 consecutive minutes → status `resolved`, resolution note appended (no LLM).
-- **Detection latency target**: fault injected → incident opened in **≤ 90s** for scenarios 1, 2, 4 (scenario 3 by design takes as long as the creep takes to cross thresholds).
+- **Baselines**: per (service, operation, metric ∈ {req_rate, error_rate, p95}) — median + MAD over the trailing 24h of rollups. No hour-of-day adjustment (the diurnal curve is mild; multiplicative thresholds absorb it — a deliberate simplification, noted in the README). Recomputed every 15 min, and synchronously at the end of backfill.
+- **Rules**, evaluated each minute (missing baseline row ⇒ error_rate falls back to its absolute floor; p95/req_rate rules are skipped until baselines exist):
+  - **Hard trip (1 completed minute)** — for sharp faults: `error_rate ≥ max(25%, 10× baseline)` with ≥ 20 requests; `p95 ≥ 4× baseline`; `req_rate ≥ 4× baseline` (the 5× traffic-spike scenario must trip it).
+  - **Sustained (2 consecutive minutes)** — for marginal drift: `error_rate > max(5%, baseline + 6×MAD)`; `p95 > 2.5× baseline`; `req_rate > 3× baseline`.
+- **Honest latency envelope**: a completed anomalous minute + 1-min cron ⇒ hard-trip detection lands **~60–150s** after injection; sustained-rule detection ~2–3 min. Target (and phase gate): **incident opened ≤ 2.5 min** for scenarios 1, 2, 4; scenario 3 fires when the creep crosses thresholds (~4–6 min, disclosed on its button). After a chaos click the UI shows a "watchdog scanning…" state so the wait reads as the system working, not broken.
+- **Incident lifecycle**: `open → investigating → reported → resolved | failed`.
+  - Dedupe: an incident in `open`/`investigating`/`reported` whose fingerprint set covers an anomaly suppresses re-firing. `resolved` never suppresses; `failed` stops suppressing after a 10-min re-arm delay (prevents both per-minute failure spam and permanently bricked detection).
+  - New fingerprints from the same cascade: appended to `incident_fingerprints` **and delivered** — the InvestigatorDO checks for undelivered fingerprints before each model call and injects them as a `detector update:` user message. Arriving after `reported`: recorded on the incident as post-report anomalies (visible in UI), and a follow-up incident (linked via `follow_up_of`) opens only if they persist past the re-arm delay.
+  - **Auto-resolve**: applies to `open` and `reported` only — all fingerprints healthy 5 consecutive minutes ⇒ `resolved`. An `investigating` incident always runs to its report (the report notes if metrics already recovered mid-investigation).
+  - **Stuck-investigation watchdog**: the sweep force-fails any `investigating` incident with no step written for > wall-clock cap + 2 min grace — recovery must not depend on the thing that died.
 
 The detector is pure TypeScript over rollups — deterministic, unit-testable, zero LLM cost at idle.
 
 ## 9. The investigator agent
 
+### Anthropic API policy (explicit, because Sonnet 5 defaults changed)
+
+- **Thinking**: Sonnet 5 runs adaptive thinking by default and thinking tokens bill as output against `max_tokens`. Investigator: `thinking: {type: "adaptive"}`, `output_config: {effort: "medium"}` — bounded thinking per step, `max_tokens` sized with headroom. Chat: `thinking: {type: "adaptive", display: "summarized"}` surfaced as a "thinking…" SSE activity event so streaming stays lively.
+- **Never set non-default `temperature`/`top_p`** — Sonnet 5 rejects them with a 400.
+- **The loop appends `response.content` verbatim** as the assistant turn (thinking blocks carry signatures and must be echoed unchanged in tool-use turns — reconstructing them 400s).
+- **Prompt caching**: system prompt + tools are byte-stable per investigation (current time is stamped **once** at open, not per call) with a `cache_control` breakpoint on the last system block and on the most recent message each iteration. Cuts the worst-case investigation from ~$0.84 to ~$0.40 (input ~4× cheaper; output unaffected), and materially cuts per-step latency. Verified in dev via `usage.cache_read_input_tokens`.
+- **SDK does the retrying**: `new Anthropic({ apiKey: env.ANTHROPIC_API_KEY, maxRetries: 3, timeout: 60_000 })` — no hand-rolled backoff; per-call timeout never exceeds the remaining wall-clock budget, so a hung request degrades into the salvage path instead of stalling the loop.
+
 ### Loop mechanics
 
-Hand-rolled loop over the Anthropic Messages API (official `@anthropic-ai/sdk`, which is fetch-based and Workers-compatible). No agent framework — every line defensible.
-
-- Trigger: detector creates the incident and calls `InvestigatorDO` with a crisp anomaly statement ("checkout error_rate 22% vs baseline 0.4% since 14:32Z; concurrent: payments p95 8× baseline").
-- System prompt contains: role, the service topology, the investigation protocol (verify → scope blast radius → drill down → check changes → conclude), tool usage guidance, current time, and the report rubric.
-- Each iteration: model responds with tool calls → DO executes them via the query layer → results (size-capped) appended → repeat.
-- **Termination**: the model must call `submit_report` (a tool with a strict JSON schema) to finish. Also terminates on: step cap (15), cumulative token budget, wall-clock cap (4 min), or repeated identical tool calls (loop guard).
-- **Persistence**: every step (tool call, result summary, token counts) is written to `investigation_steps` *before* the next model call. The UI timeline reads this; an evicted DO resumes from the last persisted step via alarm.
-- **Failure handling**: tool errors are returned to the model as error results (it adapts); malformed tool input gets a validation error back; Anthropic 429/5xx retried with backoff (3 attempts); if the loop dies anyway, the incident is marked `failed` with its partial timeline visible. Honest failure is a feature.
+- Trigger: the detector creates the incident and calls `InvestigatorDO` with a crisp anomaly statement ("checkout error_rate 22% vs baseline 0.4% since 14:32Z; related: payments p95 8× baseline").
+- System prompt: role, topology, investigation protocol (verify → scope blast radius → drill down → check changes → conclude), tool guidance, investigation-open timestamp, report rubric.
+- Each iteration: check for undelivered detector updates (inject as user message) → model call → execute tool calls via the query layer → append capped results → repeat.
+- **Termination**: normally by the model calling `submit_report`. On `end_turn` without a report, or on hitting the step cap (15) / token budget / wall clock (4 min) with budget for one more call: a final request with `tool_choice: {type: "tool", name: "submit_report"}` and the instruction "conclude with what you have; state low confidence" — nearly every investigation yields a report; `failed` is reserved for hard failures (API dead, world reset).
+- **Loop guard**: an identical tool call (normalized to absolute time windows) repeated 3× consecutively gets a synthetic error result nudging toward `submit_report`; termination only if the nudge is ignored. Time-advancing re-checks of the same query are legitimate investigation, not a stuck loop.
+- **Persistence, two representations**: (1) the exact request/response content — including signed thinking blocks and verbatim capped `tool_result` payloads — in **InvestigatorDO storage** after each step (resume fidelity); (2) human-readable step rows in `investigation_steps` (UI timeline projection). The DO re-arms its alarm **before** each await (a pending alarm must exist across every await or eviction orphans the loop); the alarm handler wraps resume in try/catch and marks the incident `failed` rather than rethrowing (DO alarms retry ~6× then go silent — a crash-looping resume must not burn them).
+- **Tool failure handling**: tool errors return to the model as error results; `strict: true` on all tool schemas makes malformed inputs an API-level impossibility rather than a runtime branch.
 
 ### Tools (the entire agent-world interface)
 
@@ -175,49 +204,55 @@ Hand-rolled loop over the Anthropic Messages API (official `@anthropic-ai/sdk`, 
 | `query_metrics` | service?, operation?, metrics[], window, step | Timeseries **with baseline overlay and delta** per point |
 | `search_logs` | service?, level?, contains?, window, limit ≤ 50 | Matching log lines with trace links |
 | `find_traces` | service?, window, criteria: errors\|slowest, limit ≤ 10 | Trace summaries (duration, status, entry span) |
-| `get_trace` | trace_id | Full span tree with timings, statuses, linked error logs |
+| `get_trace` | trace_id | Span tree with timings, statuses, linked error logs |
 | `list_deploys` | window | Deploy/change events |
-| `submit_report` | structured report (see below) | Ends the investigation |
+| `get_incidents` | window?, id? | Past incidents with reports (powers "what happened at 14:32?" in chat; gives the investigator prior-incident context) |
+| `submit_report` | structured report (below) | Ends the investigation (investigator only) |
 
-Tool results are hard-capped (~4KB JSON each) so context stays bounded: 15 steps × 4KB ≈ 60KB of tool results worst case — no summarization machinery needed (noted as future work for longer investigations).
+**Result caps are shape-aware, never byte-sliced**: enforced as row/span limits in the query layer; `get_trace` collapses repeated healthy sibling spans but always preserves the error path root-to-leaf; every capped result carries `truncated: true` plus what was omitted ("showing 12 of 87 spans") so the model drills down instead of trusting a partial view. ~4KB/result keeps 15 steps ≈ 60KB of tool results — no summarization machinery needed.
 
-### The report (structured, rendered in UI)
+### The report (structured via `strict` schema, rendered in UI)
 
-`summary` (one paragraph), `timeline[]` (ts + event), `root_cause` (hypothesis + mechanism), `evidence[]` (metric deltas, trace IDs, log excerpts — each clickable in the UI), `blast_radius` (affected services/endpoints + customer impact judgment), `confidence` (low/med/high + why), `suggested_action`.
+`summary`, `timeline[]`, `root_cause` (hypothesis + mechanism), `evidence[]` (metric deltas, trace IDs, log excerpts), `blast_radius` (affected services + customer-impact judgment), `confidence` (low/med/high + why), `suggested_action`. **Evidence payloads (span-tree excerpt, log lines) are embedded into `report_json` at submit time** — reports stay fully viewable after raw telemetry expires (6h); live drill-down beyond that uses the read API while data exists.
 
-### Chat mode (same core, second entry point)
+### Chat mode (same core, second entry point — and the primary abuse surface)
 
-The identical loop and tools (minus `submit_report`; final text is the answer), a conversational persona, and SSE token streaming to the browser. History is client-held and replayed per request (capped ~20 turns) — no server session state, no auth, defensible simplicity. Chat can reference incidents ("what happened at 14:32?" → it queries the same world).
+Same loop and tools (minus `submit_report`; final text is the answer), conversational persona, SSE streaming. Hardening, since this is an unauthenticated URL whose worst case is otherwise bounded only by org-level Anthropic rate limits (~$720/hr, two orders of magnitude above the "few dollars" story):
+
+- System prompt assembled **server-side only**; persona scoped to the observed world; declines unrelated tasks.
+- Client-held history is **untrusted input**: text-only user/assistant turns, strict alternation enforced, tool_use/tool_result blocks rejected — tool activity only ever originates server-side within a turn. Total request body capped at 32KB, message ≤ 2k chars, history ≤ 20 turns (server-side truncation).
+- Budget caps produce a visible "budget reached" message, never a hang.
 
 ### Cost guardrails (protecting the key, not "rate limiting")
 
-Max 2 concurrent investigations; max 10 investigations/hour; per-investigation budget ≈ 200k input + 16k output tokens (≈ $0.60–0.90 worst case on Sonnet); chat messages ≤ 2k chars, ≤ 8 tool steps per turn; chaos scenario trigger cooldown 30s (global). Counters live in `meta`/DO state.
+**1** active investigation (matches the one-storyline dedupe; enforced as an invariant backstop); ≤ 10 investigations/hour; per-investigation budget ≈ 200k in / 16k out (≈ $0.40 with caching); chat: ≤ 8 tool steps/turn, global ≤ 60 chat turns/hour, ≤ 2 concurrent SSE streams; chaos trigger cooldown 30s (serialized in SimulatorDO). Counters in `meta`/DO state. Worst-case total spend: a few dollars/hour, now including chat.
 
 ## 10. API surface
 
 ```
-GET  /                       UI (static assets)
-GET  /api/state              topology + per-service health + sparkline series
+GET  /                       UI (static assets; assets config: not_found_handling=SPA + run_worker_first=["/api/*"])
+GET  /api/state              topology + per-service health + sparklines + world status (running|seeding|resetting)
+                             + ops health (last sweep success, retention watermark age)
 GET  /api/incidents          incident list (recent first)
-GET  /api/incidents/:id      incident + steps (UI polls this at 2s during investigation)
-POST /api/chaos/:scenario    inject fault (bad-deploy | dependency-outage | latency-creep | traffic-spike)
-POST /api/chaos/restore      clear all faults
-POST /api/admin/reset        wipe + re-backfill world (cooldown-protected)
-POST /api/chat               SSE: token stream + tool-activity events
+GET  /api/incidents/:id      incident + steps (UI polls at 2s during investigation)
+GET  /api/traces/:id         span tree (live drill-down for evidence links, within raw retention)
+GET  /api/logs               filtered logs (service, level, window) — same query layer as the agent tools
+POST /api/chaos/:scenario    inject fault; 409 scenario_active if one is running
+POST /api/chaos/restore      clear all faults (always allowed)
+POST /api/admin/reset        wipe telemetry + re-backfill (cooldown-protected; incidents preserved)
+POST /api/chat               SSE: token stream + tool-activity + thinking-activity events
 ```
 
-No auth anywhere (hard requirement: no login screens).
+**Per-service health mapping** (computed in the query layer behind `/api/state`): **red** = service appears in an `open`/`investigating`/`reported` incident's fingerprints; **amber** = last completed minute breaches a sustained-rule threshold but isn't yet sustained (pre-incident), or incident recovering; **green** otherwise.
 
 ## 11. UI
 
-React + Vite + Tailwind, built into the Worker's static assets. No chart library, no graph library: sparklines and the topology view are small hand-rolled SVG components (fixed layout, six nodes — a graph library is unjustifiable at this size). Four areas in one page:
+React + Vite + Tailwind, served as Worker static assets. No chart or graph libraries — sparklines and the six-node topology are small hand-rolled SVG components. Four areas:
 
-1. **System view**: topology with live health coloring (green/amber/red from detector state) and per-service sparklines (rate, errors, p95).
-2. **Chaos panel**: the four scenario buttons + restore + reset, each with a one-line description of what it breaks.
-3. **Incidents**: feed of incidents; opening one shows the live investigation timeline (each tool call and result as it happens) and the final report with clickable evidence.
-4. **Chat**: streaming conversation with the same agent.
-
-Design intent: clean, dark, observability-tool aesthetic; the wow moment is watching the timeline advance on its own.
+1. **System view**: topology with live health coloring and per-service sparklines (rate, errors, p95); "watchdog scanning…" indicator after a chaos click; world status banner during seeding/reset.
+2. **Chaos panel**: four scenario buttons (+ restore + reset) with one-line descriptions and expected timescales; a "**Start here** → ship a bad deploy and watch" cue; buttons disabled while a scenario is active.
+3. **Incidents**: feed (the seeded resolved incident is visible on first visit); opening one shows the live timeline (each tool call and result as it lands) and the final report with clickable evidence.
+4. **Chat**: streaming conversation with the same agent, including visible thinking/tool activity.
 
 ## 12. Repository layout
 
@@ -236,55 +271,59 @@ docs/specs/           this document
 wrangler.jsonc, package.json, vitest.config.ts
 ```
 
-## 13. Testing & benchmarks
+## 13. Testing & benchmarks (right-sized: the instructions reject coverage for its own sake)
+
+**Keep — each earns its place on the rubric:**
 
 | Layer | Approach | Pass bar |
 |---|---|---|
-| Simulator | Unit: distribution sanity (p50/p95 within expected bands over N ticks), causal propagation (db failure → checkout error), diurnal curve applied | Deterministic with seeded RNG |
-| Query layer & tools | Unit against fixture D1 data (miniflare/vitest-pool-workers) | Exact expected rows/aggregates |
-| Detector | Unit: synthetic rollups with injected drift → fires within N minutes; steady-state fixtures → zero false positives; dedupe and auto-resolve transitions | 100% of scripted cases |
-| Agent loop | Unit with a **mock LLM** (scripted tool-call sequences): happy path, tool error mid-loop, malformed tool input, step-cap hit, submit_report validation failure | Loop never crashes; terminal states correct |
-| Integration | vitest-pool-workers: inject fault → cron tick → incident opened → mock-LLM investigation completes → report persisted | End-to-end in CI, no network |
-| **Agent eval** | `pnpm eval` against a deployed or local instance with the **real model**: reset → inject each scenario → wait for report → grade root cause (expected-cause keyword match + LLM-judge fallback) → emit table: scenario, verdict, steps, tokens, wall time | ≥ 3/4 scenarios correctly root-caused; publish the table in the README |
+| Detector | Unit: synthetic rollups — hard-trip fires on minute 1, sustained on minute 2; steady-state fixtures → zero false positives; lifecycle transitions (dedupe, re-arm, auto-resolve, stuck-watchdog) | 100% of scripted cases |
+| Agent loop | Unit with a **mock LLM**: happy path, tool error mid-loop, end_turn-without-report salvage, step-cap salvage, duplicate-call nudge, resume-from-persisted-state | Loop never crashes; terminal states correct |
+| Query layer/tools | Focused fixtures for the queries the agent actually runs (not exhaustive) | Expected rows/aggregates |
+| Simulator | Light sanity: seeded RNG determinism; error propagation reaches the right ancestors; rollups match generated batches | A handful of assertions, not distribution suites |
+| **Agent eval** | `pnpm eval` against a deployed instance with the **real model**: reset → wait for `running` → inject each scenario → wait for report → grade root cause (expected-cause rubric + keyword match) → table: scenario, verdict, steps, tokens, wall time | ≥ 3/4 scenarios correctly root-caused; table published in README |
+
+**Demoted to next-steps**: simulator statistical-band suites, exhaustive query fixtures, full CI integration matrix. CI itself: typecheck + unit tests on PR from phase 0; deploy-on-main is phase-7 polish.
 
 The eval harness is a first-class deliverable: an agent take-home that ships its own eval is the strongest signal we can send an AI-infra company.
 
 ## 14. Deployment & ops
 
-- `wrangler deploy` publishes everything to `https://watchtower.<subdomain>.workers.dev`.
-- Secrets: `ANTHROPIC_API_KEY` via `wrangler secret put`; local dev uses `.dev.vars` (gitignored). `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` stay in `.env` for the CLI only — never bundled.
-- Config via wrangler vars: `MODEL_ID` (default `claude-sonnet-5`), budget caps, sim parameters.
+- `wrangler deploy` → `https://watchtower.<subdomain>.workers.dev`.
+- Secrets: `ANTHROPIC_API_KEY` via `wrangler secret put`; local dev uses `.dev.vars` (gitignored). CLI credentials stay in `.env` (gitignored), never bundled.
+- Config via wrangler vars: `MODEL_ID`, budget caps, `SIM_RATE`.
 - D1 migrations via `wrangler d1 migrations`.
-- CI (GitHub Actions): typecheck + unit/integration tests on PR; deploy on main (secrets as repo secrets). Nice-to-have, phase 7.
-- On first deploy: `POST /api/admin/reset` seeds the world (documented in README).
+- First deploy: `POST /api/admin/reset` seeds the world (README documents this; seeding completes in ~2–3 min and `/api/state` shows progress).
 
 ## 15. Risks & mitigations
 
 | Risk | Mitigation |
 |---|---|
-| D1 write throughput/size creep | Chunked batch writes per tick; retention sweep; volumes estimated at ~2M rows/day, well under paid limits |
-| DO eviction mid-investigation | Step-by-step persistence + alarm resumption; worst case incident marked `failed` with partial timeline |
-| Model goes sideways (loops, refuses, hallucinates tools) | Step cap, repeated-call guard, schema-validated tool inputs, `submit_report` forced structure, failed-state honesty |
-| Reviewer cost abuse (it's an open URL) | Concurrency + hourly caps, token budgets, chaos cooldown; worst-case spend bounded to a few dollars/hour |
-| Sonnet latency makes the demo drag | Investigations run 1–3 min by design; the live-streaming timeline turns the wait into the show |
-| Simulated world dismissed as toy | The README's honesty boundary section + tool-layer seam argument; realistic causal chains do the convincing |
-| Free-tier reviewer curiosity ("does this need paid?") | Paid plan only relaxes limits; note in README which knobs matter on free tier |
+| D1 cost creep | Explicit write budget (§6, ~15M billable rows/month vs 50M included); sampled persistence; chunked retention with watermark; ops health on `/api/state` makes a wedged sweep visible |
+| DO eviction mid-investigation | Raw-content persistence + alarm re-armed before every await + try/catch alarm handler; stuck-watchdog force-fails as last resort |
+| Model goes sideways | Step cap, duplicate-call nudge, strict schemas, forced `submit_report` salvage, honest `failed` state |
+| Reviewer abuse of the open URL | Chat input hardening + global caps (§9); chaos cooldowns serialized in the DO; worst case bounded to a few dollars/hour |
+| Reset/restore races | All world mutations serialize through SimulatorDO; generation counter discards stale writes; detector no-ops unless world is `running`; investigations failed cleanly on reset |
+| Detection feels slow after a chaos click | Hard-trip rules (~60–150s typical); "watchdog scanning…" UI state; button labels set expectations |
+| Sonnet latency makes the demo drag | Prompt caching cuts per-step latency; the streaming timeline turns the wait into the show |
+| Simulated world dismissed as toy | Honesty-boundary README section; symptom-only logs + red herrings force real cross-signal inference |
+| Empty first impression | Seeded resolved incident + "Start here" cue |
 
 ## 16. Milestone roadmap (detail lives in the implementation plan)
 
 | Phase | Delivers | Exit criteria |
 |---|---|---|
-| 0 | Scaffold: wrangler + TS + Hono + Vite UI shell + CI skeleton; deployed hello-world | URL live; `pnpm test` and `wrangler deploy` green |
-| 1 | D1 schema + simulator (topology, generator, backfill, retention) | Statistical unit tests pass; world visibly ticking in D1 |
-| 2 | Query layer + the 5 read tools | Tool unit tests green on fixtures |
-| 3 | Baselines + detector + incidents + auto-resolve | Fault → incident ≤ 90s; zero false positives in steady-state soak |
-| 4 | Agent loop: mock-LLM tested, then live Anthropic; investigation persistence | Eval: ≥ 3/4 scenarios correct root cause |
-| 5 | Chat mode + SSE streaming | Shared core proven; streaming works at the URL |
-| 6 | UI: topology, chaos panel, incident timeline, chat | Full demo loop click-through on the deployed URL |
-| 7 | Hardening + README (decisions/tradeoffs/next) + eval table + final deploy | Break-it checklist passes; docs complete; fresh eval run published |
+| 0 | Scaffold: wrangler + TS + Hono + Vite shell + CI (typecheck/test) + **README skeleton**; deployed hello-world | URL live; `pnpm test` green; README stubs in place |
+| 1 | D1 schema + simulator: topology, generator, **scenarios (fault mechanics)**, chunked backfill, retention | Sim sanity tests pass; world ticking in D1; billable-write budget verified against real counts |
+| 2 | Query layer + all seven tools | Tool tests green on fixtures |
+| 3 | Baselines + detector + incident lifecycle + **/api/chaos routes** | Fault → incident ≤ 2.5 min (scenarios 1, 2, 4); zero false positives over a 2h steady soak; stuck/dedupe/re-arm transitions tested |
+| 4 | Agent loop (mock-LLM tests → live Anthropic) + **minimal demo surface**: chaos buttons + incident timeline/report page + **minimal README** | Eval ≥ 3/4 correct; project is genuinely submittable (URL + README) |
+| 5 | Full UI: topology/health, sparklines, seeded incident, polish | Demo loop click-through on the deployed URL |
+| 6 | Chat mode + SSE + input hardening | Adversarial chat script handled (injection, oversized, off-topic) |
+| 7 | Hardening pass + README final (decisions/tradeoffs/next + eval table) + deploy-on-main CI | Break-it checklist passes (incl. reset mid-investigation); fresh eval published |
 
-Each phase ends with: tests green → code review pass → manual exit-criteria check, before the next begins. The project is submittable after phase 4 (agent works via HTTP + README); phases 5–7 raise the demo quality.
+Each phase ends with: tests green → code review → manual exit-criteria check. The README skeleton is updated at **every** phase boundary — the graded "judgment" artifact is written continuously, not last. After phase 4 the submission is real; 5–7 raise its ceiling.
 
 ## 17. Open questions
 
-None blocking. Naming ("Watchtower"), UI stack, and scenario set were confirmed with the project owner on 2026-07-14.
+None blocking. Naming ("Watchtower"), UI stack, scenario set, and the paid-plan requirement were confirmed with the project owner on 2026-07-14.
