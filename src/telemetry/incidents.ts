@@ -57,11 +57,24 @@
  * task doesn't otherwise require). Instead, `meta` — already earmarked for exactly this
  * ("guardrail counters", migration 0001's comment) — holds one row per (incident, fingerprint):
  * key `incident_health:<incidentId>:<fingerprint>`, value the `nowMs` this fingerprint was last
- * seen anomalous. `openIncident`/`appendFingerprints` refresh it for every anomaly they record;
- * `autoResolve` reads it back and clears it once an incident resolves; `forceFailStuck` clears it on
- * force-fail too (a terminal incident's health rows serve no further purpose). A real SQL table row
- * (not a JSON blob field) stays directly queryable (`SELECT * FROM meta WHERE key LIKE
+ * seen anomalous. `openIncident`/`appendFingerprints` refresh it for every anomaly they record
+ * (append skips the refresh when the incident is already terminal — see `appendFingerprints`);
+ * `autoResolve` reads it back. Every terminal transition clears the incident's health rows
+ * (`autoResolve` on resolve, `forceFailStuck` on force-fail, the chaos reset's bulk fail via
+ * `healthClearStatement`) — a terminal incident's health rows serve no further purpose, and
+ * clearing them everywhere keeps `meta` from accumulating dead keys. A real SQL table row (not a
+ * JSON blob field) stays directly queryable (`SELECT * FROM meta WHERE key LIKE
  * 'incident_health:%'`), which is what "queryable" asks for.
+ *
+ * **Known limitation (accepted)**: `openIncident`'s dedupe is a read (`findOwnersByFingerprint`)
+ * followed by a separate insert — not atomic. Two truly concurrent `openIncident` calls for the
+ * same fingerprint could each see "no owner" and double-open. The only caller is the sweep
+ * (`runSweep` is wired solely to the cron `scheduled` handler and is not HTTP-reachable), so the
+ * exposure is cron-tick-vs-cron-tick overlap only — which Cloudflare does not do in practice, but
+ * also does not contractually guarantee. If it ever happened, the blast radius is two incidents
+ * for one fault: both suppress further re-firing from the next tick, and the redundant one
+ * auto-resolves within ~5-10 minutes on its own. Self-healing and bounded, so no locking is
+ * layered on for this project.
  */
 
 import type { Anomaly } from "../detect/rules";
@@ -133,15 +146,20 @@ function buildHealthTouchStatements(
   );
 }
 
-/** Builds the single `DELETE` statement clearing every `incident_health:*` row for `incidentId`'s
- * `fingerprints` — called once an incident reaches a terminal status (`resolved`/`failed`), since
- * those rows can never be read again (`autoResolve` only ever looks at `open`/`reported`
- * incidents). Returns `[]` for an empty `fingerprints` (nothing to clear). */
-function buildHealthClearStatements(db: D1Database, incidentId: string, fingerprints: readonly string[]): D1PreparedStatement[] {
-  if (fingerprints.length === 0) return [];
-  const keys = fingerprints.map((fp) => healthKey(incidentId, fp));
-  const placeholders = keys.map(() => "?").join(", ");
-  return [db.prepare(`DELETE FROM meta WHERE key IN (${placeholders})`).bind(...keys)];
+/** Prepared (not yet executed) statement deleting every `incident_health:*` meta row belonging to
+ * `incidentId`, regardless of fingerprint — issued at every terminal transition (`autoResolve` on
+ * resolve, `forceFailStuck` on force-fail, and `api/chaos.ts`'s reset-time bulk fail, which folds
+ * it into its own `db.batch`) so health bookkeeping never outlives the incident it served.
+ *
+ * Implemented as a half-open prefix RANGE on `meta`'s `key` PK rather than a `LIKE`: D1 caps the
+ * LIKE pattern length low enough that `'incident_health:<uuid>:%'` (~60 chars) fails with "LIKE or
+ * GLOB pattern too complex". The upper bound bumps the prefix's trailing `:` (0x3A) to `;` (0x3B),
+ * so exactly the keys beginning with `incident_health:<incidentId>:` — and nothing else — fall in
+ * `[prefix, upperBound)`; as a plain range on the PK it's also index-served. */
+export function healthClearStatement(db: D1Database, incidentId: string): D1PreparedStatement {
+  const prefix = `incident_health:${incidentId}:`;
+  const upperBound = `incident_health:${incidentId};`;
+  return db.prepare(`DELETE FROM meta WHERE key >= ? AND key < ?`).bind(prefix, upperBound);
 }
 
 // --- incident_fingerprints -----------------------------------------------------------------------
@@ -188,8 +206,16 @@ function isCovering(row: CoveringRow, nowMs: number): boolean {
  * (e.g. an earlier incident resolved and a later one reopened on it), the most-recently-opened
  * covering match wins. This per-fingerprint resolution (not "any match anywhere in the batch") is
  * what keeps two unrelated already-open incidents from being merged — see the file doc comment.
+ *
+ * Exported for `sweep.ts`'s cross-incident routing: after folding a batch onto the incident
+ * `openIncident` selected, the sweep re-resolves ownership and routes any anomaly owned by a
+ * DIFFERENT incident to that incident's own `appendFingerprints` call — so every concurrently-open
+ * incident whose fingerprint is still breaching gets its health clock refreshed every tick, not
+ * just the one incident the batch happened to fold onto (otherwise a second open incident's live
+ * fault would look "healthy 5 minutes" to `autoResolve` purely because another incident was
+ * absorbing the batch).
  */
-async function findOwnersByFingerprint(
+export async function findOwnersByFingerprint(
   db: D1Database,
   fingerprints: readonly string[],
   nowMs: number,
@@ -306,15 +332,25 @@ export async function appendFingerprints(
 
   const fingerprints = [...new Set(toAppend.map((a) => a.fingerprint))];
 
-  const row = await db.prepare(`SELECT trigger_json FROM incidents WHERE id = ?`).bind(incidentId).first<{ trigger_json: string }>();
+  const row = await db
+    .prepare(`SELECT trigger_json, status FROM incidents WHERE id = ?`)
+    .bind(incidentId)
+    .first<{ trigger_json: string; status: IncidentStatus }>();
   if (!row) return; // incident vanished underneath us (shouldn't happen) -- nothing left to append to
   const trigger = parseTrigger(row.trigger_json);
   trigger.anomalies.push(...toAppend);
   trigger.statements = trigger.anomalies.map((a) => a.statement);
 
+  // Health rows only for non-terminal incidents: a failed-within-re-arm incident still absorbs the
+  // batch (its suppression is the whole point of the re-arm window, and the audit trail should
+  // record the re-fire), but recreating its already-cleared incident_health:* rows would leak keys
+  // that no terminal transition will ever clear again (autoResolve/forceFailStuck only look at
+  // non-terminal statuses).
+  const active = row.status === "open" || row.status === "investigating" || row.status === "reported";
+
   await db.batch([
     ...buildFingerprintInsertStatements(db, incidentId, fingerprints, nowMs),
-    ...buildHealthTouchStatements(db, incidentId, fingerprints, nowMs),
+    ...(active ? buildHealthTouchStatements(db, incidentId, fingerprints, nowMs) : []),
     db.prepare(`UPDATE incidents SET trigger_json = ? WHERE id = ?`).bind(JSON.stringify(trigger), incidentId),
   ]);
 }
@@ -458,7 +494,7 @@ export async function autoResolve(db: D1Database, nowMs: number): Promise<void> 
 
     if (await allFingerprintsHealthy(db, id, fingerprints, nowMs)) {
       await setStatus(db, id, "resolved", { ts: { field: "resolved_at", value: nowMs } });
-      await db.batch(buildHealthClearStatements(db, id, fingerprints));
+      await healthClearStatement(db, id).run();
     }
   }
 }
@@ -490,14 +526,7 @@ export async function forceFailStuck(db: D1Database, nowMs: number): Promise<voi
         ts: { field: "resolved_at", value: nowMs },
         reportPatch: { failure_reason: "stuck: no investigation step written in over 6 minutes" },
       });
-
-      const { results: fpRows } = await db
-        .prepare(`SELECT fingerprint FROM incident_fingerprints WHERE incident_id = ?`)
-        .bind(id)
-        .all<{ fingerprint: string }>();
-      const fingerprints = (fpRows ?? []).map((r) => r.fingerprint);
-      const clearStatements = buildHealthClearStatements(db, id, fingerprints);
-      if (clearStatements.length > 0) await db.batch(clearStatements);
+      await healthClearStatement(db, id).run();
     }
   }
 }

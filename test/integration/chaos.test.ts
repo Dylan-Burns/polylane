@@ -70,7 +70,7 @@ describe("POST /api/chaos/restore", () => {
 describe("POST /api/admin/reset", () => {
   beforeEach(async () => resetWorldState());
 
-  it("fails open/investigating incidents with failure_reason 'world reset' before proxying to SimulatorDO, leaving resolved ones untouched", async () => {
+  it("fails open/investigating incidents with failure_reason 'world reset' and clears their health rows, leaving resolved/reported ones untouched", async () => {
     await env.DB.batch([
       env.DB.prepare(
         "INSERT INTO incidents (id, status, severity, opened_at, trigger_json) VALUES ('inc-open', 'open', 'warning', 1000, '{}')",
@@ -81,6 +81,14 @@ describe("POST /api/admin/reset", () => {
       env.DB.prepare(
         "INSERT INTO incidents (id, status, severity, opened_at, resolved_at, trigger_json) VALUES ('inc-resolved', 'resolved', 'warning', 1000, 2000, '{}')",
       ),
+      env.DB.prepare(
+        "INSERT INTO incidents (id, status, severity, opened_at, reported_at, trigger_json) VALUES ('inc-reported', 'reported', 'warning', 1000, 2000, '{}')",
+      ),
+      // Health rows for the two soon-to-fail incidents plus one for the reported incident, which
+      // must SURVIVE the reset (autoResolve still needs it to resolve the reported incident later).
+      env.DB.prepare("INSERT INTO meta (key, value) VALUES ('incident_health:inc-open:payments:errors', '1000')"),
+      env.DB.prepare("INSERT INTO meta (key, value) VALUES ('incident_health:inc-investigating:checkout:errors', '1000')"),
+      env.DB.prepare("INSERT INTO meta (key, value) VALUES ('incident_health:inc-reported:catalog:traffic', '1000')"),
     ]);
 
     const res = await SELF.fetch("https://example.com/api/admin/reset", { method: "POST" });
@@ -99,6 +107,15 @@ describe("POST /api/admin/reset", () => {
 
     expect(byId.get("inc-resolved")?.status).toBe("resolved"); // untouched
     expect(byId.get("inc-resolved")?.report_json).toBeNull();
+
+    expect(byId.get("inc-reported")?.status).toBe("reported"); // untouched -- survives a reset
+
+    // The failed incidents' health rows are gone (the terminal-transition cleanup, review FIX 3);
+    // the reported incident's row remains.
+    const healthRows = await env.DB
+      .prepare("SELECT key FROM meta WHERE key LIKE 'incident_health:%' ORDER BY key")
+      .all<{ key: string }>();
+    expect((healthRows.results ?? []).map((r) => r.key)).toEqual(["incident_health:inc-reported:catalog:traffic"]);
   });
 
   it("still proxies the reset even with no active incidents at all", async () => {

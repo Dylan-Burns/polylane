@@ -2,12 +2,14 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
 import { computeBaselines } from "../../src/detect/baselines";
+import type { Anomaly } from "../../src/detect/rules";
 import { runSweep } from "../../src/detect/sweep";
 import type { Env } from "../../src/env";
 import { seedForWindow } from "../../src/sim/backfill";
 import { generateWindow, rollupFromStats } from "../../src/sim/generator";
 import { mulberry32 } from "../../src/sim/rng";
 import { effectsFor, identityEffects, type FaultState } from "../../src/sim/scenarios";
+import { openIncident } from "../../src/telemetry/incidents";
 import { insertRollups } from "../../src/telemetry/queries";
 import type { RollupRow } from "../../src/telemetry/types";
 
@@ -223,5 +225,118 @@ describe("runSweep: subtask isolation and the world-status gate", () => {
     const incidents = await env.DB.prepare("SELECT count(*) as n FROM incidents").first<{ n: number }>();
     expect(incidents?.n).toBe(1);
     expect(started).toHaveLength(1);
+  }, 30_000);
+});
+
+describe("runSweep: batch spanning two concurrently-open incidents (review FIX 1 regression)", () => {
+  function mkAnomaly(overrides: Partial<Anomaly>): Anomaly {
+    return {
+      fingerprint: "payments:errors",
+      service: "payments",
+      metricClass: "errors",
+      rule: "hard",
+      value: 0.5,
+      baseline: 0.01,
+      statement: "synthetic statement",
+      ...overrides,
+    };
+  }
+
+  it("health-refreshes EVERY still-breaching incident each tick -- neither auto-resolves while its fault is live, and fingerprint attribution stays put", async () => {
+    // Anchor T0 on an epoch-minute % 15 == 0 boundary so the six sweeps at +1..+6 min never hit
+    // the 15-minute baseline recompute (which would rebuild baselines from ONLY the sparse breach
+    // rollups below and change what evaluate() sees mid-test).
+    const BASE = Date.UTC(2026, 0, 21, 10, 0, 0);
+    const T0 = BASE + ((15 - (Math.floor(BASE / MIN) % 15)) % 15) * MIN;
+
+    // Baselines: only checkout latency rows (p95 + p50), inserted directly with known medians so
+    // the checkout:latency hard rule fires deterministically. payments:errors needs NO baseline
+    // row at all (the missing-baseline fallback is the absolute 25% floor), and with no req_rate
+    // rows anywhere the traffic rules stay silent -- so evaluate() yields EXACTLY
+    // [checkout:latency, payments:errors] each minute.
+    await env.DB.batch([
+      env.DB
+        .prepare("REPLACE INTO baselines (service, operation, metric, median, mad, computed_at) VALUES ('checkout', 'place_order', 'p95', 100, 10, ?)")
+        .bind(T0),
+      env.DB
+        .prepare("REPLACE INTO baselines (service, operation, metric, median, mad, computed_at) VALUES ('checkout', 'place_order', 'p50', 20, 2, ?)")
+        .bind(T0),
+    ]);
+
+    // Two distinct incidents already open BEFORE the sweeps: A on payments:errors, B on
+    // checkout:latency -- the reviewer's exact scenario (a residual FP + a real fault, both open).
+    const incidentA = await openIncident(env.DB, [mkAnomaly({})], T0 - 3 * MIN);
+    const incidentB = await openIncident(
+      env.DB,
+      [mkAnomaly({ fingerprint: "checkout:latency", service: "checkout", metricClass: "latency", value: 800, baseline: 100 })],
+      T0 - 2 * MIN,
+    );
+    expect(incidentA.created).toBe(true);
+    expect(incidentB.created).toBe(true);
+
+    // Both faults keep breaching for the whole test: one rollup row per (service, minute) for
+    // minutes T0 .. T0+5 (minute0 of the sweep at T0+m is the minute starting at T0+(m-1)).
+    const rows: RollupRow[] = [];
+    for (let m = 0; m < 6; m++) {
+      // payments errors hard trip: rate 0.5 >= max(25%, --) with 20 errors >= 3.
+      rows.push({ service: "payments", operation: "charge", minute_ts: T0 + m * MIN, count: 40, error_count: 20, p50_ms: 25, p95_ms: 60, p99_ms: 80 });
+      // checkout latency hard trip: p95 8x baseline (>= 4x), p50 10x baseline (>= 2x), count >= 5.
+      rows.push({ service: "checkout", operation: "place_order", minute_ts: T0 + m * MIN, count: 40, error_count: 0, p50_ms: 200, p95_ms: 800, p99_ms: 900 });
+    }
+    await insertRollups(env.DB, rows);
+
+    const simStub = env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
+    await runInDurableObject(simStub, async (_instance, state) => {
+      await state.storage.put("worldStatus", "running");
+    });
+
+    // Six sweeps, one per minute -- well past the 5-minute healthy streak that (pre-fix) would
+    // have auto-resolved whichever incident the batch did NOT fold onto (its last health stamp
+    // would have stayed frozen at its open time, T0-3min).
+    const started: RecordedStart[] = [];
+    const testEnv = makeTestEnv(makeMockInvestigator(started));
+    for (let m = 1; m <= 6; m++) {
+      await runSweep(testEnv, T0 + m * MIN);
+    }
+
+    // NEITHER incident auto-resolved: both faults were live the whole time, so both health clocks
+    // must have been refreshed every tick regardless of which incident absorbed the batch.
+    const statuses = await env.DB
+      .prepare("SELECT id, status FROM incidents ORDER BY opened_at")
+      .all<{ id: string; status: string }>();
+    expect(statuses.results).toHaveLength(2);
+    const statusById = new Map((statuses.results ?? []).map((r) => [r.id, r.status]));
+    expect(statusById.get(incidentA.id)).toBe("open");
+    expect(statusById.get(incidentB.id)).toBe("open");
+
+    // Fingerprint attribution stayed put: payments:errors ONLY on A, checkout:latency ONLY on B.
+    const fpRows = await env.DB
+      .prepare("SELECT incident_id, fingerprint FROM incident_fingerprints ORDER BY incident_id, fingerprint")
+      .all<{ incident_id: string; fingerprint: string }>();
+    const byIncident = new Map<string, string[]>();
+    for (const row of fpRows.results ?? []) {
+      const arr = byIncident.get(row.incident_id);
+      if (arr) arr.push(row.fingerprint);
+      else byIncident.set(row.incident_id, [row.fingerprint]);
+    }
+    expect(byIncident.get(incidentA.id)).toEqual(["payments:errors"]);
+    expect(byIncident.get(incidentB.id)).toEqual(["checkout:latency"]);
+
+    // Both health clocks read the LAST sweep's timestamp -- direct evidence the refresh decoupled
+    // from the fold decision (pre-fix, one of these would still read its open-time stamp).
+    const lastSweepMs = String(T0 + 6 * MIN);
+    for (const [incidentId, fingerprint] of [
+      [incidentA.id, "payments:errors"],
+      [incidentB.id, "checkout:latency"],
+    ] as const) {
+      const healthRow = await env.DB
+        .prepare("SELECT value FROM meta WHERE key = ?")
+        .bind(`incident_health:${incidentId}:${fingerprint}`)
+        .first<{ value: string }>();
+      expect(healthRow?.value).toBe(lastSweepMs);
+    }
+
+    // And no new incident/investigation was spawned by any of the six covered sweeps.
+    expect(started).toHaveLength(0);
   }, 30_000);
 });

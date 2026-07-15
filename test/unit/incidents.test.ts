@@ -242,6 +242,25 @@ describe("appendFingerprints", () => {
     expect(await fingerprintRows(id)).toHaveLength(1);
   });
 
+  it("does not re-create health rows when appending onto a terminal (failed-within-re-arm) incident, but still records the anomaly", async () => {
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    await setStatus(env.DB, id, "failed", { ts: { field: "resolved_at", value: T0 + MIN } });
+    // Simulate the terminal-transition cleanup autoResolve/forceFailStuck/the chaos reset perform.
+    await env.DB.prepare("DELETE FROM meta WHERE key LIKE 'incident_health:%'").run();
+
+    // Within the 10-min re-arm window the failed incident still covers -> the batch folds onto it.
+    await appendFingerprints(env.DB, id, [mkAnomaly({ fingerprint: "payments:errors" })], T0 + 2 * MIN);
+
+    const healthRows = await env.DB
+      .prepare("SELECT count(*) as n FROM meta WHERE key LIKE 'incident_health:%'")
+      .first<{ n: number }>();
+    expect(healthRows?.n).toBe(0); // not resurrected -- nothing would ever clear them again
+
+    const row = await incidentRow(id);
+    const trigger = JSON.parse(row?.trigger_json ?? "{}") as { anomalies: Anomaly[] };
+    expect(trigger.anomalies).toHaveLength(2); // the re-fire is still on the audit trail
+  });
+
   it("does not double-track a fingerprint that belongs to a DIFFERENT, still-active incident when a batch spans two open incidents", async () => {
     const incidentA = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors", service: "payments" })], T0);
     const incidentB = await openIncident(
@@ -383,6 +402,23 @@ describe("autoResolve", () => {
   it("does not throw when there are no open/reported incidents", async () => {
     await expect(autoResolve(env.DB, T0)).resolves.toBeUndefined();
   });
+
+  it("clears the incident's incident_health meta rows once it resolves", async () => {
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+
+    const before = await env.DB
+      .prepare("SELECT count(*) as n FROM meta WHERE key LIKE 'incident_health:%'")
+      .first<{ n: number }>();
+    expect(before?.n).toBe(1);
+
+    await autoResolve(env.DB, T0 + 5 * MIN);
+    expect((await incidentRow(id))?.status).toBe("resolved");
+
+    const after = await env.DB
+      .prepare("SELECT count(*) as n FROM meta WHERE key LIKE 'incident_health:%'")
+      .first<{ n: number }>();
+    expect(after?.n).toBe(0);
+  });
 });
 
 describe("forceFailStuck", () => {
@@ -434,5 +470,18 @@ describe("forceFailStuck", () => {
     await forceFailStuck(env.DB, T0 + 60 * MIN);
     expect((await incidentRow(open.id))?.status).toBe("open");
     expect((await incidentRow(reported.id))?.status).toBe("reported");
+  });
+
+  it("clears the incident's incident_health meta rows when it force-fails", async () => {
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    await setStatus(env.DB, id, "investigating");
+
+    await forceFailStuck(env.DB, T0 + 6 * MIN + 1);
+    expect((await incidentRow(id))?.status).toBe("failed");
+
+    const after = await env.DB
+      .prepare("SELECT count(*) as n FROM meta WHERE key LIKE 'incident_health:%'")
+      .first<{ n: number }>();
+    expect(after?.n).toBe(0);
   });
 });

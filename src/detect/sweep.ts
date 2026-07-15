@@ -17,7 +17,13 @@
  *     `tryConsumeInvestigationBudget`). `created: false` (covered by an existing incident) ->
  *     `appendFingerprints` onto it instead; deliberately no `/start` call, which is exactly how the
  *     mandated integration test proves dedupe (two sweeps over an unresolved fault -> exactly one
- *     `/start`, not one incident row still gets an accumulated fingerprint history).
+ *     `/start`, not one incident row still gets an accumulated fingerprint history). Finally,
+ *     anomalies owned by a DIFFERENT still-covering incident than the one the batch folded onto
+ *     (reachable when two incidents are open concurrently, e.g. a residual false positive plus a
+ *     real fault) are routed to their own incidents via per-owner `appendFingerprints` calls — so
+ *     every open incident whose fingerprint is still breaching gets its auto-resolve health clock
+ *     refreshed every tick, and its evidence recorded on the RIGHT incident, regardless of which
+ *     incident happened to absorb the batch this tick.
  *  3. **Lifecycle housekeeping**: `autoResolve` then `forceFailStuck` (see `incidents.ts`).
  *  4. **Baseline recompute**: every 15 minutes on the wall clock (`floor(nowMs/60_000) % 15 === 0`),
  *     `detect/baselines.ts`'s `computeBaselines`.
@@ -38,7 +44,13 @@ import { evaluate, type Anomaly } from "./rules";
 import type { Env } from "../env";
 import { MINUTE_MS } from "../sim/backfill";
 import { simulatorStub } from "../sim/simulator-do";
-import { appendFingerprints, autoResolve, forceFailStuck, openIncident } from "../telemetry/incidents";
+import {
+  appendFingerprints,
+  autoResolve,
+  findOwnersByFingerprint,
+  forceFailStuck,
+  openIncident,
+} from "../telemetry/incidents";
 import { queryMetrics } from "../telemetry/read";
 import { sweepRetention } from "../telemetry/retention";
 
@@ -85,11 +97,16 @@ function parseInvestigationRateState(raw: string | undefined, nowMs: number): In
 
 /**
  * Fixed-window (not sliding) <= 10/hour guard on starting new investigations, persisted in `meta`
- * under `investigation_count_hour`. A plain read-then-write, not a SQL-level atomic increment: the
- * sweep is invoked at most once per cron tick and Cloudflare does not overlap a Worker's own
- * scheduled invocations, so there is no concurrent writer to race against in practice — "atomic"
- * here means "the counter can't be bypassed by a normal single sweep run," not "safe under
- * arbitrary concurrent callers." Returns `true` (and consumes one slot) iff under budget.
+ * under `investigation_count_hour`. Returns `true` (and consumes one slot) iff under budget.
+ *
+ * **Known limitation (accepted)**: a plain read-then-write, not a SQL-level atomic increment. It
+ * is correct as long as two sweep runs never interleave — Cloudflare does not overlap a Worker's
+ * own scheduled invocations in practice, but that is observed platform behavior, not a documented
+ * contractual guarantee. The exposure is cron-vs-cron only (`runSweep` is wired solely to the
+ * `scheduled` handler and is not HTTP-reachable), and the worst case of an interleaving is an
+ * over- or under-count of a couple of investigations within one hour — a bounded cost overrun (or
+ * a one-tick start delay), never a correctness break — so no locking/CAS is layered on for this
+ * project.
  */
 async function tryConsumeInvestigationBudget(db: D1Database, nowMs: number): Promise<boolean> {
   const row = await db.prepare(`SELECT value FROM meta WHERE key = ?`).bind(INVESTIGATION_BUDGET_META_KEY).first<{ value: string }>();
@@ -150,6 +167,28 @@ async function runDetection(env: Env, nowMs: number): Promise<void> {
     }
   } else {
     await appendFingerprints(env.DB, id, anomalies, nowMs);
+  }
+
+  // Cross-incident routing (see the file doc comment, subtask 2): the batch may span MORE open
+  // incidents than the one `openIncident` selected — `appendFingerprints` above deliberately
+  // drops anomalies owned by a different incident rather than mis-attributing them, so route
+  // each of those to its actual owner here. Ownership is re-resolved AFTER the open/append above
+  // (a just-created incident now owns its whole batch, making this a no-op on the `created`
+  // path), and each foreign owner gets exactly its own anomalies — refreshing that incident's
+  // health clock so a still-breaching fault can never auto-resolve just because a different
+  // incident absorbed the batch this tick.
+  const owners = await findOwnersByFingerprint(env.DB, [...new Set(anomalies.map((a) => a.fingerprint))], nowMs);
+  const foreignByOwner = new Map<string, Anomaly[]>();
+  for (const anomaly of anomalies) {
+    const owner = owners.get(anomaly.fingerprint);
+    if (owner !== undefined && owner !== id) {
+      const group = foreignByOwner.get(owner);
+      if (group) group.push(anomaly);
+      else foreignByOwner.set(owner, [anomaly]);
+    }
+  }
+  for (const [ownerId, group] of foreignByOwner) {
+    await appendFingerprints(env.DB, ownerId, group, nowMs);
   }
 }
 

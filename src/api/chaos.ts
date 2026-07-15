@@ -24,6 +24,7 @@ import { Hono } from "hono";
 import type { Env } from "../env";
 import { simulatorStub } from "../sim/simulator-do";
 import { SCENARIOS, type ScenarioId } from "../sim/scenarios";
+import { healthClearStatement } from "../telemetry/incidents";
 
 const VALID_SCENARIOS: ReadonlySet<string> = new Set(Object.keys(SCENARIOS));
 
@@ -59,15 +60,27 @@ chaosRoutes.post("/:scenario", async (c) => {
   });
 });
 
-/** Marks every currently `open`/`investigating` incident `failed` in one bulk `UPDATE` (atomic —
- * either all matching incidents flip together or none do, and no N separate round trips for N
- * incidents) once a reset is confirmed underway and about to wipe the telemetry those incidents
- * reference. */
+/** Marks every currently `open`/`investigating` incident `failed` and clears each one's
+ * `incident_health:*` meta rows (matching `autoResolve`/`forceFailStuck`'s terminal-transition
+ * cleanup, so health bookkeeping never survives a reset-time fail either) — all in one `db.batch`
+ * (transactional: the flips and their cleanup land together or not at all), once a reset is
+ * confirmed underway and about to wipe the telemetry those incidents reference. `reported`
+ * incidents are untouched — they survive a reset, and their health rows must stay so
+ * `autoResolve` can still resolve them. */
 async function failActiveIncidents(db: D1Database, nowMs: number): Promise<void> {
-  await db
-    .prepare(`UPDATE incidents SET status = 'failed', resolved_at = ?, report_json = ? WHERE status IN ('open', 'investigating')`)
-    .bind(nowMs, JSON.stringify({ failure_reason: "world reset" }))
-    .run();
+  const { results } = await db
+    .prepare(`SELECT id FROM incidents WHERE status IN ('open', 'investigating')`)
+    .all<{ id: string }>();
+  const ids = (results ?? []).map((r) => r.id);
+  if (ids.length === 0) return;
+
+  const placeholders = ids.map(() => "?").join(", ");
+  await db.batch([
+    db
+      .prepare(`UPDATE incidents SET status = 'failed', resolved_at = ?, report_json = ? WHERE id IN (${placeholders})`)
+      .bind(nowMs, JSON.stringify({ failure_reason: "world reset" }), ...ids),
+    ...ids.map((id) => healthClearStatement(db, id)),
+  ]);
 }
 
 export async function handleAdminReset(c: AppContext): Promise<Response> {
