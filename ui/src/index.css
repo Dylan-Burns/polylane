@@ -1,9 +1,103 @@
 @import "tailwindcss";
 
-/* Dark observability-tool base: near-black background, light text. */
+/*
+ * Design tokens (frontend-design pass, Task 5.2). Registered via Tailwind v4's CSS-first `@theme`
+ * so every token below is also a utility class (`bg-void`, `text-signal`, `font-display`, ...).
+ *
+ * Palette — "a watchtower scanning a dark field": a cold, blue-black night rather than a flat
+ * #000, one deliberate "signal" blue (the beacon sweep — used for interactive/live elements only,
+ * never for health), and a separate, never-overlapping red/amber/green vocabulary reserved
+ * entirely for service health so the two systems can never be misread as one another.
+ *
+ * Type — three faces, one family relationship: Space Grotesk (display: panel titles, the incident
+ * summary, big numbers) used sparingly at large sizes; IBM Plex Sans (body: prose, descriptions);
+ * IBM Plex Mono (utility: timestamps, trace ids, tool args/output, token counts — Plex Mono shares
+ * Plex Sans' design DNA, so data-dense readouts feel like part of the same instrument, not a
+ * bolted-on monospace). Fetched from Google Fonts in index.html with full system-font fallback
+ * stacks below, so the page still reads intentionally with zero network (as it must for this
+ * task's offline local verification).
+ */
+@theme {
+  --color-void: #0a0d12;
+  --color-panel: #12161d;
+  --color-panel-raised: #191f28;
+  --color-hairline: #232a37;
+  --color-hairline-bright: #303a4a;
+
+  --color-ink: #e7ecf3;
+  --color-ink-dim: #8792a3;
+  --color-ink-faint: #57606f;
+
+  --color-signal: #4c8dff;
+  --color-signal-dim: #2c5cc7;
+  --color-signal-glow: #8ab4ff;
+
+  --color-status-red: #ef4a5a;
+  --color-status-amber: #e8a33d;
+  --color-status-green: #35d68f;
+  --color-status-gray: #5b6472;
+
+  --font-display: "Space Grotesk", -apple-system, "Segoe UI", sans-serif;
+  --font-sans: "IBM Plex Sans", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
 html,
 body {
-  background-color: #0a0a0a;
-  color: #e5e5e5;
+  background-color: var(--color-void);
+  color: var(--color-ink);
   color-scheme: dark;
+  font-family: var(--font-sans);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* Visible keyboard focus everywhere (quality floor) — a soft signal-blue ring, never suppressed. */
+:focus-visible {
+  outline: 2px solid var(--color-signal);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* The scanning-pulse: a slow breathing glow for "watchdog scanning" and the live-timeline cursor —
+   the one recurring motion signature in the app, reused nowhere else so it stays legible as "this
+   specific thing is live right now." */
+@keyframes scan-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-signal) 55%, transparent);
+  }
+  50% {
+    opacity: 0.55;
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--color-signal) 0%, transparent);
+  }
+}
+
+.animate-scan-pulse {
+  animation: scan-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes fade-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-step-in {
+  animation: fade-slide-in 0.32s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-scan-pulse,
+  .animate-step-in {
+    animation: none !important;
+  }
 }

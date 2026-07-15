@@ -1,81 +1,84 @@
-import { useEffect, useState } from "react";
+import { Wordmark } from "./components/Wordmark";
+import { Pill } from "./components/Pill";
+import { getIncidents, getState } from "./lib/api";
+import { usePoll } from "./lib/poll";
+import { ToastProvider } from "./lib/toast";
+import type { StateResponse } from "./lib/types";
+import { ChaosPanel } from "./panels/Chaos";
+import { ChatTab } from "./panels/Chat";
+import { IncidentsPanel } from "./panels/Incidents";
+import { SystemView, WorldStatusBanner } from "./panels/System";
 
-type HealthResponse = {
-  ok: boolean;
-  worldStatus: string;
-};
+const STATE_POLL_MS = 5000;
+const INCIDENTS_POLL_MS = 10_000;
 
-type HealthState =
-  | { status: "loading" }
-  | { status: "ok"; data: HealthResponse }
-  | { status: "error"; message: string };
-
-function StatusBadge({ health }: { health: HealthState }) {
-  if (health.status === "loading") {
-    return (
-      <span className="rounded-full border border-neutral-700 px-3 py-1 text-sm text-neutral-400">
-        checking…
-      </span>
-    );
+function WorldStatusPill({ state, error }: { state: StateResponse | undefined; error: unknown }) {
+  if (state === undefined) {
+    if (error !== undefined) return <Pill color="var(--color-status-red)">offline</Pill>;
+    return <Pill color="var(--color-ink-faint)">connecting…</Pill>;
   }
-
-  if (health.status === "error") {
-    return (
-      <span className="rounded-full border border-red-800 bg-red-950 px-3 py-1 text-sm text-red-400">
-        offline
-      </span>
-    );
-  }
-
-  const isOk = health.data.ok;
+  const ws = state.worldStatus.worldStatus;
+  const color =
+    ws === "running" ? "var(--color-status-green)" : ws === "unseeded" ? "var(--color-status-amber)" : "var(--color-signal)";
   return (
-    <span
-      className={
-        isOk
-          ? "rounded-full border border-emerald-800 bg-emerald-950 px-3 py-1 text-sm text-emerald-400"
-          : "rounded-full border border-red-800 bg-red-950 px-3 py-1 text-sm text-red-400"
-      }
-    >
-      {isOk ? `OK · ${health.data.worldStatus}` : "unhealthy"}
-    </span>
+    <Pill color={color} pulse={ws !== "running"}>
+      {ws}
+    </Pill>
+  );
+}
+
+function LoadingCard({ label }: { label: string }) {
+  return (
+    <section className="flex min-h-[220px] items-center justify-center rounded-2xl border border-hairline bg-panel/40 p-5">
+      <p className="text-xs text-ink-dim">{label}</p>
+    </section>
+  );
+}
+
+function Dashboard() {
+  const state = usePoll(getState, STATE_POLL_MS);
+  const incidentsPoll = usePoll(getIncidents, INCIDENTS_POLL_MS);
+  const incidents = incidentsPoll.data?.incidents ?? [];
+
+  return (
+    <div className="min-h-screen bg-void text-ink">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-hairline px-4 py-4 sm:px-6 lg:px-8">
+        <div className="flex flex-wrap items-center gap-3 sm:gap-6">
+          <Wordmark />
+          <nav className="flex items-center gap-1 rounded-lg border border-hairline bg-panel p-1">
+            <span className="whitespace-nowrap rounded-md bg-panel-raised px-3 py-1.5 font-mono text-xs uppercase tracking-wide text-ink">Dashboard</span>
+            <ChatTab />
+          </nav>
+        </div>
+        <WorldStatusPill state={state.data} error={state.error} />
+      </header>
+
+      <main className="mx-auto flex max-w-[1440px] flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8">
+        {state.data && <WorldStatusBanner worldStatus={state.data.worldStatus} />}
+
+        <div className="grid grid-cols-1 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
+          {state.data ? (
+            <SystemView state={state.data} incidents={incidents} />
+          ) : (
+            <LoadingCard label={state.error !== undefined ? "Couldn't reach Watchtower's API." : "Loading system view…"} />
+          )}
+          {state.data ? (
+            <ChaosPanel worldStatus={state.data.worldStatus} onActionSettled={state.refresh} />
+          ) : (
+            <LoadingCard label="Loading chaos panel…" />
+          )}
+        </div>
+
+        <IncidentsPanel incidents={incidents} worldStatus={state.data?.worldStatus.worldStatus ?? "unseeded"} />
+      </main>
+    </div>
   );
 }
 
 export default function App() {
-  const [health, setHealth] = useState<HealthState>({ status: "loading" });
-
-  useEffect(() => {
-    let cancelled = false;
-
-    fetch("/api/health")
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = (await res.json()) as HealthResponse;
-        if (!cancelled) setHealth({ status: "ok", data });
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          setHealth({
-            status: "error",
-            message: err instanceof Error ? err.message : "Unknown error",
-          });
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-100">
-      <header className="flex items-center justify-between border-b border-neutral-800 px-6 py-4">
-        <h1 className="text-xl font-semibold tracking-tight">Watchtower</h1>
-        <StatusBadge health={health} />
-      </header>
-      <main className="px-6 py-8 text-neutral-400">
-        <p>Production-watchdog agent. Panels land in later tasks.</p>
-      </main>
-    </div>
+    <ToastProvider>
+      <Dashboard />
+    </ToastProvider>
   );
 }

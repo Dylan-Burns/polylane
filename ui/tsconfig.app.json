@@ -21,5 +21,12 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["src"]
+  "include": [
+    "src",
+    "../src/sim/scenarios.ts",
+    "../src/sim/generator.ts",
+    "../src/sim/topology.ts",
+    "../src/sim/rng.ts",
+    "../src/telemetry/types.ts"
+  ]
 }

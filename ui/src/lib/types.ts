@@ -1,0 +1,141 @@
+/**
+ * JSON shapes the UI consumes from the API (spec §10/§11). Two sourcing strategies, deliberately
+ * mixed:
+ *
+ *  - Types from dependency-free server modules (`src/telemetry/types.ts`, `src/sim/scenarios.ts`)
+ *    are imported directly below — a real single source of truth, not a copy that can drift.
+ *    `ui/tsconfig.app.json`'s `include` is widened to cover exactly these files (plus their own
+ *    dependency-free imports) so `tsc -b` can typecheck across the project boundary.
+ *  - Types whose *source* module transitively imports D1-typed code (`D1Database`,
+ *    `DurableObjectState` — `src/telemetry/state.ts`, `src/telemetry/read.ts`,
+ *    `src/agent/report-schema.ts`, `src/sim/simulator-do.ts`) are hand-mirrored here instead:
+ *    importing those modules would drag `@cloudflare/workers-types`-only globals into a Vite
+ *    project that never installs that package. Each mirror below cites its source file/type name;
+ *    keep them in sync by hand when the matching server-side shape changes.
+ */
+
+import type { FaultState, ScenarioId } from "../../../src/sim/scenarios";
+import type { IncidentView, LogLine, Span, TraceView } from "../../../src/telemetry/types";
+
+export type { FaultState, IncidentView, LogLine, ScenarioId, Span, TraceView };
+
+// --- /api/state (mirrors src/telemetry/state.ts's exported interfaces) --------------------------
+
+export type HealthStatus = "red" | "amber" | "green";
+
+export interface TopologyServiceNode {
+  name: string;
+  external?: boolean;
+}
+
+export interface TopologyPayload {
+  services: TopologyServiceNode[];
+  edges: [string, string][];
+}
+
+export interface SparklinePoint {
+  minute_ts: number;
+  count: number;
+  error_rate: number;
+  p95: number;
+}
+
+/** Mirrors `src/sim/simulator-do.ts`'s `WorldStatus` (not imported directly — that module pulls in
+ * the full Durable Object/D1 write path). */
+export type WorldStatus = "unseeded" | "seeding" | "running" | "resetting";
+
+export interface WorldStatusView {
+  worldStatus: WorldStatus;
+  fault: FaultState;
+  generation: number;
+  seedProgress?: number;
+}
+
+export interface OpsHealth {
+  lastSweepOkMs?: number;
+  retentionWatermarkAgeMs?: number;
+}
+
+export interface StateResponse {
+  topology: TopologyPayload;
+  health: Record<string, HealthStatus>;
+  sparklines: Record<string, SparklinePoint[]>;
+  worldStatus: WorldStatusView;
+  opsHealth: OpsHealth;
+}
+
+// --- /api/incidents/:id (mirrors src/telemetry/read.ts's StepView + src/api/routes.ts's
+// IncidentDetailResponse) -------------------------------------------------------------------------
+
+export interface StepView {
+  step_no: number;
+  kind: "tool_call" | "tool_result" | "note" | "report" | "error";
+  content: unknown;
+  ts_ms: number;
+  tokens_in: number;
+  tokens_out: number;
+}
+
+export interface IncidentDetailResponse {
+  incident: IncidentView;
+  steps: StepView[];
+}
+
+export interface IncidentListResponse {
+  incidents: IncidentView[];
+  total: number;
+}
+
+// --- Report (mirrors src/agent/report-schema.ts's Report + friends) ------------------------------
+
+export interface ReportTimelineEntry {
+  time: string;
+  description: string;
+}
+
+export interface ReportRootCause {
+  hypothesis: string;
+  mechanism: string;
+}
+
+export interface ReportEvidenceEntry {
+  description: string;
+  trace_id: string | null;
+  metric: string | null;
+  log_excerpt: string | null;
+  /** Present for every entry whose `trace_id` is non-null once the report has been submitted
+   * (`embedEvidence` runs before `report_json` is ever written) — the trace's span-tree view
+   * fetched at submit time, or `{error}` if that fetch itself failed. */
+  embedded?: TraceView | { error: string };
+}
+
+export interface ReportBlastRadius {
+  affected_services: string[];
+  customer_impact: string;
+}
+
+export interface ReportConfidence {
+  level: "low" | "medium" | "high";
+  why: string;
+}
+
+export interface Report {
+  summary: string;
+  timeline: ReportTimelineEntry[];
+  root_cause: ReportRootCause;
+  evidence: ReportEvidenceEntry[];
+  blast_radius: ReportBlastRadius;
+  confidence: ReportConfidence;
+  suggested_action: string;
+}
+
+// --- Chaos endpoints (mirror src/sim/simulator-do.ts's handler response bodies) ------------------
+
+export interface ChaosFaultBody {
+  fault: FaultState;
+}
+
+export interface ChaosErrorBody {
+  error?: string;
+  retryAfterMs?: number;
+}
