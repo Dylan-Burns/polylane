@@ -41,6 +41,7 @@
 
 import { computeBaselines, getBaselines } from "./baselines";
 import { evaluate, type Anomaly } from "./rules";
+import { investigatorStub } from "../agent/investigator-do";
 import type { Env } from "../env";
 import { MINUTE_MS } from "../sim/backfill";
 import { simulatorStub } from "../sim/simulator-do";
@@ -124,15 +125,15 @@ async function tryConsumeInvestigationBudget(db: D1Database, nowMs: number): Pro
   return true;
 }
 
-/** Best-effort notification of `env.INVESTIGATOR`'s singleton stub — fire-and-forget: the
- * InvestigatorDO is still the Task-1.4-era 501 stub (TODO Task 4.2), which has no state machine to
- * react to yet, so any response (including 501) is treated as "successfully notified." A thrown
- * fetch (DO unreachable) is caught and logged, never allowed to fail the sweep. */
+/** Best-effort notification of `env.INVESTIGATOR`'s singleton stub — fire-and-forget: `/start`
+ * returns as soon as `InvestigatorDO` has durably recorded the investigation and armed its alarm
+ * (Task 4.2), well before the loop itself runs, so this call is fast regardless of how long the
+ * investigation ends up taking. A thrown fetch (DO unreachable) is caught and logged, never
+ * allowed to fail the sweep. */
 async function notifyInvestigator(env: Env, incidentId: string, anomalies: readonly Anomaly[]): Promise<void> {
   const statement = anomalies.map((a) => a.statement).join(" | ");
   try {
-    const stub = env.INVESTIGATOR.get(env.INVESTIGATOR.idFromName("investigator"));
-    await stub.fetch("http://investigator/start", {
+    await investigatorStub(env).fetch("http://investigator/start", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ incidentId, statement }),

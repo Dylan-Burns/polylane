@@ -11,7 +11,7 @@ declare namespace Cloudflare {
     // Real DO/env bindings (mirrors src/env.d.ts) so integration tests can reach SimulatorDO via
     // `import { env } from "cloudflare:workers"` the same way production code does.
     SIMULATOR: DurableObjectNamespace<import("../src/sim/simulator-do").SimulatorDO>;
-    INVESTIGATOR: DurableObjectNamespace;
+    INVESTIGATOR: DurableObjectNamespace<import("../src/agent/investigator-do").InvestigatorDO>;
     SIM_RATE: string;
   }
 }

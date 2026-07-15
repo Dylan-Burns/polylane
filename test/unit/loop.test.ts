@@ -363,6 +363,10 @@ describe("runLoop", () => {
     const salvageMsg = salvageReq?.messages[2];
     expect(salvageMsg?.role).toBe("user");
     expect(((salvageMsg?.content as ContentBlockParam[])[0] as { text: string }).text).toBe("conclude with what you have; state low confidence");
+
+    // Review-mandated: a "note" step lands the instant salvage begins, so a caller persisting
+    // steps live (Task 4.2) sees an explicit marker instead of a silent gap until the report.
+    expect(result.steps.map((s) => s.kind)).toEqual(["note", "report"]);
   });
 
   it("[3b] salvage response also end_turn/no-report -> outcome failed", async () => {

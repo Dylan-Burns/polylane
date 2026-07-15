@@ -83,8 +83,14 @@ export interface LoopConfig {
   submitReportTool?: ToolDef;
   /** Persistence hook — awaited BEFORE the next model call (behavioral contract test 8), so a
    * caller (Task 4.2's `InvestigatorDO`) can guarantee a step is durable before any further model
-   * spend happens. */
-  onStep?: (step: StepRecord) => Promise<void>;
+   * spend happens. The second argument is a read-only snapshot of loop-internal state as of
+   * *this* step (Task 4.2's resume-fidelity persistence): `messages` is the exact array this
+   * module holds (never copy-on-write internally — a caller that needs to persist it durably
+   * should shallow-copy before handing it to a storage API), `usage`/`iterations` are the running
+   * totals `cfg.caps.maxTokensIn`/`maxTokensOut`/`maxSteps` are compared against, letting a caller
+   * resume later with the exact remaining budget rather than reconstructing it from `StepRecord`
+   * summaries (which deliberately don't carry raw content blocks/signed thinking blocks). */
+  onStep?: (step: StepRecord, ctx: StepContext) => Promise<void>;
   /** Undelivered detector updates, checked once per iteration; a non-null return is injected as a
    * user message (prefixed `"detector update: "`) immediately before the next model call. */
   checkUpdates?: () => Promise<string | null>;
@@ -102,6 +108,13 @@ export interface LoopResult {
   text?: string;
   steps: StepRecord[];
   usage: { in: number; out: number };
+}
+
+/** See `LoopConfig.onStep`'s doc comment. */
+export interface StepContext {
+  messages: readonly MessageParam[];
+  usage: { in: number; out: number };
+  iterations: number;
 }
 
 // --- Constants -----------------------------------------------------------------------------
@@ -314,7 +327,7 @@ export async function runLoop(cfg: LoopConfig, initialMessages: MessageParam[]):
     stepNo += 1;
     const step: StepRecord = { step_no: stepNo, kind, content, ts_ms: cfg.nowFn(), tokens_in: tokensInDelta, tokens_out: tokensOutDelta };
     steps.push(step);
-    if (cfg.onStep) await cfg.onStep(step);
+    if (cfg.onStep) await cfg.onStep(step, { messages, usage: usage(), iterations });
   }
 
   /** One model call: builds params, calls `cfg.llm.create` with a per-call timeout clamped to the
@@ -348,6 +361,11 @@ export async function runLoop(cfg: LoopConfig, initialMessages: MessageParam[]):
       return { outcome: "failed", steps, usage: usage() };
     }
     const submitReportTool = cfg.submitReportTool;
+    // Review-mandated (Task 4.1 closeout): a "note" step lands right as salvage begins, so a
+    // caller watching `investigation_steps` (Task 4.2's stuck-watchdog / UI timeline) sees an
+    // explicit marker that the loop is concluding rather than a silent gap — every gap is now
+    // bounded by ~one model call, not by however long the salvage request itself takes.
+    await record("note", { text: "entering salvage: concluding with the evidence gathered so far (cap reached, no report yet, or a repeated tool call)" });
     messages.push({ role: "user", content: [{ type: "text", text: SALVAGE_INSTRUCTION }] });
     const response = await callModel({
       toolChoice: { type: "tool", name: submitReportTool.name },

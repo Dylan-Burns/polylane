@@ -1,9 +1,9 @@
-import { DurableObject } from "cloudflare:workers";
 import { Hono } from "hono";
 import { runSweep } from "./detect/sweep";
 import type { Env } from "./env";
 import { chaosRoutes, handleAdminReset } from "./api/chaos";
 import { simulatorStub, SimulatorDO } from "./sim/simulator-do";
+import { InvestigatorDO } from "./agent/investigator-do";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -30,13 +30,7 @@ app.route("/api/chaos", chaosRoutes);
 app.post("/api/admin/reset", handleAdminReset);
 
 export { SimulatorDO };
-
-/** Stub — replaced with the real investigation agent loop in Task 4.2. */
-export class InvestigatorDO extends DurableObject<Env> {
-  async fetch(_request: Request): Promise<Response> {
-    return new Response("Not Implemented", { status: 501 });
-  }
-}
+export { InvestigatorDO };
 
 export default {
   fetch: app.fetch,

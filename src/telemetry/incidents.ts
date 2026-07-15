@@ -14,11 +14,11 @@
  * the generic "ended" column — see `setStatus`'s doc comment), then stops. `resolved` never
  * suppresses. `reported` is treated identically to `open`/`investigating` (permanent suppression,
  * no re-arm) — spec §8 describes a `follow_up_of`-linked incident opening for anomalies that arrive
- * after `reported` and persist past a re-arm delay, but that mechanism is driven by the
- * investigator loop reacting to post-report anomalies (Task 4.2, not yet built — `InvestigatorDO`
- * is still the Task-1.4-era 501 stub), so it's out of scope here; this file's dedupe binding text
- * ("suppressed by covering fingerprints on `open|investigating|reported`") is honored literally,
- * and `follow_up_of` is left unused pending that task. TODO(Task 4.2).
+ * after `reported` and persist past a re-arm delay, but that mechanism is a distinct follow-up
+ * investigation trigger, not part of Task 4.2's persistence/resume/budgets scope, so it's still out
+ * of scope here; this file's dedupe binding text ("suppressed by covering fingerprints on
+ * `open|investigating|reported`") is honored literally, and `follow_up_of` is left unused pending
+ * that future task.
  *
  * Coverage is resolved **per fingerprint**, not batch-wide: `openIncident`/`appendFingerprints` both
  * look up which specific incident (if any) currently owns each individual fingerprint in the batch,
@@ -447,6 +447,71 @@ export async function setStatus(db: D1Database, id: string, status: IncidentStat
   }
   params.push(id);
   await db.prepare(`UPDATE incidents SET ${sets.join(", ")} WHERE id = ?`).bind(...params).run();
+}
+
+/**
+ * Like `setStatus`, but the write only applies while the incident's CURRENT status is exactly
+ * `fromStatus` (`UPDATE ... WHERE id = ? AND status = ?`) — returns whether the transition actually
+ * happened. Task 4.2's guarded report/failure write: `InvestigatorDO` finishes a (possibly
+ * long-running, resumed-after-a-crash) investigation and wants to write `reported`/`failed`, but
+ * the stuck-investigation watchdog (`forceFailStuck`) or a world reset (`api/chaos.ts`) may have
+ * already force-failed the SAME incident out from under it while it was still running. Returning
+ * `false` (0 rows changed) rather than throwing or silently overwriting lets the caller detect that
+ * race and log a "discarded" note instead of clobbering whichever terminal state won.
+ */
+export async function setStatusGuarded(
+  db: D1Database,
+  id: string,
+  fromStatus: IncidentStatus,
+  toStatus: IncidentStatus,
+  opts?: SetStatusOptions,
+): Promise<boolean> {
+  const sets: string[] = ["status = ?"];
+  const params: unknown[] = [toStatus];
+  if (opts?.ts) {
+    sets.push(`${opts.ts.field} = ?`);
+    params.push(opts.ts.value);
+  }
+  if (opts?.reportPatch) {
+    sets.push("report_json = ?");
+    params.push(JSON.stringify(opts.reportPatch));
+  }
+  params.push(id, fromStatus);
+  const res = await db
+    .prepare(`UPDATE incidents SET ${sets.join(", ")} WHERE id = ? AND status = ?`)
+    .bind(...params)
+    .run();
+  return (res.meta?.changes ?? 0) > 0;
+}
+
+// --- investigation_steps -----------------------------------------------------------------------
+
+/** One `investigation_steps` row (Task 4.2: `InvestigatorDO`'s human-readable UI-timeline
+ * projection, the second of the loop's "two representations" — see `agent/loop.ts`'s `StepRecord`
+ * for the first, byte-exact one that lives in DO storage instead of D1). `INSERT OR IGNORE` on the
+ * `(incident_id, step_no)` PK: a resumed investigation re-deriving the same step number after a
+ * crash (this should not normally happen given `InvestigatorDO`'s own step-number bookkeeping, but
+ * costs nothing to make idempotent, matching this codebase's other resumable writes — e.g.
+ * `seed-incident.ts`'s backfill-retry inserts) skips cleanly instead of throwing on the PK
+ * collision. */
+export interface InvestigationStepInput {
+  incidentId: string;
+  stepNo: number;
+  kind: "tool_call" | "tool_result" | "note" | "report" | "error";
+  contentJson: string;
+  tsMs: number;
+  tokensIn: number;
+  tokensOut: number;
+}
+
+export async function insertInvestigationStep(db: D1Database, input: InvestigationStepInput): Promise<void> {
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO investigation_steps (incident_id, step_no, kind, content_json, ts_ms, tokens_in, tokens_out)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(input.incidentId, input.stepNo, input.kind, input.contentJson, input.tsMs, input.tokensIn, input.tokensOut)
+    .run();
 }
 
 // --- autoResolve ------------------------------------------------------------------------------

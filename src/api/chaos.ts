@@ -13,10 +13,12 @@
  * happened. This is the Task 1.4 carry-forward (`SimulatorDO.abortActiveInvestigation`'s TODO):
  * `SimulatorDO` itself can't reach into `incidents` (spec §6: fault state lives in SimulatorDO
  * storage only, telemetry writes live in D1 — the DO never mixes the two), so the abort has to
- * happen here, at the one call site that already knows a reset is genuinely underway. TODO(Task
- * 4.2): once InvestigatorDO tracks a real active investigation, also call its `/abort` here so an
- * in-flight model loop stops promptly instead of running to its own budget caps against a wiped
- * world.
+ * happen here, at the one call site that already knows a reset is genuinely underway. Task 4.2
+ * closes the loop: once a reset is confirmed underway, this also calls `InvestigatorDO`'s
+ * `/abort` — not just for the in-flight model loop to stop promptly instead of burning its budget
+ * against a wiped world, but because the DO's OWN 1-concurrent invariant (`active` in DO storage)
+ * has no other way to learn the incident it's tracking just got force-failed here; without this
+ * call, `active` would stay wedged on that incident id forever, 409ing every future `/start`.
  */
 
 import type { Context } from "hono";
@@ -25,6 +27,7 @@ import type { Env } from "../env";
 import { simulatorStub } from "../sim/simulator-do";
 import { SCENARIOS, type ScenarioId } from "../sim/scenarios";
 import { healthClearStatement } from "../telemetry/incidents";
+import { investigatorStub } from "../agent/investigator-do";
 
 const VALID_SCENARIOS: ReadonlySet<string> = new Set(Object.keys(SCENARIOS));
 
@@ -83,6 +86,23 @@ async function failActiveIncidents(db: D1Database, nowMs: number): Promise<void>
   ]);
 }
 
+/** Best-effort `InvestigatorDO` `/abort` call, gated the same way `failActiveIncidents` is (only
+ * once a reset is confirmed underway). A failure here is logged and does NOT block the response --
+ * the D1-side `failActiveIncidents` write is what actually protects the incident data; this call
+ * is what keeps the DO's own `active` flag from wedging, not something the reset's success depends
+ * on. */
+async function abortActiveInvestigation(env: Env): Promise<void> {
+  try {
+    await investigatorStub(env).fetch("http://investigator/abort", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reason: "world reset" }),
+    });
+  } catch (err) {
+    console.error("chaos: failed to abort the active investigation after reset", err);
+  }
+}
+
 export async function handleAdminReset(c: AppContext): Promise<Response> {
   const res = await simulatorStub(c.env).fetch("http://simulator/reset", { method: "POST" });
 
@@ -95,6 +115,7 @@ export async function handleAdminReset(c: AppContext): Promise<Response> {
     } catch (err) {
       console.error("chaos: failed to mark active incidents failed after reset", err);
     }
+    await abortActiveInvestigation(c.env);
   }
 
   return relay(res);
