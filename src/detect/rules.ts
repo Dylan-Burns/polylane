@@ -49,6 +49,12 @@
  *     one metric because a real traffic spike is high count BY DEFINITION — a "4x spike" onto
  *     fewer than 20 requests/min is not an event worth an investigation.
  *
+ * Honest residual: these gates are NOT globally zero-FP. A 12-day seeded sweep (independent
+ * review) measured ~0.17 FP/day — the two known leak modes at ~10-40x reduced frequency
+ * (an n=5 minute whose sample p50 legitimately doubles alongside one incidental timeout;
+ * three cascade-correlated propagated errors landing in one thin minute). The incident
+ * layer's dedupe + auto-resolve absorbs a spurious incident every ~6 days by design.
+ *
  * Two gates are TIGHTER than spec §8 v2.1's published values, forced by the multi-day
  * false-positive bound (the ratified escalation path: tighten via evidence gates, never via
  * traffic-volume gates) and validated to cost zero scenario-detection trials:
@@ -186,7 +192,7 @@ const METRIC_SPECS: readonly MetricSpec[] = [
       errorCountOf(point) >= HARD_ERROR_MIN_ERRORS &&
       point.error_rate >=
         Math.max(HARD_ERROR_RATE_FLOOR, b.error_rate ? HARD_ERROR_RATE_BASELINE_MULT * b.error_rate.median : 0),
-    // Missing baseline row => the absolute 5% floor alone; >= 2 errors required in each minute.
+    // Missing baseline row => the absolute 5% floor alone; >= 3 errors required in each minute.
     sustainedBreaches: (point, b) =>
       errorCountOf(point) >= SUSTAINED_ERROR_MIN_ERRORS &&
       point.error_rate >
