@@ -233,6 +233,24 @@ const METRIC_SPECS: readonly MetricSpec[] = [
   },
 ];
 
+/**
+ * Whether `point`'s own single completed minute would satisfy ANY metric class's sustained-rule
+ * ratio-plus-evidence-gate check, evaluated in isolation from the immediately preceding minute —
+ * i.e. exactly the per-minute half of `evaluate`'s sustained check, without also requiring the
+ * identical breach in `lastMinutes[1]`. `evaluate` itself always demands two consecutive breaching
+ * minutes before calling something "sustained" (see the top doc comment's rule table), which is
+ * precisely why a single breaching minute alone never opens an incident on its own — this export
+ * lets a caller observe that "one-minute-in" state before the sweep's own two-minute rule would.
+ *
+ * Exposed for `/api/state`'s amber health mapping (spec §10: "last completed minute breaches a
+ * sustained-rule threshold but isn't yet sustained (pre-incident)") so that mapping reuses these
+ * exact thresholds/evidence gates instead of a second, driftable copy of the constants above.
+ */
+export function breachesSustainedThreshold(point: MetricPoint, baselines: BaselineMap): boolean {
+  const opBaselines = opBaselinesFor(baselines, point.service, point.operation);
+  return METRIC_SPECS.some((spec) => spec.sustainedBreaches(point, opBaselines));
+}
+
 /** One (service, operation, metricClass) breach observation, before fingerprint consolidation. */
 interface Breach {
   service: string;

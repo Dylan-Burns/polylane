@@ -58,6 +58,12 @@ import { sweepRetention } from "../telemetry/retention";
 const BASELINE_RECOMPUTE_INTERVAL_MIN = 15;
 const RETENTION_MAX_ROWS = 5000;
 
+/** Meta key holding the epoch-ms `nowMs` of the most recent sweep tick that ran to completion
+ * (world running, all four subtasks attempted — see the bottom of `runSweep`). Exported so
+ * `telemetry/state.ts`'s `getOpsHealth` (Task 5.1's `/api/state` ops-health panel) reads the exact
+ * key this file writes, rather than a second hand-copied literal. */
+export const LAST_SWEEP_OK_META_KEY = "last_sweep_ok_ms";
+
 const INVESTIGATION_RATE_LIMIT = 10;
 const INVESTIGATION_RATE_WINDOW_MS = 60 * 60_000;
 const INVESTIGATION_BUDGET_META_KEY = "investigation_count_hour";
@@ -245,5 +251,16 @@ export async function runSweep(env: Env, nowMs: number = Date.now()): Promise<vo
     await sweepRetention(env.DB, nowMs, { maxRows: RETENTION_MAX_ROWS });
   } catch (err) {
     console.error("sweep: retention subtask failed", err);
+  }
+
+  // Recorded last, and only reached once the tick has run to completion (world running, every
+  // subtask above attempted — each is individually try/caught, so a subtask's own failure never
+  // stops us from getting here). `/api/state`'s ops-health panel surfaces this so the UI can flag
+  // "the sweep hasn't run recently" if it stops advancing (e.g. the cron trigger itself breaks,
+  // which no in-Worker try/catch can detect from the inside).
+  try {
+    await env.DB.prepare(`REPLACE INTO meta (key, value) VALUES (?, ?)`).bind(LAST_SWEEP_OK_META_KEY, String(nowMs)).run();
+  } catch (err) {
+    console.error("sweep: failed to record the last-sweep-ok watermark", err);
   }
 }

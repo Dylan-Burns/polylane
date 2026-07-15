@@ -3,7 +3,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
 import { computeBaselines } from "../../src/detect/baselines";
 import type { Anomaly } from "../../src/detect/rules";
-import { runSweep } from "../../src/detect/sweep";
+import { LAST_SWEEP_OK_META_KEY, runSweep } from "../../src/detect/sweep";
 import type { Env } from "../../src/env";
 import { seedForWindow } from "../../src/sim/backfill";
 import { generateWindow, rollupFromStats } from "../../src/sim/generator";
@@ -181,6 +181,21 @@ describe("runSweep: subtask isolation and the world-status gate", () => {
     expect(incidents?.n).toBe(0);
   });
 
+  it("does NOT record last_sweep_ok_ms when the world isn't running (every subtask, including this one, is skipped)", async () => {
+    // Explicit, not relied-upon-default: other tests in this file leave the shared 'world'
+    // SimulatorDO singleton's storage at 'running', so this pins the precondition instead of
+    // trusting whatever an earlier test left behind.
+    const simStub = env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
+    await runInDurableObject(simStub, async (_instance, state) => {
+      await state.storage.put("worldStatus", "unseeded");
+    });
+    const testEnv = makeTestEnv(makeMockInvestigator([]));
+    await runSweep(testEnv, ANCHOR);
+
+    const row = await env.DB.prepare("SELECT value FROM meta WHERE key = ?").bind(LAST_SWEEP_OK_META_KEY).first<{ value: string }>();
+    expect(row).toBeNull();
+  });
+
   it("a throwing retention subtask does not prevent detection (which runs first) from opening an incident", async () => {
     await insertHealthyHistory(env.DB, ANCHOR, DAY_MIN);
     await computeBaselines(env.DB, ANCHOR);
@@ -226,6 +241,37 @@ describe("runSweep: subtask isolation and the world-status gate", () => {
     expect(incidents?.n).toBe(1);
     expect(started).toHaveLength(1);
   }, 30_000);
+});
+
+describe("runSweep: last-sweep-ok watermark", () => {
+  it("records last_sweep_ok_ms in meta once a tick against a running world runs to completion", async () => {
+    await insertRollups(env.DB, healthyMinute(ANCHOR - MIN));
+    const simStub = env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
+    await runInDurableObject(simStub, async (_instance, state) => {
+      await state.storage.put("worldStatus", "running");
+    });
+    const testEnv = makeTestEnv(makeMockInvestigator([]));
+
+    await runSweep(testEnv, ANCHOR);
+
+    const row = await env.DB.prepare("SELECT value FROM meta WHERE key = ?").bind(LAST_SWEEP_OK_META_KEY).first<{ value: string }>();
+    expect(row?.value).toBe(String(ANCHOR));
+  });
+
+  it("advances on every subsequent successful tick (not a write-once value)", async () => {
+    await insertRollups(env.DB, healthyMinute(ANCHOR - MIN));
+    const simStub = env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
+    await runInDurableObject(simStub, async (_instance, state) => {
+      await state.storage.put("worldStatus", "running");
+    });
+    const testEnv = makeTestEnv(makeMockInvestigator([]));
+
+    await runSweep(testEnv, ANCHOR);
+    await runSweep(testEnv, ANCHOR + MIN);
+
+    const row = await env.DB.prepare("SELECT value FROM meta WHERE key = ?").bind(LAST_SWEEP_OK_META_KEY).first<{ value: string }>();
+    expect(row?.value).toBe(String(ANCHOR + MIN));
+  });
 });
 
 describe("runSweep: batch spanning two concurrently-open incidents (review FIX 1 regression)", () => {

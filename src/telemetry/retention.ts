@@ -24,7 +24,9 @@
 const SPANS_LOGS_RETENTION_MS = 6 * 60 * 60 * 1000;
 const ROLLUPS_RETENTION_MS = 72 * 60 * 60 * 1000;
 const DEFAULT_MAX_ROWS = 5000;
-const WATERMARK_KEY = "retention_watermark_ms";
+/** Exported so `telemetry/state.ts`'s `getOpsHealth` (Task 5.1's `/api/state` ops-health panel)
+ * reads the same key this file writes, rather than a second hand-copied literal. */
+export const RETENTION_WATERMARK_META_KEY = "retention_watermark_ms";
 
 interface Watermarks {
   spans: number;
@@ -35,7 +37,7 @@ interface Watermarks {
 const EPOCH_WATERMARKS: Watermarks = { spans: 0, logs: 0, rollups: 0 };
 
 async function loadWatermarks(db: D1Database): Promise<Watermarks> {
-  const row = await db.prepare(`SELECT value FROM meta WHERE key = ?`).bind(WATERMARK_KEY).first<{ value: string }>();
+  const row = await db.prepare(`SELECT value FROM meta WHERE key = ?`).bind(RETENTION_WATERMARK_META_KEY).first<{ value: string }>();
   if (!row) return { ...EPOCH_WATERMARKS };
   try {
     const parsed = JSON.parse(row.value) as Partial<Watermarks>;
@@ -53,7 +55,7 @@ async function loadWatermarks(db: D1Database): Promise<Watermarks> {
 }
 
 async function saveWatermarks(db: D1Database, watermarks: Watermarks): Promise<void> {
-  await db.prepare(`REPLACE INTO meta (key, value) VALUES (?, ?)`).bind(WATERMARK_KEY, JSON.stringify(watermarks)).run();
+  await db.prepare(`REPLACE INTO meta (key, value) VALUES (?, ?)`).bind(RETENTION_WATERMARK_META_KEY, JSON.stringify(watermarks)).run();
 }
 
 interface RetentionTarget {

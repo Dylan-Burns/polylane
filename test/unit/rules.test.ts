@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { baselineKey, type BaselineMap } from "../../src/detect/baselines";
-import { evaluate, type Anomaly } from "../../src/detect/rules";
+import { breachesSustainedThreshold, evaluate, type Anomaly } from "../../src/detect/rules";
 import { seedForWindow } from "../../src/sim/backfill";
 import { generateWindow, rollupFromStats } from "../../src/sim/generator";
 import { mulberry32 } from "../../src/sim/rng";
@@ -185,6 +185,45 @@ describe("evaluate: hard trip vs. sustained", () => {
         statement: "checkout error_rate 6.0% vs baseline 1.0% (sustained) since 14:00Z",
       },
     ]);
+  });
+});
+
+describe("breachesSustainedThreshold: the /api/state amber pre-incident check", () => {
+  it("true for a single minute alone that clears the sustained ratio + evidence gate", () => {
+    const baselines = mkBaselines([["checkout", "POST /checkout", "error_rate", 0.01, 0.005]]);
+    // 6%: above the sustained floor (max(5%, 1%+6*0.5%=4%) = 5%), 6 errors clears the >=3 gate --
+    // identical fixture to the "sustained needs the SAME ... in BOTH minutes" test above, but here
+    // asserting the single-minute half fires on its own, with no second minute involved at all.
+    const point = mkPoint("checkout", "POST /checkout", T0, { count: 100, error_rate: 0.06 });
+    expect(breachesSustainedThreshold(point, baselines)).toBe(true);
+  });
+
+  it("false in steady state (well under every sustained floor)", () => {
+    const baselines = mkBaselines([["checkout", "POST /checkout", "error_rate", 0.01, 0.005]]);
+    const point = mkPoint("checkout", "POST /checkout", T0, { count: 100, error_rate: 0.01 });
+    expect(breachesSustainedThreshold(point, baselines)).toBe(false);
+  });
+
+  it("false when the ratio breaches but the evidence gate (>= 3 errors) doesn't", () => {
+    const baselines = mkBaselines([["payments", "charge", "error_rate", 0.005, 0.002]]);
+    // 10% clears the sustained ratio, but only 2 errors -- below the >= 3-error evidence gate.
+    const point = mkPoint("payments", "charge", T0, { count: 20, error_rate: 0.1 });
+    expect(breachesSustainedThreshold(point, baselines)).toBe(false);
+  });
+
+  it("true for a hard-trip-level breach too (a bigger breach still clears the looser sustained gate)", () => {
+    const baselines = mkBaselines([["checkout", "POST /checkout", "error_rate", 0.01, 0.005]]);
+    const point = mkPoint("checkout", "POST /checkout", T0, { count: 100, error_rate: 0.3 });
+    expect(breachesSustainedThreshold(point, baselines)).toBe(true);
+  });
+
+  it("checks every metric class, e.g. a latency breach with p50 confirmation", () => {
+    const baselines = mkBaselines([
+      ["payments-db", "query_ledger", "p95", 30, 5],
+      ["payments-db", "query_ledger", "p50", 12, 2],
+    ]);
+    const point = mkPoint("payments-db", "query_ledger", T0, { count: 15, p50: 24, p95: 90 }); // p95 3x (> 2.5x), p50 2x confirms
+    expect(breachesSustainedThreshold(point, baselines)).toBe(true);
   });
 });
 
