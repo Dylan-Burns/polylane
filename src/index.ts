@@ -1,7 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { Hono } from "hono";
+import { runSweep } from "./detect/sweep";
 import type { Env } from "./env";
-import { SimulatorDO } from "./sim/simulator-do";
+import { chaosRoutes, handleAdminReset } from "./api/chaos";
+import { simulatorStub, SimulatorDO } from "./sim/simulator-do";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -9,8 +11,7 @@ const app = new Hono<{ Bindings: Env }>();
  * `null` on any failure so callers can fall back rather than 500ing the whole request. */
 async function fetchWorldStatus(env: Env): Promise<{ worldStatus: string } | null> {
   try {
-    const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
-    const res = await stub.fetch("http://simulator/status");
+    const res = await simulatorStub(env).fetch("http://simulator/status");
     if (!res.ok) return null;
     return await res.json();
   } catch {
@@ -23,14 +24,10 @@ app.get("/api/health", async (c) => {
   return c.json({ ok: true, worldStatus: status?.worldStatus ?? "unseeded" });
 });
 
-/** Temporary direct route to the DO (task brief, Task 1.4 step 3) — superseded by a hardened
- * admin surface later; forwards straight to SimulatorDO's `/reset` and relays its response. */
-app.post("/api/admin/reset", async (c) => {
-  const stub = c.env.SIMULATOR.get(c.env.SIMULATOR.idFromName("world"));
-  const res = await stub.fetch("http://simulator/reset", { method: "POST" });
-  const body = await res.text();
-  return new Response(body, { status: res.status, headers: { "content-type": "application/json" } });
-});
+// Chaos panel (spec §6) + admin reset (Task 3.3): thin proxies to SimulatorDO, plus the
+// reset-time incident-abort carry-forward from Task 1.4 — see src/api/chaos.ts's doc comment.
+app.route("/api/chaos", chaosRoutes);
+app.post("/api/admin/reset", handleAdminReset);
 
 export { SimulatorDO };
 
@@ -43,7 +40,7 @@ export class InvestigatorDO extends DurableObject<Env> {
 
 export default {
   fetch: app.fetch,
-  async scheduled(_controller: ScheduledController, _env: Env, _ctx: ExecutionContext) {
-    console.log("scheduled trigger fired (no-op)");
+  async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
+    await runSweep(env, controller.scheduledTime);
   },
 } satisfies ExportedHandler<Env>;

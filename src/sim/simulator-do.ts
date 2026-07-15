@@ -24,10 +24,17 @@ import type { Deploy, LogLine, RollupRow, Span } from "../telemetry/types";
 import { BACKFILL_CHUNK_MS, BACKFILL_TOTAL_MS, MINUTE_MS, runBackfillChunk } from "./backfill";
 import { generateWindow, rollupFromStats, sampleForPersistence, type RequestStat } from "./generator";
 import { mulberry32 } from "./rng";
-import { deployEventsFor, effectsFor, type FaultState, type ScenarioId } from "./scenarios";
+import { deployEventsFor, effectsFor, SCENARIOS, type FaultState, type ScenarioId } from "./scenarios";
 import { insertSeededIncident } from "./seed-incident";
 
 export type WorldStatus = "unseeded" | "seeding" | "running" | "resetting";
+
+/** The single `idFromName('world')` SimulatorDO stub every caller (the HTTP routes, the sweep, the
+ * chaos proxies) talks to — factored out here so "world" isn't a string literal repeated at every
+ * call site. */
+export function simulatorStub(env: Env): DurableObjectStub {
+  return env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
+}
 
 /** Alarm cadence: drives both live ticking and (while seeding) one backfill chunk per firing. */
 const ALARM_INTERVAL_MS = 20_000;
@@ -35,12 +42,10 @@ const ALARM_INTERVAL_MS = 20_000;
 const CHAOS_COOLDOWN_MS = 30_000;
 const RESET_COOLDOWN_MS = 10 * 60_000;
 
-const VALID_SCENARIOS: ReadonlySet<ScenarioId> = new Set([
-  "bad-deploy",
-  "dependency-outage",
-  "latency-creep",
-  "traffic-spike",
-]);
+/** Derived from `scenarios.ts`'s own `SCENARIOS` map (single source of truth — `api/chaos.ts`'s
+ * route-level validation derives the same set the identical way) rather than a hand-maintained
+ * literal, so the two can never silently drift apart if a scenario is ever added or removed. */
+const VALID_SCENARIOS: ReadonlySet<ScenarioId> = new Set(Object.keys(SCENARIOS) as ScenarioId[]);
 
 interface BackfillState {
   generation: number;
