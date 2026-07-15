@@ -60,6 +60,65 @@ export function realLLM(env: Pick<Env, "ANTHROPIC_API_KEY">): LLM {
   };
 }
 
+/**
+ * Callbacks a streaming `LLM.create` call invokes as tokens arrive — chat mode's (Task 6.1) seam
+ * for turning per-iteration model calls into live SSE events without `loop.ts` (`runLoop`) needing
+ * to know anything about streaming, SSE, or chat at all. The design choice this project makes
+ * (documented here since the task brief asked for one, explicitly): `LoopConfig.llm` is a single
+ * object constructed ONCE per chat turn (in `api/chat.ts`) with these hooks already bound via
+ * closure over that turn's SSE writer, then reused UNCHANGED across every iteration of that turn's
+ * loop — exactly like `scriptedLLM`/`realLLM` are already reused unchanged across every iteration
+ * of the investigator's loop. That means the callback lives entirely inside the `LLM`
+ * implementation (`streamingLLM` below), never in `LoopConfig` or `runLoop` itself: zero changes
+ * to the domain-agnostic loop core, its tests, or the `LLM` interface's call signature — the
+ * alternative (threading an `onTextDelta` field through `LoopConfig` and `LLM.create`'s own
+ * parameter list) was rejected as strictly more invasive for no behavioral gain, since the
+ * callback never varies within a single loop run either way.
+ */
+export interface StreamHooks {
+  /** Fired for each text delta as the assistant's response streams in. */
+  onTextDelta?: (text: string) => void;
+  /** Fired at most ONCE per `create()` call, on the first thinking delta observed — chat mode only
+   * needs a single "thinking…" activity ping per model call (spec §9: surfaced as a "thinking…" SSE
+   * event so streaming stays lively), not the actual (possibly multi-chunk, and policy-summarized
+   * anyway) thinking text itself, which the wire protocol's `{type: 'thinking'}` event carries no
+   * field for. */
+  onThinking?: () => void;
+}
+
+/**
+ * The streaming counterpart to `realLLM` (Task 6.1, chat mode): identical client construction,
+ * retry policy, and timeout clamping, but issues `client.messages.stream()` instead of `.create()`
+ * so `hooks.onTextDelta`/`onThinking` fire as tokens arrive — while still resolving to the exact
+ * same `Message` shape `LLM.create` always promises, so `runLoop`'s verbatim-echo, cache_control,
+ * and usage-accounting logic is entirely unaware whether a given call was streamed. One
+ * `streamingLLM(...)` is constructed per chat turn (see `api/chat.ts`'s handler), with `hooks`
+ * closing over that turn's SSE stream.
+ */
+export function streamingLLM(env: Pick<Env, "ANTHROPIC_API_KEY">, hooks: StreamHooks = {}): LLM {
+  const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY, maxRetries: 3, timeout: DEFAULT_TIMEOUT_MS });
+  return {
+    async create(params, timeoutMs) {
+      const timeout = timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : Math.max(0, Math.min(DEFAULT_TIMEOUT_MS, timeoutMs));
+      const stream = client.messages.stream(params, { timeout });
+      if (hooks.onTextDelta) {
+        const onTextDelta = hooks.onTextDelta;
+        stream.on("text", (delta) => onTextDelta(delta));
+      }
+      if (hooks.onThinking) {
+        const onThinking = hooks.onThinking;
+        let fired = false;
+        stream.on("thinking", () => {
+          if (fired) return;
+          fired = true;
+          onThinking();
+        });
+      }
+      return await stream.finalMessage();
+    },
+  };
+}
+
 /** `scriptedLLM`'s own interface: everything `LLM` has, plus the captured call history tests
  * assert against. `requests`/`timeouts` are parallel arrays (same index = same call) rather than
  * an array of pairs, so tests can `expect(llm.requests[1].messages)...` without destructuring. */
@@ -95,6 +154,42 @@ export function scriptedLLM(script: readonly Message[]): ScriptedLLM {
       }
       const response = script[next] as Message;
       next += 1;
+      return response;
+    },
+  };
+}
+
+/**
+ * Bridges `scriptedLLM`'s deterministic script playback with `streamingLLM`'s `StreamHooks`
+ * contract — Task 6.1's chat integration test needs to exercise the REAL SSE event-emission code
+ * path (real hooks firing, real event serialization) with the network down, where `scriptedLLM`
+ * alone resolves a whole `Message` with no deltas at all. Fires `hooks.onThinking` once if the
+ * scripted response contains a `thinking` block, then `hooks.onTextDelta` once per `text` block
+ * (whole-block, not sub-chunked — a single deterministic delta per block is enough to prove the
+ * wiring end to end without making tests fuss over chunk boundaries), before resolving with the
+ * exact scripted `Message` — otherwise identical to `scriptedLLM` (same script-exhaustion error,
+ * same `requests`/`timeouts` capture).
+ */
+export function scriptedStreamingLLM(script: readonly Message[], hooks: StreamHooks = {}): ScriptedLLM {
+  const inner = scriptedLLM(script);
+  return {
+    requests: inner.requests,
+    timeouts: inner.timeouts,
+    async create(params, timeoutMs) {
+      const response = await inner.create(params, timeoutMs);
+      // One pass in CONTENT-BLOCK ORDER (not thinking-then-text unconditionally): the hooks must
+      // fire in the same relative order a real streamed response would produce them, so a test
+      // script with an unusual block ordering exercises exactly that ordering downstream instead
+      // of this double silently normalizing it.
+      let thinkingFired = false;
+      for (const block of response.content) {
+        if (block.type === "thinking" && hooks.onThinking && !thinkingFired) {
+          thinkingFired = true; // once per create(), mirroring streamingLLM's own once-guard
+          hooks.onThinking();
+        } else if (block.type === "text" && hooks.onTextDelta && block.text.length > 0) {
+          hooks.onTextDelta(block.text);
+        }
+      }
       return response;
     },
   };

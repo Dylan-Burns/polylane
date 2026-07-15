@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { runSweep } from "./detect/sweep";
 import type { Env } from "./env";
 import { chaosRoutes, handleAdminReset } from "./api/chaos";
+import { chatRoutes } from "./api/chat";
 import { routes } from "./api/routes";
 import { SimulatorDO } from "./sim/simulator-do";
 import { InvestigatorDO } from "./agent/investigator-do";
@@ -16,6 +17,9 @@ app.route("/api", routes);
 // reset-time incident-abort carry-forward from Task 1.4 — see src/api/chaos.ts's doc comment.
 app.route("/api/chaos", chaosRoutes);
 app.post("/api/admin/reset", handleAdminReset);
+
+// Hardened streaming chat (Task 6.1) — POST /api/chat, SSE. See src/api/chat.ts's doc comment.
+app.route("/api/chat", chatRoutes);
 
 export { SimulatorDO };
 export { InvestigatorDO };

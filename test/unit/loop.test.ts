@@ -388,6 +388,7 @@ describe("runLoop", () => {
     const result = await runLoop(cfg, INITIAL_MESSAGES);
 
     expect(result.outcome).toBe("failed");
+    expect(result.failure).toBe("error"); // a salvage that returned no report is a real failure, not a budget trip
     expect(result.steps.some((s) => s.kind === "error")).toBe(true);
     expect(llm.requests).toHaveLength(2); // exactly one salvage attempt, never more
   });
@@ -576,6 +577,7 @@ describe("runLoop", () => {
     const result = await runLoop(cfg, INITIAL_MESSAGES);
 
     expect(result.outcome).toBe("failed");
+    expect(result.failure).toBe("aborted"); // the structural discriminant chat's disconnect guard branches on
     expect(llm.requests).toHaveLength(1); // the in-flight iteration only -- no second call, no salvage
     expect(result.steps.map((s) => s.kind)).toEqual(["tool_call", "tool_result", "error"]);
     expect(result.steps[2]?.content).toEqual({ message: "aborted" });
@@ -602,6 +604,53 @@ describe("runLoop", () => {
     expect(result.text).toBe("The checkout error rate returned to baseline at 14:45Z.");
     expect(llm.requests).toHaveLength(1); // no salvage attempted without a submit_report tool
     expect(llm.requests[0]?.tools?.map((t) => t.name)).toEqual(TOOLS.map((t) => t.name));
+  });
+
+  it("[7a] chat mode: a cap trip with no submit_report tool -> outcome failed with failure 'budget'", async () => {
+    const r1 = makeMessage({ content: [toolUse("c1", "query_metrics", { service: null, operation: null, metrics: null, window: null, step: null })], stop_reason: "tool_use" });
+    // Only one scripted response: the step cap (1) trips before a second call; without a
+    // submit_report tool, salvage() records the budget-exhausted error and returns immediately.
+    const llm = scriptedLLM([r1]);
+
+    const cfg: LoopConfig = {
+      llm,
+      model: "claude-sonnet-5",
+      system: [{ type: "text", text: "sys" }],
+      tools: TOOLS,
+      executeTool: async () => ({ ok: true }),
+      caps: { ...baseCaps(), maxSteps: 1 },
+      // submitReportTool omitted: chat mode.
+      nowFn: () => NOW0,
+    };
+
+    const result = await runLoop(cfg, INITIAL_MESSAGES);
+
+    expect(result.outcome).toBe("failed");
+    expect(result.failure).toBe("budget"); // what chat.ts turns into the budget_reached SSE event
+    expect(llm.requests).toHaveLength(1); // no salvage model call without a tool to force
+  });
+
+  it("[7b] chat mode: stop_reason max_tokens with no tool calls -> failed with failure 'budget' (a truncation is a budget trip, not a crash)", async () => {
+    const r1 = makeMessage({ content: [text("The timeline begins at 14:02 when")], stop_reason: "max_tokens" });
+    const llm = scriptedLLM([r1]);
+
+    const cfg: LoopConfig = {
+      llm,
+      model: "claude-sonnet-5",
+      system: [{ type: "text", text: "sys" }],
+      tools: TOOLS,
+      executeTool: async () => ({ ok: true }),
+      caps: baseCaps(),
+      // submitReportTool omitted: chat mode (with it present, salvage fires first instead).
+      nowFn: () => NOW0,
+    };
+
+    const result = await runLoop(cfg, INITIAL_MESSAGES);
+
+    expect(result.outcome).toBe("failed");
+    expect(result.failure).toBe("budget");
+    expect(llm.requests).toHaveLength(1);
+    expect(result.steps.map((s) => s.kind)).toEqual(["error"]);
   });
 
   it("[8] onStep is called for every step in order and awaited before the next model call", async () => {

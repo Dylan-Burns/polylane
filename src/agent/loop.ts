@@ -109,8 +109,23 @@ export interface LoopConfig {
   thinkingOverride?: ThinkingPolicy;
 }
 
+/** Why a `failed` outcome failed — a structural discriminant, set on every `outcome: 'failed'`
+ * return (and only those), so a caller can branch on the failure class without string-matching
+ * step messages (Task 6.1 review: chat needs "budget trip" vs "real failure" to be a type-level
+ * distinction, not a fragile comparison against an error step's prose).
+ *  - `"budget"`: a cap/loop-guard trip with no way to conclude — chat mode (no `submitReportTool`)
+ *    hitting the step/wall/token cap or the ignored-nudge force-salvage, or a chat-mode response
+ *    truncated by the per-call `max_tokens` ceiling. Chat surfaces this as `budget_reached`.
+ *  - `"aborted"`: cooperative cancellation via `shouldAbort` (the caller asked the loop to stop —
+ *    nobody is waiting for a result).
+ *  - `"error"`: everything else — an `llm.create` rejection, a salvage call that returned no
+ *    report, an unexpected stop_reason, a thrown `onStep`. */
+export type LoopFailureKind = "budget" | "aborted" | "error";
+
 export interface LoopResult {
   outcome: "report" | "text" | "failed";
+  /** Present iff `outcome === 'failed'` — see `LoopFailureKind`. */
+  failure?: LoopFailureKind;
   report?: unknown;
   text?: string;
   steps: StepRecord[];
@@ -365,7 +380,7 @@ export async function runLoop(cfg: LoopConfig, initialMessages: MessageParam[]):
   async function salvage(): Promise<LoopResult> {
     if (!cfg.submitReportTool) {
       await record("error", { message: "budget exhausted with no submit_report tool to salvage into (chat mode)" });
-      return { outcome: "failed", steps, usage: usage() };
+      return { outcome: "failed", failure: "budget", steps, usage: usage() };
     }
     const submitReportTool = cfg.submitReportTool;
     // Review-mandated (Task 4.1 closeout): a "note" step lands right as salvage begins, so a
@@ -388,7 +403,7 @@ export async function runLoop(cfg: LoopConfig, initialMessages: MessageParam[]):
       return { outcome: "report", report: reportBlock.input, steps, usage: usage() };
     }
     await record("error", { message: "salvage call did not return a submit_report tool call", stop_reason: response.stop_reason });
-    return { outcome: "failed", steps, usage: usage() };
+    return { outcome: "failed", failure: "error", steps, usage: usage() };
   }
 
   try {
@@ -398,7 +413,7 @@ export async function runLoop(cfg: LoopConfig, initialMessages: MessageParam[]):
       // `LoopConfig.shouldAbort`'s doc comment). ----------------------------------------------
       if (cfg.shouldAbort && (await cfg.shouldAbort())) {
         await record("error", { message: "aborted" });
-        return { outcome: "failed", steps, usage: usage() };
+        return { outcome: "failed", failure: "aborted", steps, usage: usage() };
       }
 
       // --- Cap check, before doing anything else this iteration ---------------------------
@@ -437,8 +452,17 @@ export async function runLoop(cfg: LoopConfig, initialMessages: MessageParam[]):
         if (response.stop_reason === "end_turn") {
           return { outcome: "text", text: extractText(response.content), steps, usage: usage() };
         }
+        // Chat-mode only from here (the submitReportTool branch above already salvaged): a
+        // response truncated by the per-call `max_tokens` ceiling is a BUDGET trip, not a crash —
+        // the caller already streamed the partial text, and "budget reached" is the honest label
+        // for why it stops mid-answer (Task 6.1 review: this path is reachable whenever a long
+        // no-tool answer plus adaptive thinking runs past MAX_TOKENS_PER_CALL).
+        if (response.stop_reason === "max_tokens") {
+          await record("error", { message: "response truncated by the per-call max_tokens ceiling" });
+          return { outcome: "failed", failure: "budget", steps, usage: usage() };
+        }
         await record("error", { message: `unexpected stop_reason with no tool calls: ${String(response.stop_reason)}` });
-        return { outcome: "failed", steps, usage: usage() };
+        return { outcome: "failed", failure: "error", steps, usage: usage() };
       }
 
       // --- submit_report anywhere in the turn ends the investigation immediately --------------
@@ -513,6 +537,6 @@ export async function runLoop(cfg: LoopConfig, initialMessages: MessageParam[]):
     } catch {
       // A broken onStep must not defeat the "loop never throws" guarantee.
     }
-    return { outcome: "failed", steps, usage: usage() };
+    return { outcome: "failed", failure: "error", steps, usage: usage() };
   }
 }

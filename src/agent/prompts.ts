@@ -19,8 +19,9 @@ import { FLOWS, type Step } from "../sim/topology";
  * `FLOWS` data (never hand-copied) so the prompt can never silently drift from the simulated
  * world it's actually describing. Deduped/sorted since several flows share the same sub-trees
  * (e.g. every flow enters through `gateway`, both payments operations hit the same payments-db
- * steps). */
-function renderTopology(): string {
+ * steps). Exported so `chat-prompt.ts` (Task 6.1) renders the identical topology summary rather
+ * than hand-copying a second version that could silently drift from this one. */
+export function renderTopology(): string {
   const edges = new Set<string>();
   const visit = (step: Step): void => {
     for (const child of step.children) {
