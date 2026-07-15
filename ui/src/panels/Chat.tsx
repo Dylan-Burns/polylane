@@ -64,6 +64,38 @@ function capMessages<T>(list: T[]): T[] {
   return out;
 }
 
+/**
+ * Builds the wire payload for one send. Prior `history` (always strictly `[user, assistant,
+ * user, assistant, …]` pairs — `sendMessage` is the only writer and always appends both at once)
+ * is filtered down to the pairs whose assistant turn actually produced text: a turn that ended
+ * with zero `text_delta`s (a rate-gate SSE error, a client-caught 400, a network failure, a
+ * budget trip before the first token) leaves its placeholder at `content: ""`, and replaying that
+ * empty turn would poison every later request — the Anthropic API rejects empty text content
+ * blocks, so one gated turn would wedge the whole session, with each failed retry appending
+ * another empty turn (never self-healing).
+ *
+ * The empty assistant turn's paired USER turn is dropped with it: keeping it would put two user
+ * turns back to back, which the server's strict-alternation validator 400s — and the model never
+ * saw a response to it anyway, so the pair conveyed nothing worth replaying. (Trim-compared, to
+ * also catch a hypothetical whitespace-only answer.) Display state deliberately keeps both turns
+ * — the inline error banner in the bubble is the UX; this filter is wire-only.
+ *
+ * The result is pairs + the fresh user text, so it starts and ends on `user` and alternates by
+ * construction — `validateChatBody`-clean — then `capMessages` bounds it to `CHAT_MAX_TURNS`.
+ */
+function buildWirePayload(history: ChatMessage[], newUserText: string): ChatRequestTurn[] {
+  const turns: ChatRequestTurn[] = [];
+  for (let i = 0; i + 1 < history.length; i += 2) {
+    const user = history[i];
+    const assistant = history[i + 1];
+    if (user === undefined || assistant === undefined) break; // defensive: pairing invariant broken
+    if (assistant.content.trim().length === 0) continue;
+    turns.push({ role: "user", content: user.content }, { role: "assistant", content: assistant.content });
+  }
+  turns.push({ role: "user", content: newUserText });
+  return capMessages(turns);
+}
+
 /** Folds one incoming SSE event into the in-progress assistant message it belongs to. Pure — takes
  * the message, returns the next version — so it can be used from a `setMessages` updater. */
 function applyEvent(message: ChatMessage, event: ChatSSEEvent): ChatMessage {
@@ -209,6 +241,10 @@ function Composer({
   const canSend = !disabled && !overLimit && draft.trim().length > 0;
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    // Never treat Enter as "send" mid-IME-composition (Japanese/Chinese/Korean input): confirming
+    // a candidate fires an Enter keydown with `isComposing` set (legacy engines report keyCode
+    // 229 instead) that must select the candidate, not submit the message.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     // Enter sends; Shift+Enter inserts a newline (task brief, verbatim).
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -262,7 +298,10 @@ export function ChatPanel() {
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
+    // behavior "auto" (instant), not "smooth": text_delta events re-run this many times a second
+    // while a turn streams, and restarting a smooth-scroll animation on every delta makes the
+    // list judder and lag behind the newest text instead of tracking it.
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
   }, [messages]);
 
   // Abort any in-flight turn if the whole app unmounts (tab close/navigation away) — the panel
@@ -280,10 +319,11 @@ export function ChatPanel() {
     const assistantId = newId();
     const assistantMessage: ChatMessage = { id: assistantId, role: "assistant", content: "", activity: [], pending: true };
 
-    // The wire payload mirrors exactly what's about to become display state (post-cap, pre-
-    // placeholder) — built from `messages` as it stands right now rather than a ref, since this
-    // handler only ever runs once per turn (the composer is disabled while `sending`).
-    const payload: ChatRequestTurn[] = capMessages([...messages, userMessage]).map((m) => ({ role: m.role, content: m.content }));
+    // Wire payload: prior history with dead (empty-assistant) pairs filtered out, plus this
+    // message — see buildWirePayload. Built from `messages` as it stands right now rather than a
+    // ref, since this handler only ever runs once per turn (the composer is disabled while
+    // `sending`).
+    const payload = buildWirePayload(messages, text);
 
     setMessages((prev) => capMessages([...prev, userMessage, assistantMessage]));
     setDraft("");

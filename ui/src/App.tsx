@@ -56,10 +56,15 @@ function LoadingCard({ label }: { label: string }) {
 }
 
 function Dashboard() {
-  const state = usePoll(getState, STATE_POLL_MS);
-  const incidentsPoll = usePoll(getIncidents, INCIDENTS_POLL_MS);
-  const incidents = incidentsPoll.data?.incidents ?? [];
   const [view, setView] = useState<View>("dashboard");
+  // Polling pauses (intervalMs null) while the Chat view is active — nothing on screen consumes
+  // the results, and a chat turn is already competing for the same worker. `usePoll` re-fetches
+  // immediately when the interval flips back on, so returning to the dashboard never shows a
+  // stale-then-jump frame beyond the first paint.
+  const onDashboard = view === "dashboard";
+  const state = usePoll(getState, onDashboard ? STATE_POLL_MS : null);
+  const incidentsPoll = usePoll(getIncidents, onDashboard ? INCIDENTS_POLL_MS : null);
+  const incidents = incidentsPoll.data?.incidents ?? [];
 
   return (
     <div className="min-h-screen bg-void text-ink">
