@@ -1,7 +1,8 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
-import { MINUTE_MS } from "../../src/sim/backfill";
+import { BACKFILL_CHUNK_MS, MINUTE_MS } from "../../src/sim/backfill";
+import { insertSeededIncident } from "../../src/sim/seed-incident";
 import { insertSpans } from "../../src/telemetry/queries";
 import type { Span } from "../../src/telemetry/types";
 
@@ -214,6 +215,98 @@ describe("SimulatorDO reset", () => {
     },
     60_000,
   );
+});
+
+describe("SimulatorDO reset self-heal", () => {
+  it("accepts a new /reset when status is 'resetting' with no pending alarm (wedged), and reaches running", async () => {
+    const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("test-wedge-1"));
+    const T0 = Date.UTC(2026, 0, 6, 0, 0, 0); // minute-aligned
+
+    // Simulate the wedge: a previous reset committed status 'resetting' and deleted the alarm,
+    // then died before re-arming. lastResetAtMs is recent to prove the escape hatch also bypasses
+    // the 10-minute reset cooldown (a wedged world must not stay bricked).
+    await runInDurableObject(stub, async (instance, state) => {
+      instance.setTestNow(T0);
+      await state.storage.put("worldStatus", "resetting");
+      await state.storage.put("generation", 3);
+      await state.storage.put("lastResetAtMs", T0 - 30_000);
+      await state.storage.deleteAlarm();
+    });
+
+    const resetRes = await stub.fetch("http://simulator/reset", { method: "POST" });
+    expect(resetRes.status).toBe(202);
+
+    const afterReset = await statusOf(stub);
+    expect(afterReset.worldStatus).toBe("seeding");
+    expect(afterReset.generation).toBe(4); // took over with a fresh generation
+
+    // Sanity: a NON-wedged in-progress state (alarm pending, as /reset just armed one) still 429s.
+    const competing = await stub.fetch("http://simulator/reset", { method: "POST" });
+    expect(competing.status).toBe(429);
+
+    let status = "seeding";
+    for (let i = 0; i < 10 && status !== "running"; i++) {
+      await runInDurableObject(stub, async (instance, state) => {
+        instance.setTestNow(T0);
+        await instance.alarm();
+        status = (await state.storage.get<string>("worldStatus")) ?? "";
+      });
+    }
+    expect(status).toBe("running");
+  }, 60_000);
+});
+
+describe("SimulatorDO idempotent final chunk", () => {
+  it("retries the final backfill chunk cleanly after seed rows already committed (crash before the running flip)", async () => {
+    const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("test-idem-1"));
+    const T0 = Date.UTC(2026, 0, 6, 12, 0, 0); // minute-aligned
+
+    await runInDurableObject(stub, (instance) => instance.setTestNow(T0));
+    const resetRes = await stub.fetch("http://simulator/reset", { method: "POST" });
+    expect(resetRes.status).toBe(202);
+
+    // Drive the first 5 of 6 chunks; world is still seeding with only the final chunk left.
+    for (let i = 0; i < 5; i++) {
+      await runInDurableObject(stub, async (instance) => {
+        instance.setTestNow(T0);
+        await instance.alarm();
+      });
+    }
+    const beforeFinal = await statusOf(stub);
+    expect(beforeFinal.worldStatus).toBe("seeding");
+    const cursor = await runInDurableObject(stub, (_i, state) =>
+      state.storage.get<{ cursorMs: number; endMs: number }>("backfill"),
+    );
+    expect(cursor?.endMs).toBe(T0);
+    expect(cursor?.cursorMs).toBe(T0 - BACKFILL_CHUNK_MS); // exactly one chunk remaining
+
+    // Simulate "crash after the seed rows committed but before the flip to running": pre-commit
+    // the seed rows exactly as the final chunk will (same nowMs => same deterministic ids).
+    await insertSeededIncident(env.DB, T0);
+    const preSeeded = await env.DB.prepare("SELECT count(*) as n FROM incidents").first<{ n: number }>();
+    expect(preSeeded?.n).toBe(1);
+
+    // The retried final chunk must not throw on the PK collisions, and must reach running.
+    await runInDurableObject(stub, async (instance) => {
+      instance.setTestNow(T0);
+      await instance.alarm();
+    });
+
+    const after = await statusOf(stub);
+    expect(after.worldStatus).toBe("running");
+
+    // Exactly one seeded incident (and its children) — the retry was a clean skip, not a duplicate.
+    const incidents = await env.DB.prepare("SELECT count(*) as n FROM incidents WHERE id LIKE 'seed-%'").first<{ n: number }>();
+    expect(incidents?.n).toBe(1);
+    const steps = await env.DB.prepare("SELECT count(*) as n FROM investigation_steps").first<{ n: number }>();
+    expect(steps?.n).toBe(9);
+    const fingerprints = await env.DB.prepare("SELECT count(*) as n FROM incident_fingerprints").first<{ n: number }>();
+    expect(fingerprints?.n).toBe(3);
+    const seedDeploys = await env.DB.prepare("SELECT count(*) as n FROM deploys WHERE id LIKE 'seed-deploy-%'").first<{
+      n: number;
+    }>();
+    expect(seedDeploys?.n).toBe(1);
+  }, 60_000);
 });
 
 describe("SimulatorDO stale-generation guard", () => {

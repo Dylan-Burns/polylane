@@ -48,6 +48,13 @@ interface BackfillState {
   endMs: number;
 }
 
+/** Reset parameters persisted by `handleReset`'s first gate so the wipe -> seeding step
+ * (`advanceReset`) is resumable from the alarm handler after a transient failure. */
+interface PendingReset {
+  generation: number;
+  nowMs: number;
+}
+
 interface PartialMinute {
   minuteTs: number;
   stats: RequestStat[];
@@ -124,9 +131,13 @@ export class SimulatorDO extends DurableObject<Env> {
       await this.runBackfillTick();
     } else if (worldStatus === "running") {
       await this.runLiveTick();
+    } else if (worldStatus === "resetting") {
+      // Recovery path: a reset's wipe -> seeding step failed after handleReset returned 202 and a
+      // recovery alarm was armed. Retry it here (idempotent; no-op if pendingReset is gone). If it
+      // throws again, the alarm re-armed at the top of this handler retries on the next firing.
+      await this.advanceReset();
     }
-    // 'unseeded' / 'resetting': no alarm is normally pending in these states; a stray firing (a
-    // race with an in-flight /reset) just re-arms above and no-ops here.
+    // 'unseeded': no alarm is normally pending; a stray firing just re-arms above and no-ops.
   }
 
   // --- HTTP handlers ---------------------------------------------------------------------------
@@ -180,15 +191,24 @@ export class SimulatorDO extends DurableObject<Env> {
   private async handleReset(): Promise<Response> {
     const gate = await this.ctx.blockConcurrencyWhile(async () => {
       const worldStatus = (await this.ctx.storage.get<WorldStatus>("worldStatus")) ?? "unseeded";
-      const lastResetAtMs = (await this.ctx.storage.get<number>("lastResetAtMs")) ?? -Infinity;
       const now = this.now();
 
-      if (worldStatus === "seeding" || worldStatus === "resetting") {
+      // Self-heal escape hatch: 'resetting'/'seeding' normally reject a new reset, but those
+      // states are only legitimate while an alarm is pending to advance them. No pending alarm
+      // means a previous reset died between committing state and re-arming (isolate death,
+      // unrecovered wipe failure) — treat the state as wedged and let this reset take over,
+      // bypassing the cooldown too (a wedged world must not stay bricked for 10 minutes).
+      const inProgress = worldStatus === "seeding" || worldStatus === "resetting";
+      const wedged = inProgress && (await this.ctx.storage.getAlarm()) === null;
+      if (inProgress && !wedged) {
         return { ok: false as const, retryAfterMs: RESET_COOLDOWN_MS };
       }
-      const sinceLastReset = now - lastResetAtMs;
-      if (sinceLastReset < RESET_COOLDOWN_MS) {
-        return { ok: false as const, retryAfterMs: RESET_COOLDOWN_MS - sinceLastReset };
+      if (!wedged) {
+        const lastResetAtMs = (await this.ctx.storage.get<number>("lastResetAtMs")) ?? -Infinity;
+        const sinceLastReset = now - lastResetAtMs;
+        if (sinceLastReset < RESET_COOLDOWN_MS) {
+          return { ok: false as const, retryAfterMs: RESET_COOLDOWN_MS - sinceLastReset };
+        }
       }
 
       const generation = ((await this.ctx.storage.get<number>("generation")) ?? 0) + 1;
@@ -197,35 +217,66 @@ export class SimulatorDO extends DurableObject<Env> {
       await this.ctx.storage.put("lastResetAtMs", now);
       await this.ctx.storage.put("fault", null);
       await this.ctx.storage.delete("partialMinute");
+      // Persisted (not closed over) so the wipe -> seeding step is resumable by the alarm
+      // handler if this request's own attempt below fails partway.
+      await this.ctx.storage.put<PendingReset>("pendingReset", { generation, nowMs: now });
       await this.ctx.storage.deleteAlarm();
-      return { ok: true as const, generation, now };
+      return { ok: true as const };
     });
 
     if (!gate.ok) {
       return jsonResponse({ error: "cooldown", retryAfterMs: gate.retryAfterMs }, 429);
     }
 
-    // Investigation-abort and the telemetry wipe are not `ctx.storage` operations, so they run
-    // outside the input gate (spec §6: "DO input gates do not protect across D1/fetch awaits").
-    // That's safe here: worldStatus is already 'resetting', so no tick/backfill can run
-    // concurrently, and a second /reset is rejected above until this one reaches 'seeding'.
+    try {
+      await this.advanceReset();
+    } catch {
+      // Transient failure mid-wipe (e.g. a D1 hiccup). State is already recoverable — status
+      // 'resetting' + pendingReset persisted above — so arm a recovery alarm and let the alarm
+      // handler's 'resetting' branch retry `advanceReset`. If the isolate dies before even this
+      // setAlarm lands, the no-pending-alarm escape hatch above un-wedges the next /reset.
+      await this.armAlarm(ALARM_INTERVAL_MS);
+    }
+
+    return jsonResponse({ status: "resetting" }, 202);
+  }
+
+  /**
+   * The wipe -> seeding step of a reset, driven by the `pendingReset` record `handleReset`
+   * persists. Idempotent and resumable: callable again by the alarm handler (status 'resetting')
+   * after a partial failure — the wipe re-runs harmlessly, and the gated transition below re-checks
+   * the generation so a superseding reset makes this one a no-op.
+   *
+   * Investigation-abort and the telemetry wipe are not `ctx.storage` operations, so they run
+   * outside the input gate (spec §6: "DO input gates do not protect across D1/fetch awaits").
+   * That's safe: worldStatus is 'resetting' throughout, so no tick/backfill can run concurrently,
+   * and a competing /reset is rejected (non-wedged in-progress state) until this reaches 'seeding'.
+   */
+  private async advanceReset(): Promise<void> {
+    const pending = await this.ctx.storage.get<PendingReset>("pendingReset");
+    if (!pending) return;
+    const generation = await this.ctx.storage.get<number>("generation");
+    if (generation !== pending.generation) {
+      await this.ctx.storage.delete("pendingReset"); // superseded by a newer reset
+      return;
+    }
+
     await this.abortActiveInvestigation();
     await this.wipeTelemetryTables();
 
     await this.ctx.blockConcurrencyWhile(async () => {
       const currentGeneration = await this.ctx.storage.get<number>("generation");
-      if (currentGeneration !== gate.generation) return; // superseded by a newer reset mid-wipe
+      if (currentGeneration !== pending.generation) return; // superseded mid-wipe
 
-      const endMs = Math.floor(gate.now / MINUTE_MS) * MINUTE_MS;
+      const endMs = Math.floor(pending.nowMs / MINUTE_MS) * MINUTE_MS;
       const startMs = endMs - BACKFILL_TOTAL_MS;
-      const backfill: BackfillState = { generation: gate.generation, cursorMs: startMs, startMs, endMs };
+      const backfill: BackfillState = { generation: pending.generation, cursorMs: startMs, startMs, endMs };
       await this.ctx.storage.put<WorldStatus>("worldStatus", "seeding");
       await this.ctx.storage.put("seedProgress", 0);
       await this.ctx.storage.put("backfill", backfill);
+      await this.ctx.storage.delete("pendingReset");
       await this.armAlarm(ALARM_INTERVAL_MS);
     });
-
-    return jsonResponse({ status: "resetting" }, 202);
   }
 
   // --- Internals ---------------------------------------------------------------------------------
@@ -325,6 +376,12 @@ export class SimulatorDO extends DurableObject<Env> {
     // Stale-generation guard: captured above (or supplied by a test), re-checked immediately
     // before the D1 writes — the only awaits in this method not covered by an input gate. Discard
     // the whole batch (no insert at all) if a reset landed underneath us in between.
+    //
+    // Accepted limitation (reviewer-acknowledged): a reset can still land in the residual window
+    // between this re-check passing and the D1 batch committing, letting one tick's rows (~a few
+    // hundred max) into the freshly wiped world. Bounded and self-healing — no unique keys means
+    // no errors, and retention ages the strays out — so per-row generation tagging is deliberately
+    // not implemented for this demo.
     const currentGeneration = await this.ctx.storage.get<number>("generation");
     if (currentGeneration !== capturedGeneration) return { wrote: false };
 
@@ -383,6 +440,9 @@ export class SimulatorDO extends DurableObject<Env> {
     const simRate = parseSimRate(this.env.SIM_RATE);
     const batch = runBackfillChunk(chunkFromMs, chunkToMs, simRate);
 
+    // Same residual stale-write window as runLiveTick's re-check (see the comment there): a reset
+    // between this check and the batch commit can leave one chunk's rows behind — accepted, bounded,
+    // aged out by retention.
     const currentGeneration = await this.ctx.storage.get<number>("generation");
     if (currentGeneration !== capturedGeneration) return { wrote: false };
 

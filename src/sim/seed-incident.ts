@@ -20,7 +20,9 @@
  * and expected in a report; the honesty rule constrains telemetry, not reports").
  */
 
-import { insertDeploy } from "../telemetry/queries";
+// All inserts below use INSERT OR IGNORE on deterministic ids/PKs: the final backfill chunk can
+// be retried after a crash that landed these rows but died before the worldStatus -> 'running'
+// flip, and the retry must skip cleanly instead of throwing on PK collisions forever.
 
 /** Incident opens ~3h before reset time (task brief: "hand-authored resolved bad-deploy incident
  * ~3h before nowMs"). */
@@ -249,18 +251,15 @@ export async function insertSeededIncident(db: D1Database, nowMs: number): Promi
 
   const { report, trigger, steps } = buildStory(deployMs, openedAtMs, reportedAtMs, resolvedAtMs);
 
-  await insertDeploy(db, {
-    id: `seed-deploy-payments-${nowMs}`,
-    service: "payments",
-    version: "v3.0.0",
-    ts_ms: deployMs,
-    note: "routine release",
-  });
+  await db
+    .prepare(`INSERT OR IGNORE INTO deploys (id, service, version, ts_ms, note) VALUES (?, ?, ?, ?, ?)`)
+    .bind(`seed-deploy-payments-${nowMs}`, "payments", "v3.0.0", deployMs, "routine release")
+    .run();
 
   const incidentId = `seed-bad-deploy-${nowMs}`;
   await db
     .prepare(
-      `INSERT INTO incidents (id, status, severity, opened_at, reported_at, resolved_at, trigger_json, report_json, follow_up_of)
+      `INSERT OR IGNORE INTO incidents (id, status, severity, opened_at, reported_at, resolved_at, trigger_json, report_json, follow_up_of)
        VALUES (?, 'resolved', 'critical', ?, ?, ?, ?, ?, NULL)`,
     )
     .bind(incidentId, openedAtMs, reportedAtMs, resolvedAtMs, JSON.stringify(trigger), JSON.stringify(report))
@@ -269,7 +268,7 @@ export async function insertSeededIncident(db: D1Database, nowMs: number): Promi
   const fingerprintStatements = ["payments:errors", "payments:latency", "checkout:errors"].map((fingerprint) =>
     db
       .prepare(
-        `INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES (?, ?, ?, 1)`,
+        `INSERT OR IGNORE INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES (?, ?, ?, 1)`,
       )
       .bind(incidentId, fingerprint, openedAtMs),
   );
@@ -277,7 +276,7 @@ export async function insertSeededIncident(db: D1Database, nowMs: number): Promi
   const stepStatements = steps.map((step, i) =>
     db
       .prepare(
-        `INSERT INTO investigation_steps (incident_id, step_no, kind, content_json, ts_ms, tokens_in, tokens_out)
+        `INSERT OR IGNORE INTO investigation_steps (incident_id, step_no, kind, content_json, ts_ms, tokens_in, tokens_out)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(incidentId, i + 1, step.kind, JSON.stringify(step.content), openedAtMs + step.offsetMs, step.tokensIn, step.tokensOut),
