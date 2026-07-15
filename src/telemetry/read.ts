@@ -8,8 +8,10 @@
  * Shared conventions across every function below:
  *  - Time windows are half-open `[fromMs, toMs)`, matching `generateWindow`'s own convention.
  *  - Row/span caps are *shape-aware*, never byte-sliced: every capped result says so
- *    (`truncated: true`, `limit`-clamped counts) rather than silently dropping data the caller
- *    can't tell is missing (spec §9's "Result caps are shape-aware, never byte-sliced").
+ *    (`truncated: true` on `getTrace`; a `total` match count alongside `searchLogs`/`findTraces`
+ *    pages so `total > page.length` is an exact truncation signal) rather than silently dropping
+ *    data the caller can't tell is missing (spec §9's "Result caps are shape-aware, never
+ *    byte-sliced").
  *  - "Newest first" (descending by the row's own timestamp) is the default sort for
  *    investigation-facing lookups (`findTraces`, `searchLogs`, `getIncidents` by window) since the
  *    agent/UI usually wants the most recent evidence first; `listDeploys` sorts chronologically
@@ -250,11 +252,25 @@ export interface SearchLogsArgs {
   limit?: number;
 }
 
-const SEARCH_LOGS_MAX_LIMIT = 50;
+/** Row cap for `searchLogs` (spec §9's tool table: "limit ≤ 50"). Exported so the tool layer
+ * (`agent/tools.ts`) can build its cap-mentioning schema descriptions from the same constant
+ * instead of a copy that could go stale. */
+export const SEARCH_LOGS_MAX_LIMIT = 50;
+
+export interface SearchLogsResult {
+  /** The returned page: at most `limit` (clamped) rows, newest first. */
+  logs: LogLine[];
+  /** Total rows matching the same filters, ignoring `limit` — `total > logs.length` is the
+   * honest "this page is truncated" signal (a bare capped array can't distinguish "exactly N"
+   * from "capped at N"). */
+  total: number;
+}
 
 /** Log lines within `[fromMs, toMs)`, optionally filtered by service/level/substring, newest
- * first. `limit` is clamped to `[1, 50]`, defaulting to 50 when omitted. */
-export async function searchLogs(db: D1Database, args: SearchLogsArgs): Promise<LogLine[]> {
+ * first, plus the `total` match count (a `COUNT(*)` over the same `WHERE`, batched alongside the
+ * page query in a single D1 round trip). `limit` is clamped to `[1, 50]`, defaulting to 50 when
+ * omitted, and caps `logs` only — never `total`. */
+export async function searchLogs(db: D1Database, args: SearchLogsArgs): Promise<SearchLogsResult> {
   const limit = clampInt(args.limit ?? SEARCH_LOGS_MAX_LIMIT, 1, SEARCH_LOGS_MAX_LIMIT);
 
   const conditions: string[] = ["ts_ms >= ?", "ts_ms < ?"];
@@ -271,14 +287,20 @@ export async function searchLogs(db: D1Database, args: SearchLogsArgs): Promise<
     conditions.push("message LIKE ? ESCAPE '\\'");
     params.push(`%${escapeLikePattern(args.contains)}%`);
   }
-  params.push(limit);
+  const where = conditions.join(" AND ");
 
-  const sql = `SELECT ts_ms, service, level, message, trace_id, span_id FROM logs WHERE ${conditions.join(" AND ")} ORDER BY ts_ms DESC LIMIT ?`;
-  const { results } = await db
-    .prepare(sql)
-    .bind(...params)
-    .all<LogRowDb>();
-  return (results ?? []).map(rowToLogLine);
+  const [pageRes, countRes] = await db.batch([
+    db
+      .prepare(
+        `SELECT ts_ms, service, level, message, trace_id, span_id FROM logs WHERE ${where} ORDER BY ts_ms DESC LIMIT ?`,
+      )
+      .bind(...params, limit),
+    db.prepare(`SELECT COUNT(*) AS total FROM logs WHERE ${where}`).bind(...params),
+  ]);
+
+  const logs = ((pageRes?.results ?? []) as LogRowDb[]).map(rowToLogLine);
+  const totalRow = countRes?.results?.[0] as { total: number } | undefined;
+  return { logs, total: totalRow?.total ?? logs.length };
 }
 
 // --- findTraces -----------------------------------------------------------------------------
@@ -291,7 +313,9 @@ export interface FindTracesArgs {
   limit?: number;
 }
 
-const FIND_TRACES_MAX_LIMIT = 10;
+/** Row cap for `findTraces` (spec §9's tool table: "limit ≤ 10"). Exported for the same
+ * stale-copy-prevention reason as `SEARCH_LOGS_MAX_LIMIT`. */
+export const FIND_TRACES_MAX_LIMIT = 10;
 
 interface TraceRootRowDb {
   trace_id: string;
@@ -302,11 +326,20 @@ interface TraceRootRowDb {
   status: "ok" | "error";
 }
 
+export interface FindTracesResult {
+  /** The returned page: at most `limit` (clamped) trace summaries. */
+  traces: TraceSummary[];
+  /** Total traces matching the same filters, ignoring `limit` — see `SearchLogsResult.total`. */
+  total: number;
+}
+
 /**
  * Summaries of persisted traces whose *entry* (root, `parent_span_id IS NULL`) span starts within
  * `[fromMs, toMs)`, optionally filtered to a `service` (matched against the entry span, not any
- * span in the tree — "traces entering through this service"). `duration_ms` on each summary is
- * the root span's own duration (see `TraceSummary`), and `limit` clamps to `[1, 10]`.
+ * span in the tree — "traces entering through this service"), plus the `total` match count (a
+ * `COUNT(*)` over the same `WHERE`, batched alongside the page query). `duration_ms` on each
+ * summary is the root span's own duration (see `TraceSummary`), and `limit` clamps to `[1, 10]`,
+ * capping `traces` only — never `total`.
  *
  *  - `criteria: 'errors'` — traces containing at least one span with `status = 'error'` *anywhere*
  *    in the tree (matching `sampleForPersistence`'s own notion of an "error trace" — the root may
@@ -318,7 +351,7 @@ interface TraceRootRowDb {
  * traces) rather than a `JOIN`/subquery on the main query, so the (at most 10) root-span rows
  * stay the driver of ordering/limiting and the count fetch can't distort either.
  */
-export async function findTraces(db: D1Database, args: FindTracesArgs): Promise<TraceSummary[]> {
+export async function findTraces(db: D1Database, args: FindTracesArgs): Promise<FindTracesResult> {
   const limit = clampInt(args.limit ?? FIND_TRACES_MAX_LIMIT, 1, FIND_TRACES_MAX_LIMIT);
 
   const conditions: string[] = ["parent_span_id IS NULL", "start_ms >= ?", "start_ms < ?"];
@@ -330,16 +363,21 @@ export async function findTraces(db: D1Database, args: FindTracesArgs): Promise<
   if (args.criteria === "errors") {
     conditions.push("trace_id IN (SELECT trace_id FROM spans WHERE status = 'error')");
   }
-  params.push(limit);
+  const where = conditions.join(" AND ");
 
   const orderBy = args.criteria === "errors" ? "start_ms DESC" : "duration_ms DESC, start_ms DESC";
-  const sql = `SELECT trace_id, service, operation, start_ms, duration_ms, status FROM spans WHERE ${conditions.join(" AND ")} ORDER BY ${orderBy} LIMIT ?`;
-  const { results } = await db
-    .prepare(sql)
-    .bind(...params)
-    .all<TraceRootRowDb>();
-  const roots = results ?? [];
-  if (roots.length === 0) return [];
+  const [pageRes, countRes] = await db.batch([
+    db
+      .prepare(
+        `SELECT trace_id, service, operation, start_ms, duration_ms, status FROM spans WHERE ${where} ORDER BY ${orderBy} LIMIT ?`,
+      )
+      .bind(...params, limit),
+    db.prepare(`SELECT COUNT(*) AS total FROM spans WHERE ${where}`).bind(...params),
+  ]);
+  const roots = (pageRes?.results ?? []) as TraceRootRowDb[];
+  const totalRow = countRes?.results?.[0] as { total: number } | undefined;
+  const total = totalRow?.total ?? roots.length;
+  if (roots.length === 0) return { traces: [], total };
 
   const traceIds = roots.map((r) => r.trace_id);
   const placeholders = traceIds.map(() => "?").join(", ");
@@ -349,7 +387,7 @@ export async function findTraces(db: D1Database, args: FindTracesArgs): Promise<
     .all<{ trace_id: string; span_count: number }>();
   const spanCountByTrace = new Map((countRows ?? []).map((r) => [r.trace_id, r.span_count]));
 
-  return roots.map((row) => ({
+  const traces = roots.map((row) => ({
     trace_id: row.trace_id,
     entry_service: row.service,
     entry_operation: row.operation,
@@ -358,12 +396,14 @@ export async function findTraces(db: D1Database, args: FindTracesArgs): Promise<
     status: row.status,
     span_count: spanCountByTrace.get(row.trace_id) ?? 1,
   }));
+  return { traces, total };
 }
 
 // --- getTrace ---------------------------------------------------------------------------------
 
-/** Shape-aware span cap (spec §9's `get_trace`: "≤ 40 spans"). */
-const MAX_TRACE_SPANS = 40;
+/** Shape-aware span cap (spec §9's `get_trace`: "≤ 40 spans"). Exported for the same
+ * stale-copy-prevention reason as `SEARCH_LOGS_MAX_LIMIT`. */
+export const MAX_TRACE_SPANS = 40;
 
 /** Prefix marking a synthesized "collapsed" marker span so the defensive fallback trim (below)
  * can recognize and never drop/re-collapse one. Never collides with a real `span_id` (`randomHex`

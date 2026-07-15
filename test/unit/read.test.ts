@@ -515,9 +515,10 @@ describe("queryMetrics", () => {
 });
 
 describe("searchLogs", () => {
-  it("matches on contains (substring), newest first", async () => {
-    const logs = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, contains: "pool exhausted" });
+  it("matches on contains (substring), newest first, with an exact total", async () => {
+    const { logs, total } = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, contains: "pool exhausted" });
     expect(logs).toHaveLength(2);
+    expect(total).toBe(2); // nothing capped: total equals the page size
     // cap-trace's payments log (ts = capRootStart+55+700) is newer than cascade-trace's
     // (ts = cascadeRootStart+15+700) since capRootStart > cascadeRootStart.
     expect(logs[0]?.trace_id).toBe("trace-cap");
@@ -529,32 +530,35 @@ describe("searchLogs", () => {
   });
 
   it("filters by service and level", async () => {
-    const logs = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "checkout", level: "error" });
+    const { logs } = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "checkout", level: "error" });
     expect(logs).toHaveLength(1);
     expect(logs[0]?.span_id).toBe("cascade-checkout");
   });
 
   it("excludes non-matching levels/services", async () => {
-    const logs = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "notifications" });
+    const { logs } = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "notifications" });
     expect(logs).toHaveLength(1);
     expect(logs[0]?.level).toBe("info");
   });
 
-  it("clamps limit to 50 by default, and to an explicit lower value", async () => {
+  it("clamps limit to 50 by default and to an explicit lower value, while total always reports the full match count", async () => {
     const defaulted = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "catalog", level: "info" });
-    expect(defaulted).toHaveLength(50); // 60 noise logs match; clamp caps it at 50
+    expect(defaulted.logs).toHaveLength(50); // 60 noise logs match; clamp caps the page at 50
+    expect(defaulted.total).toBe(60); // ...but total is the uncapped match count
 
     const oversized = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "catalog", level: "info", limit: 1000 });
-    expect(oversized).toHaveLength(50);
+    expect(oversized.logs).toHaveLength(50);
+    expect(oversized.total).toBe(60);
 
     const small = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "catalog", level: "info", limit: 5 });
-    expect(small).toHaveLength(5);
+    expect(small.logs).toHaveLength(5);
+    expect(small.total).toBe(60); // total is independent of the caller's limit
   });
 
   it("falls back to the default limit (50) when `limit` is NaN, rather than propagating NaN into the query", async () => {
     // `args.limit ?? 50` doesn't catch this: NaN isn't nullish, so an explicit NaN limit would
     // otherwise flow straight into `clampInt` and then the bound SQL parameter.
-    const logs = await searchLogs(env.DB, {
+    const { logs } = await searchLogs(env.DB, {
       fromMs: T0,
       toMs: T0 + 30 * MIN,
       service: "catalog",
@@ -566,35 +570,40 @@ describe("searchLogs", () => {
 });
 
 describe("findTraces", () => {
-  it("criteria 'errors' returns only traces containing an error span, newest first, with entry service/op and span_count", async () => {
-    const traces = await findTraces(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, criteria: "errors" });
+  it("criteria 'errors' returns only traces containing an error span, newest first, with entry service/op, span_count, and total", async () => {
+    const { traces, total } = await findTraces(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, criteria: "errors" });
     expect(traces.map((t) => t.trace_id)).toEqual(["trace-cap", "trace-cascade"]);
     expect(traces.map((t) => t.entry_service)).toEqual(["gateway", "gateway"]);
     expect(traces.map((t) => t.entry_operation)).toEqual(["GET /catalog", "POST /checkout"]);
     expect(traces.map((t) => t.span_count)).toEqual([90, 4]); // full persisted span count, not the capped getTrace view
+    expect(total).toBe(2); // nothing capped: total equals the page size
     for (const t of traces) expect(t.status).toBe("error");
   });
 
-  it("criteria 'errors' with a service filter that has no error traces returns []", async () => {
-    const traces = await findTraces(env.DB, { service: "checkout", fromMs: T0, toMs: T0 + 30 * MIN, criteria: "errors" });
+  it("criteria 'errors' with a service filter that has no error traces returns an empty page with total 0", async () => {
+    const { traces, total } = await findTraces(env.DB, { service: "checkout", fromMs: T0, toMs: T0 + 30 * MIN, criteria: "errors" });
     expect(traces).toEqual([]); // trace-healthy-a enters via checkout but is fully ok
+    expect(total).toBe(0);
   });
 
   it("criteria 'slowest' sorts by the root span's own duration, filtered to a service", async () => {
-    const traces = await findTraces(env.DB, { service: "gateway", fromMs: T0, toMs: T0 + 30 * MIN, criteria: "slowest" });
+    const { traces } = await findTraces(env.DB, { service: "gateway", fromMs: T0, toMs: T0 + 30 * MIN, criteria: "slowest" });
     expect(traces.map((t) => t.trace_id)).toEqual(["trace-cap", "trace-cascade", "trace-healthy-b", "trace-fallback"]);
     expect(traces.map((t) => t.duration_ms)).toEqual([900, 800, 120, 50]);
     expect(traces.map((t) => t.span_count)).toEqual([90, 4, 1, 46]);
   });
 
-  it("clamps limit to 10 by default and to an explicit lower value", async () => {
+  it("clamps limit to 10 by default and to an explicit lower value, with total unaffected by the limit", async () => {
     const limited = await findTraces(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, criteria: "slowest", limit: 2 });
-    expect(limited).toHaveLength(2);
-    expect(limited.map((t) => t.trace_id)).toEqual(["trace-cap", "trace-cascade"]);
+    expect(limited.traces).toHaveLength(2);
+    expect(limited.traces.map((t) => t.trace_id)).toEqual(["trace-cap", "trace-cascade"]);
+    // All five in-window roots (cap, cascade, healthy-a, healthy-b, fallback) still count toward
+    // total — the limit caps the page only.
+    expect(limited.total).toBe(5);
   });
 
   it("reports the entry span's duration, not a max(end)-min(start) span (would be inflated by the async tail)", async () => {
-    const traces = await findTraces(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, criteria: "errors" });
+    const { traces } = await findTraces(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, criteria: "errors" });
     const cascade = traces.find((t) => t.trace_id === "trace-cascade");
     expect(cascade?.duration_ms).toBe(800); // root's own duration; the async tail runs to +2000ms past root start
   });

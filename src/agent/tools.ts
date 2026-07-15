@@ -10,20 +10,23 @@
  * Executors are thin adapters over `read.ts` — they parse/validate `input` (untyped JSON from
  * the model), resolve `window` via `parseWindow`, call the matching `read.ts` function, and
  * shape the result for the model. Row/span caps themselves live entirely in `read.ts`; nothing
- * here re-implements or second-guesses them. `get_trace`'s `truncated`/`note` fields are carried
- * through untouched. `search_logs`/`find_traces` don't get a `truncated` field from `read.ts`
- * itself (a capped array alone can't tell "exactly N" from "capped at N") — this layer adds one,
- * `count === limit`, since hitting the row cap exactly is the closest available signal that more
- * rows may exist beyond it.
+ * here re-implements or second-guesses them (the cap constants mentioned in schema descriptions
+ * are imported from `read.ts`, never copied). `get_trace`'s `truncated`/`note` fields are carried
+ * through untouched. `search_logs`/`find_traces` return a `total` match count from `read.ts`
+ * alongside the capped page, so this layer reports exact truncation (`truncated: total > count`,
+ * plus a "showing N of M" note mirroring `get_trace`'s phrasing).
  */
 
 import { parseWindow, WindowError, type WindowInput } from "./window";
 import {
+  FIND_TRACES_MAX_LIMIT,
   findTraces,
   getIncidents,
   getTrace,
   listDeploys,
+  MAX_TRACE_SPANS,
   queryMetrics,
+  SEARCH_LOGS_MAX_LIMIT,
   searchLogs,
 } from "../telemetry/read";
 import type { BaselineMetric, MetricPoint } from "../telemetry/types";
@@ -98,7 +101,7 @@ const SEARCH_LOGS_SCHEMA: JSONSchema = {
     level: { type: ["string", "null"], enum: LOG_LEVELS, description: "Restrict to one log level. Omit/null for all levels." },
     contains: { type: ["string", "null"], description: "Literal (non-pattern) case-insensitive substring the log message must contain. Omit/null for no filter." },
     window: WINDOW_SCHEMA,
-    limit: { type: ["integer", "null"], description: "Max rows to return, newest first. Clamped to [1, 50]; defaults to 50." },
+    limit: { type: ["integer", "null"], description: `Max rows to return, newest first. Clamped to [1, ${SEARCH_LOGS_MAX_LIMIT}]; defaults to ${SEARCH_LOGS_MAX_LIMIT}.` },
   },
   required: ["service", "level", "contains", "window", "limit"],
   additionalProperties: false,
@@ -115,7 +118,7 @@ const FIND_TRACES_SCHEMA: JSONSchema = {
       description:
         "\"errors\": traces containing an error span anywhere in the tree (the root may still be ok under an async fire-and-forget branch) — use this to find concrete failing requests. \"slowest\": all matching traces sorted by the root span's own duration, descending — use this for latency investigations.",
     },
-    limit: { type: ["integer", "null"], description: "Max trace summaries to return. Clamped to [1, 10]; defaults to 10." },
+    limit: { type: ["integer", "null"], description: `Max trace summaries to return. Clamped to [1, ${FIND_TRACES_MAX_LIMIT}]; defaults to ${FIND_TRACES_MAX_LIMIT}.` },
   },
   required: ["service", "window", "criteria", "limit"],
   additionalProperties: false,
@@ -160,21 +163,21 @@ export const TOOLS: ToolDef[] = [
   {
     name: "search_logs",
     description:
-      "Matching log lines in the window, newest first, each with its service/level/message and (when available) the trace_id/span_id linking it back to a specific request. Use once query_metrics has scoped a time range and service, to read the actual messages driving an anomaly — `contains` is a literal substring match, not a pattern language. Capped at `limit` (default and max 50); `truncated: true` means the cap was hit and there may be more matching lines than shown, so narrow the window/service/level rather than trusting this as exhaustive.",
+      `Matching log lines in the window, newest first, each with its service/level/message and (when available) the trace_id/span_id linking it back to a specific request. Use once query_metrics has scoped a time range and service, to read the actual messages driving an anomaly — \`contains\` is a literal substring match, not a pattern language. Returns at most \`limit\` (default and max ${SEARCH_LOGS_MAX_LIMIT}) lines plus \`total\`, the full match count; \`truncated: true\` means only the newest \`count\` of \`total\` matches are shown — narrow the window/service/level to see the rest.`,
     input_schema: SEARCH_LOGS_SCHEMA,
     strict: true,
   },
   {
     name: "find_traces",
     description:
-      "Trace summaries (entry service/operation, start time, root-span duration, status, span_count) for traces entering in the window — not full span trees. Use `criteria: \"errors\"` to find concrete failing requests once query_metrics/search_logs point at a service, or `criteria: \"slowest\"` for latency investigations. Follow up with get_trace on a specific trace_id to see the causal chain. Capped at `limit` (default and max 10); `truncated: true` means there are likely more matches than shown.",
+      `Trace summaries (entry service/operation, start time, root-span duration, status, span_count) for traces entering in the window — not full span trees. Use \`criteria: "errors"\` to find concrete failing requests once query_metrics/search_logs point at a service, or \`criteria: "slowest"\` for latency investigations. Follow up with get_trace on a specific trace_id to see the causal chain. Returns at most \`limit\` (default and max ${FIND_TRACES_MAX_LIMIT}) summaries plus \`total\`, the full match count; \`truncated: true\` means only \`count\` of \`total\` matches are shown.`,
     input_schema: FIND_TRACES_SCHEMA,
     strict: true,
   },
   {
     name: "get_trace",
     description:
-      "The full span tree for one trace_id — every span's service/operation/timing/status, plus the error-level log lines linked to that trace. This is how to see the causal chain of a single failing or slow request: which service called which, and where an error or latency actually originated versus where it was merely observed downstream. Capped at 40 spans; on a larger trace, repeated healthy sibling spans collapse into \"...N similar ok spans\" markers while the full error root-to-leaf path is always kept intact — `truncated: true` plus `note` explain what was collapsed. Get a trace_id from find_traces or a log line first.",
+      `The full span tree for one trace_id — every span's service/operation/timing/status, plus the error-level log lines linked to that trace. This is how to see the causal chain of a single failing or slow request: which service called which, and where an error or latency actually originated versus where it was merely observed downstream. Capped at ${MAX_TRACE_SPANS} spans; on a larger trace, repeated healthy sibling spans collapse into "...N similar ok spans" markers while the full error root-to-leaf path is always kept intact — \`truncated: true\` plus \`note\` explain what was collapsed. Get a trace_id from find_traces or a log line first.`,
     input_schema: GET_TRACE_SCHEMA,
     strict: true,
   },
@@ -280,15 +283,6 @@ export interface ExecuteToolCtx {
   db: D1Database;
   nowMs: number;
 }
-
-/** Mirrors `read.ts`'s own (private) row-cap clamp, so this layer can compute the *effective*
- * limit a call used (to detect "hit the cap exactly") without reaching into `read.ts` internals. */
-function clampInt(n: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, Math.floor(n)));
-}
-
-const SEARCH_LOGS_MAX_LIMIT = 50;
-const FIND_TRACES_MAX_LIMIT = 10;
 
 function asRecord(input: unknown): Record<string, unknown> {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
@@ -408,9 +402,15 @@ async function runSearchLogs(input: unknown, ctx: ExecuteToolCtx): Promise<objec
   const limitInput = optionalNumber(rec, "limit");
   const { fromMs, toMs } = parseWindow(optionalWindow(rec), ctx.nowMs);
 
-  const effectiveLimit = clampInt(limitInput ?? SEARCH_LOGS_MAX_LIMIT, 1, SEARCH_LOGS_MAX_LIMIT);
-  const logs = await searchLogs(ctx.db, { service, level, contains, fromMs, toMs, limit: limitInput });
-  return { logs, count: logs.length, limit: effectiveLimit, truncated: logs.length >= effectiveLimit };
+  const { logs, total } = await searchLogs(ctx.db, { service, level, contains, fromMs, toMs, limit: limitInput });
+  const truncated = total > logs.length;
+  return {
+    logs,
+    count: logs.length,
+    total,
+    truncated,
+    ...(truncated ? { note: `showing ${logs.length} of ${total} matching log lines` } : {}),
+  };
 }
 
 async function runFindTraces(input: unknown, ctx: ExecuteToolCtx): Promise<object> {
@@ -420,9 +420,15 @@ async function runFindTraces(input: unknown, ctx: ExecuteToolCtx): Promise<objec
   const limitInput = optionalNumber(rec, "limit");
   const { fromMs, toMs } = parseWindow(optionalWindow(rec), ctx.nowMs);
 
-  const effectiveLimit = clampInt(limitInput ?? FIND_TRACES_MAX_LIMIT, 1, FIND_TRACES_MAX_LIMIT);
-  const traces = await findTraces(ctx.db, { service, fromMs, toMs, criteria, limit: limitInput });
-  return { traces, count: traces.length, limit: effectiveLimit, truncated: traces.length >= effectiveLimit };
+  const { traces, total } = await findTraces(ctx.db, { service, fromMs, toMs, criteria, limit: limitInput });
+  const truncated = total > traces.length;
+  return {
+    traces,
+    count: traces.length,
+    total,
+    truncated,
+    ...(truncated ? { note: `showing ${traces.length} of ${total} matching traces` } : {}),
+  };
 }
 
 async function runGetTrace(input: unknown, ctx: ExecuteToolCtx): Promise<object> {

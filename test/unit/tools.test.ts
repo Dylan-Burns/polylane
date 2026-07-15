@@ -329,40 +329,71 @@ describe("executeTool", () => {
     expect(point?.p50).toBe(40); // raw values untouched by the metrics filter
   });
 
-  it("search_logs round-trips a contains filter with trace linkage", async () => {
+  it("search_logs round-trips a contains filter with trace linkage and an exact total", async () => {
     const result = (await executeTool(
       "search_logs",
       { service: null, level: "error", contains: "pool exhausted", window: { from: "-30m", to: null }, limit: null },
       CTX,
-    )) as { logs: Array<{ trace_id?: string }>; count: number; truncated: boolean };
+    )) as { logs: Array<{ trace_id?: string }>; count: number; total: number; truncated: boolean; note?: string };
 
     expect(result.count).toBe(1);
+    expect(result.total).toBe(1);
     expect(result.logs[0]?.trace_id).toBe("trace-cascade");
     expect(result.truncated).toBe(false);
+    expect(result.note).toBeUndefined(); // note appears only on truncated results, like get_trace
   });
 
-  it("search_logs clamps an oversized limit and reports truncated: true when the cap is hit", async () => {
+  it("search_logs clamps an oversized limit and reports exact truncation with a showing-N-of-M note", async () => {
     const result = (await executeTool(
       "search_logs",
       { service: "catalog", level: "info", contains: null, window: { from: "-30m", to: null }, limit: 1000 },
       CTX,
-    )) as { logs: unknown[]; count: number; limit: number; truncated: boolean };
+    )) as { logs: unknown[]; count: number; total: number; truncated: boolean; note?: string };
 
-    expect(result.limit).toBe(50); // clamped to search_logs' max
-    expect(result.count).toBe(50); // 60 noise logs match, capped at 50
+    expect(result.count).toBe(50); // 60 noise logs match, page capped at 50
+    expect(result.total).toBe(60); // ...but total reports the uncapped match count
     expect(result.truncated).toBe(true);
+    expect(result.note).toBe("showing 50 of 60 matching log lines");
   });
 
-  it("find_traces criteria 'errors' round-trips entry service/operation/status", async () => {
+  it("search_logs with count exactly at the caller's limit is NOT truncated when total matches (old heuristic's false positive)", async () => {
+    const result = (await executeTool(
+      "search_logs",
+      { service: null, level: "error", contains: "pool exhausted", window: { from: "-30m", to: null }, limit: 1 },
+      CTX,
+    )) as { count: number; total: number; truncated: boolean };
+
+    // Exactly 1 match, limit 1: the page is "full" but nothing was cut off — the COUNT(*)-backed
+    // total makes this exact where the old count===limit heuristic misreported truncated: true.
+    expect(result.count).toBe(1);
+    expect(result.total).toBe(1);
+    expect(result.truncated).toBe(false);
+  });
+
+  it("find_traces criteria 'errors' round-trips entry service/operation/status with an exact total", async () => {
     const result = (await executeTool(
       "find_traces",
       { service: null, window: { from: "-30m", to: null }, criteria: "errors", limit: null },
       CTX,
-    )) as { traces: Array<{ trace_id: string; status: string }>; count: number; truncated: boolean };
+    )) as { traces: Array<{ trace_id: string; status: string }>; count: number; total: number; truncated: boolean };
 
     expect(result.traces.map((t) => t.trace_id).sort()).toEqual(["trace-cap", "trace-cascade"]);
     for (const t of result.traces) expect(t.status).toBe("error");
+    expect(result.total).toBe(2);
     expect(result.truncated).toBe(false);
+  });
+
+  it("find_traces below-total limit reports truncated with a showing-N-of-M note", async () => {
+    const result = (await executeTool(
+      "find_traces",
+      { service: null, window: { from: "-30m", to: null }, criteria: "errors", limit: 1 },
+      CTX,
+    )) as { traces: unknown[]; count: number; total: number; truncated: boolean; note?: string };
+
+    expect(result.count).toBe(1);
+    expect(result.total).toBe(2);
+    expect(result.truncated).toBe(true);
+    expect(result.note).toBe("showing 1 of 2 matching traces");
   });
 
   it("get_trace passes through truncated: true and note untouched for an oversized trace", async () => {
