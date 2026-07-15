@@ -57,9 +57,11 @@ function DetailBody({ detail }: { detail: IncidentDetailResponse }) {
 
 export function IncidentDetailModal({ incidentId, onClose }: { incidentId: string; onClose: () => void }) {
   // Starts optimistic (assume live) so a freshly-opened incident polls right away; once the first
-  // response lands, tracks the real status so polling stops the instant it's no longer investigating.
+  // response lands, tracks the real status. Polling stops only on the TRUE terminal states
+  // (resolved | failed) — "reported" is not terminal: auto-resolve flips reported→resolved from
+  // the cron sweep minutes later with no new step row, and an open modal must show that heal live.
   const [knownStatus, setKnownStatus] = useState<string | null>(null);
-  const interval = knownStatus === null || knownStatus === "investigating" ? LIVE_POLL_MS : null;
+  const interval = knownStatus === "resolved" || knownStatus === "failed" ? null : LIVE_POLL_MS;
   const { data, error } = usePoll(() => getIncidentDetail(incidentId), interval);
 
   useEffect(() => {

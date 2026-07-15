@@ -82,7 +82,7 @@ function ScenarioCard({
     >
       {isBadDeploy && (
         <span className="absolute -top-2.5 right-3 rounded-full border border-signal/50 bg-void px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-signal-glow">
-          Start here →
+          Start here → ship a bad deploy and watch
         </span>
       )}
       <div className="flex items-baseline justify-between gap-2">
