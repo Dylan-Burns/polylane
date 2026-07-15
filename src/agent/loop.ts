@@ -117,6 +117,27 @@ const MAX_TOKENS_PER_CALL = 8192;
 /** The instruction appended as a user message for the one-shot salvage call (spec §9, verbatim). */
 const SALVAGE_INSTRUCTION = "conclude with what you have; state low confidence";
 
+/**
+ * Minimum per-call timeout for the SALVAGE call specifically. Without a floor, tripping the wall
+ * cap makes salvage dead on arrival: `remainingMs` is 0 (or nearly so) at exactly the moment
+ * salvage fires, and a 0ms timeout aborts the SDK request immediately — a real 4-minute
+ * investigation could NEVER salvage a report, only ever `fail`. So the wall cap bounds the
+ * INVESTIGATION loop (no further exploration once it trips), while the salvage epilogue is
+ * bounded separately: `max(SALVAGE_FLOOR_MS, remainingMs)`, meaning a wall-capped run is allowed
+ * to exceed `maxWallMs` by up to this floor for its one concluding call. Exported so tests assert
+ * against the same constant rather than a copy.
+ */
+export const SALVAGE_FLOOR_MS = 45_000;
+
+/**
+ * `max_tokens` ceiling for the SALVAGE call specifically, higher than the per-step
+ * `MAX_TOKENS_PER_CALL`: this is the one call where a complete `submit_report` payload is
+ * mandatory (forced via `tool_choice`), so adaptive thinking + a full structured report must
+ * never be able to truncate against the ceiling. Exported for the same reason as
+ * `SALVAGE_FLOOR_MS`.
+ */
+export const SALVAGE_MAX_TOKENS = 12_288;
+
 /** Loop-guard thresholds (spec §9): the *third* consecutive identical tool call gets a synthetic
  * error result nudging toward `submit_report`; a *fourth* (the nudge ignored) forces salvage
  * instead of nudging again or looping forever. */
@@ -187,17 +208,25 @@ function messagesForRequest(messages: readonly MessageParam[]): MessageParam[] {
   return copy;
 }
 
-function buildParams(cfg: LoopConfig, messages: readonly MessageParam[], toolChoice?: ToolChoice): MessageCreateParamsNonStreaming {
+function buildParams(
+  cfg: LoopConfig,
+  messages: readonly MessageParam[],
+  toolChoice?: ToolChoice,
+  maxTokens: number = MAX_TOKENS_PER_CALL,
+): MessageCreateParamsNonStreaming {
   const policy = cfg.thinkingOverride ?? DEFAULT_THINKING_POLICY;
   const tools = cfg.submitReportTool ? [...cfg.tools, cfg.submitReportTool] : cfg.tools;
   return {
     model: cfg.model,
-    max_tokens: MAX_TOKENS_PER_CALL,
+    max_tokens: maxTokens,
     system: systemForRequest(cfg.system),
     messages: messagesForRequest(messages),
     tools: tools.map(toApiTool),
     thinking: policy.thinking,
     output_config: policy.outputConfig,
+    // Forced tool_choice combined with adaptive thinking is legal on the first-party Claude API
+    // (this project's only target) but is rejected with a 400 on Bedrock — a known portability
+    // caveat for the salvage call, not a bug here.
     ...(toolChoice ? { tool_choice: toolChoice } : {}),
   };
 }
@@ -289,13 +318,21 @@ export async function runLoop(cfg: LoopConfig, initialMessages: MessageParam[]):
   }
 
   /** One model call: builds params, calls `cfg.llm.create` with a per-call timeout clamped to the
-   * remaining wall-clock budget (`llm.ts`'s deadline contract), and folds `response.usage` into
-   * the running totals. Rejections are NOT caught here — they propagate to `runLoop`'s top-level
-   * catch, which is exactly the "llm.create rejection -> outcome 'failed'" contract. */
-  async function callModel(toolChoice?: ToolChoice): Promise<Message> {
+   * remaining wall-clock budget (`llm.ts`'s deadline contract) — raised to `timeoutFloorMs` when
+   * set, which only the salvage path uses (see `SALVAGE_FLOOR_MS`: without the floor, a tripped
+   * wall cap means `remainingMs` is 0 and the one mandatory concluding call aborts instantly) —
+   * and folds `response.usage` into the running totals. Rejections are NOT caught here — they
+   * propagate to `runLoop`'s top-level catch, which is exactly the "llm.create rejection ->
+   * outcome 'failed'" contract. */
+  async function callModel(opts: { toolChoice?: ToolChoice; timeoutFloorMs?: number; maxTokens?: number } = {}): Promise<Message> {
     const remainingMs = Math.max(0, cfg.caps.maxWallMs - (cfg.nowFn() - startMs));
-    const params = buildParams(cfg, messages, toolChoice);
-    const response = await cfg.llm.create(params, remainingMs);
+    const timeoutMs = Math.max(opts.timeoutFloorMs ?? 0, remainingMs);
+    const params = buildParams(cfg, messages, opts.toolChoice, opts.maxTokens);
+    const response = await cfg.llm.create(params, timeoutMs);
+    // Deliberate: the tokens-in budget counts cache_creation AND cache_read tokens at FULL
+    // weight, even though cache reads bill at ~1/10 the price. The cap is a spend/runaway
+    // backstop, not an invoice — counting the cheap tokens as if they were full-price is the
+    // conservative direction (trips earlier, never later than a price-weighted count would).
     tokensIn += response.usage.input_tokens + (response.usage.cache_creation_input_tokens ?? 0) + (response.usage.cache_read_input_tokens ?? 0);
     tokensOut += response.usage.output_tokens;
     return response;
@@ -312,7 +349,11 @@ export async function runLoop(cfg: LoopConfig, initialMessages: MessageParam[]):
     }
     const submitReportTool = cfg.submitReportTool;
     messages.push({ role: "user", content: [{ type: "text", text: SALVAGE_INSTRUCTION }] });
-    const response = await callModel({ type: "tool", name: submitReportTool.name });
+    const response = await callModel({
+      toolChoice: { type: "tool", name: submitReportTool.name },
+      timeoutFloorMs: SALVAGE_FLOOR_MS,
+      maxTokens: SALVAGE_MAX_TOKENS,
+    });
     // Verbatim echo — see the top-of-file contract; this is the exact array the model returned.
     messages.push({ role: "assistant", content: response.content as unknown as ContentBlockParam[] });
 
@@ -367,17 +408,31 @@ export async function runLoop(cfg: LoopConfig, initialMessages: MessageParam[]):
         return { outcome: "failed", steps, usage: usage() };
       }
 
+      // --- submit_report anywhere in the turn ends the investigation immediately --------------
+      // Even alongside other tool calls in a parallel turn (and regardless of block order): once
+      // the report exists the loop is over, so sibling tools are never executed — their results
+      // could never be delivered to another model call anyway.
+      const submitReportTool = cfg.submitReportTool;
+      if (submitReportTool) {
+        const reportUse = toolUses.find((b) => b.name === submitReportTool.name);
+        if (reportUse) {
+          await record("report", reportUse.input, response.usage.input_tokens, response.usage.output_tokens);
+          return { outcome: "report", report: reportUse.input, steps, usage: usage() };
+        }
+      }
+
       // --- Process each tool call in order ----------------------------------------------------
       const results: ToolResultBlockParam[] = [];
       let forceSalvage = false;
       for (const toolUse of toolUses) {
-        if (cfg.submitReportTool && toolUse.name === cfg.submitReportTool.name) {
-          await record("report", toolUse.input, response.usage.input_tokens, response.usage.output_tokens);
-          return { outcome: "report", report: toolUse.input, steps, usage: usage() };
-        }
-
         await record("tool_call", { tool_use_id: toolUse.id, name: toolUse.name, input: toolUse.input }, response.usage.input_tokens, response.usage.output_tokens);
 
+        // Dedup-guard scope note: `lastSignature`/`consecutiveCount` track ONE linear signature
+        // sequence across all tool calls. An alternating parallel-turn loop ([A,B],[A,B],...)
+        // therefore never accumulates a consecutive count — each B resets A's streak and vice
+        // versa — so the nudge won't catch that pattern; the step/token/wall caps terminate it
+        // instead. Accepted: the guard targets the observed single-call fixation failure mode,
+        // and the caps remain the unconditional backstop for everything else.
         const signature = callSignature(toolUse.name, toolUse.input, cfg.nowFn());
         if (signature === lastSignature) consecutiveCount += 1;
         else {

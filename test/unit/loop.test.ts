@@ -10,7 +10,7 @@ import type {
   Usage,
 } from "@anthropic-ai/sdk/resources/messages";
 import { realLLM, scriptedLLM, type LLM } from "../../src/agent/llm";
-import { runLoop, type LoopConfig, type StepRecord } from "../../src/agent/loop";
+import { runLoop, SALVAGE_FLOOR_MS, SALVAGE_MAX_TOKENS, type LoopConfig, type StepRecord } from "../../src/agent/loop";
 import { SUBMIT_REPORT, TOOLS } from "../../src/agent/tools";
 
 // ============================================================================================
@@ -252,6 +252,84 @@ describe("runLoop", () => {
     expect(JSON.parse(block.content as string)).toEqual({ error: "boom: D1 unavailable" });
   });
 
+  it("[2a] parallel turn with TWO tool_use blocks -> exactly one following user message with two matching tool_results", async () => {
+    const r1 = makeMessage({
+      content: [
+        toolUse("par-1", "query_metrics", { service: "checkout", operation: null, metrics: null, window: null, step: null }),
+        toolUse("par-2", "search_logs", { service: "checkout", level: "error", contains: null, window: null, limit: null }),
+      ],
+      stop_reason: "tool_use",
+    });
+    const r2 = makeMessage({ content: [toolUse("par-3", "submit_report", GOOD_REPORT)], stop_reason: "tool_use" });
+    const llm = scriptedLLM([r1, r2]);
+
+    const executed: string[] = [];
+    const cfg: LoopConfig = {
+      llm,
+      model: "claude-sonnet-5",
+      system: [{ type: "text", text: "sys" }],
+      tools: TOOLS,
+      executeTool: async (name) => {
+        executed.push(name);
+        return { ok: true, tool: name };
+      },
+      caps: baseCaps(),
+      submitReportTool: SUBMIT_REPORT,
+      nowFn: () => NOW0,
+    };
+
+    const result = await runLoop(cfg, INITIAL_MESSAGES);
+
+    expect(result.outcome).toBe("report");
+    expect(executed).toEqual(["query_metrics", "search_logs"]); // both executed, in block order
+
+    // Exactly ONE user message follows the parallel assistant turn: [user0, assistant(r1), results].
+    const req1 = llm.requests[1];
+    expect(req1?.messages).toHaveLength(3);
+    const resultsMsg = req1?.messages[2];
+    expect(resultsMsg?.role).toBe("user");
+    const blocks = resultsMsg?.content as ToolResultBlockParam[];
+    expect(blocks).toHaveLength(2);
+    expect(blocks.every((b) => b.type === "tool_result")).toBe(true);
+    expect(blocks.map((b) => b.tool_use_id)).toEqual(["par-1", "par-2"]); // ids match both tool_use blocks
+    expect(parseToolResult(blocks[0] as ToolResultBlockParam)).toEqual({ ok: true, tool: "query_metrics" });
+    expect(parseToolResult(blocks[1] as ToolResultBlockParam)).toEqual({ ok: true, tool: "search_logs" });
+  });
+
+  it("[2b] submit_report alongside another tool in one parallel turn -> immediate report, no further model call", async () => {
+    const r1 = makeMessage({
+      content: [
+        toolUse("mix-1", "query_metrics", { service: null, operation: null, metrics: null, window: null, step: null }),
+        toolUse("mix-2", "submit_report", GOOD_REPORT),
+      ],
+      stop_reason: "tool_use",
+    });
+    const llm = scriptedLLM([r1]);
+
+    let executeCount = 0;
+    const cfg: LoopConfig = {
+      llm,
+      model: "claude-sonnet-5",
+      system: [{ type: "text", text: "sys" }],
+      tools: TOOLS,
+      executeTool: async () => {
+        executeCount += 1;
+        return { ok: true };
+      },
+      caps: baseCaps(),
+      submitReportTool: SUBMIT_REPORT,
+      nowFn: () => NOW0,
+    };
+
+    const result = await runLoop(cfg, INITIAL_MESSAGES);
+
+    expect(result.outcome).toBe("report");
+    expect(result.report).toEqual(GOOD_REPORT);
+    expect(llm.requests).toHaveLength(1); // no further model call after the report
+    expect(executeCount).toBe(0); // sibling tools are never executed once the report exists
+    expect(result.steps.map((s) => s.kind)).toEqual(["report"]);
+  });
+
   it("[3a] end_turn without submit_report -> one salvage call (tool_choice forced) -> outcome report", async () => {
     const r1 = makeMessage({ content: [text("I believe the investigation is complete.")], stop_reason: "end_turn" });
     const r2 = makeMessage({ content: [toolUse("call-salvage", "submit_report", GOOD_REPORT)], stop_reason: "tool_use" });
@@ -274,6 +352,11 @@ describe("runLoop", () => {
     expect(result.report).toEqual(GOOD_REPORT);
     expect(llm.requests).toHaveLength(2);
     expect(llm.requests[1]?.tool_choice).toEqual({ type: "tool", name: "submit_report" });
+    // Salvage-specific ceilings: a bigger max_tokens (thinking + a full mandatory report payload
+    // must never truncate on this one call) and a real timeout floor.
+    expect(llm.requests[0]?.max_tokens).toBe(8192);
+    expect(llm.requests[1]?.max_tokens).toBe(SALVAGE_MAX_TOKENS);
+    expect(llm.timeouts[1]).toBeGreaterThanOrEqual(SALVAGE_FLOOR_MS);
 
     const salvageReq = llm.requests[1];
     expect(salvageReq?.messages).toHaveLength(3); // [user0, assistant(end_turn), user(salvage instruction)]
@@ -381,6 +464,12 @@ describe("runLoop", () => {
     expect(result.outcome).toBe("report");
     expect(llm.requests).toHaveLength(3);
     expect(llm.requests[2]?.tool_choice).toEqual({ type: "tool", name: "submit_report" });
+    // The wall cap has tripped, so remaining budget is 0 — the salvage call must still get a
+    // real timeout (SALVAGE_FLOOR_MS floor), otherwise a timeout of 0 aborts the SDK request
+    // instantly and a wall-capped investigation could never salvage a report, only fail.
+    expect(llm.timeouts[2]).toBeGreaterThanOrEqual(SALVAGE_FLOOR_MS);
+    // The non-salvage calls still get the plain remaining-budget timeout, no floor.
+    expect(llm.timeouts[0]).toBe(100_000);
   });
 
   it("[5] duplicate-call nudge: 3rd identical call gets synthetic error nudge; 4th (ignored) forces salvage, not infinite", async () => {
@@ -543,5 +632,27 @@ describe("runLoop", () => {
     expect(result.steps).toHaveLength(1);
     expect(result.steps[0]?.kind).toBe("error");
     expect((result.steps[0]?.content as { message: string }).message).toContain("network is down");
+  });
+
+  it("onStep throwing -> outcome failed, runLoop still never throws", async () => {
+    const r1 = makeMessage({ content: [toolUse("c1", "query_metrics", { service: null, operation: null, metrics: null, window: null, step: null })], stop_reason: "tool_use" });
+    const llm = scriptedLLM([r1]);
+
+    const cfg: LoopConfig = {
+      llm,
+      model: "claude-sonnet-5",
+      system: [{ type: "text", text: "sys" }],
+      tools: TOOLS,
+      executeTool: async () => ({ ok: true }),
+      caps: baseCaps(),
+      submitReportTool: SUBMIT_REPORT,
+      onStep: async () => {
+        throw new Error("persistence down");
+      },
+      nowFn: () => NOW0,
+    };
+
+    const result = await runLoop(cfg, INITIAL_MESSAGES); // must resolve, not reject
+    expect(result.outcome).toBe("failed");
   });
 });
