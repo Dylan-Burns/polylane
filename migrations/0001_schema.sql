@@ -99,6 +99,8 @@ CREATE TABLE meta (
 );
 
 -- The four indexes (spec §7): exactly two on spans, one on logs, one on rollups.
+-- (The PKs on the six low-volume tables below each add a SQLite autoindex; those
+-- tables write ~tens of rows/hour, so the 2x billing there is negligible by design.)
 CREATE INDEX idx_spans_service_start_ms ON spans (service, start_ms);
 CREATE INDEX idx_spans_trace_id ON spans (trace_id);
 CREATE INDEX idx_logs_service_ts_ms ON logs (service, ts_ms);
