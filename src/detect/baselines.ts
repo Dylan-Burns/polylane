@@ -1,6 +1,7 @@
 /**
- * Baselines: median + MAD per (service, operation, metric ∈ {req_rate, error_rate, p95}) over the
- * trailing 24h of `rollups` (spec §8). Pure statistics over already-persisted rollups — no LLM
+ * Baselines: median + MAD per (service, operation, metric ∈ {req_rate, error_rate, p95, p50})
+ * over the trailing 24h of `rollups` (spec §8 v2.1 — p50 backs the latency rules'
+ * distribution-shift confirmation, see `rules.ts`). Pure statistics over already-persisted rollups — no LLM
  * cost, deterministic, unit-testable in isolation. Deliberately no hour-of-day adjustment (spec
  * §8: "the diurnal curve is mild; multiplicative thresholds absorb it").
  *
@@ -56,6 +57,7 @@ interface RollupAggRow {
   operation: string;
   count: number;
   error_count: number;
+  p50_ms: number;
   p95_ms: number;
 }
 
@@ -63,6 +65,7 @@ interface Group {
   reqRates: number[];
   errorRates: number[];
   p95s: number[];
+  p50s: number[];
 }
 
 interface BaselineRow {
@@ -111,8 +114,8 @@ async function replaceBaselines(db: D1Database, rows: readonly BaselineRow[], no
  * Per (service, operation) group:
  *  - `req_rate`: one data point per rollup minute (`count`), zero-traffic minutes included as a
  *    literal 0 — always written when the group has any rollup rows.
- *  - `p95`: one data point per rollup minute (`p95_ms`) — always written alongside `req_rate`
- *    (same rollup rows back both).
+ *  - `p95` / `p50`: one data point per rollup minute (`p95_ms` / `p50_ms`) — always written
+ *    alongside `req_rate` (same rollup rows back all three).
  *  - `error_rate`: one data point per minute (`error_count / count`), but minutes with `count = 0`
  *    are EXCLUDED (an undefined ratio, not a 0) — so if every minute in the window had zero
  *    traffic, no `error_rate` row is written for that group at all (nothing to baseline).
@@ -120,7 +123,9 @@ async function replaceBaselines(db: D1Database, rows: readonly BaselineRow[], no
 export async function computeBaselines(db: D1Database, nowMs: number): Promise<number> {
   const fromMs = nowMs - TRAILING_WINDOW_MS;
   const { results } = await db
-    .prepare("SELECT service, operation, count, error_count, p95_ms FROM rollups WHERE minute_ts >= ? AND minute_ts < ?")
+    .prepare(
+      "SELECT service, operation, count, error_count, p50_ms, p95_ms FROM rollups WHERE minute_ts >= ? AND minute_ts < ?",
+    )
     .bind(fromMs, nowMs)
     .all<RollupAggRow>();
 
@@ -129,11 +134,12 @@ export async function computeBaselines(db: D1Database, nowMs: number): Promise<n
     const key = `${row.service}${GROUP_KEY_SEP}${row.operation}`;
     let group = groups.get(key);
     if (!group) {
-      group = { reqRates: [], errorRates: [], p95s: [] };
+      group = { reqRates: [], errorRates: [], p95s: [], p50s: [] };
       groups.set(key, group);
     }
     group.reqRates.push(row.count);
     group.p95s.push(row.p95_ms);
+    group.p50s.push(row.p50_ms);
     if (row.count > 0) group.errorRates.push(row.error_count / row.count);
   }
 
@@ -148,6 +154,9 @@ export async function computeBaselines(db: D1Database, nowMs: number): Promise<n
 
     const p95Median = median(group.p95s);
     rows.push({ service, operation, metric: "p95", median: p95Median, mad: medianAbsoluteDeviation(group.p95s, p95Median) });
+
+    const p50Median = median(group.p50s);
+    rows.push({ service, operation, metric: "p50", median: p50Median, mad: medianAbsoluteDeviation(group.p50s, p50Median) });
 
     if (group.errorRates.length > 0) {
       const errorMedian = median(group.errorRates);

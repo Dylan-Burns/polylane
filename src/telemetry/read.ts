@@ -106,7 +106,7 @@ interface BaselineRowDb {
 }
 
 /** Reads the value a given baseline `metric` class compares against on a `MetricPoint`. */
-function metricValueFor(point: Pick<MetricPoint, "count" | "error_rate" | "p95">, metric: BaselineMetric): number {
+function metricValueFor(point: Pick<MetricPoint, "count" | "error_rate" | "p95" | "p50">, metric: BaselineMetric): number {
   switch (metric) {
     case "req_rate":
       return point.count;
@@ -114,6 +114,8 @@ function metricValueFor(point: Pick<MetricPoint, "count" | "error_rate" | "p95">
       return point.error_rate;
     case "p95":
       return point.p95;
+    case "p50":
+      return point.p50;
   }
 }
 

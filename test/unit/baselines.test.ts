@@ -63,13 +63,17 @@ describe("computeBaselines", () => {
     ]);
 
     const written = await computeBaselines(env.DB, T0);
-    expect(written).toBe(3); // req_rate + error_rate + p95
+    expect(written).toBe(4); // req_rate + error_rate + p95 + p50
 
     const reqRate = await baselineRow("checkout", "POST /checkout", "req_rate");
     expect(reqRate).toEqual({ median: 20, mad: 10, computed_at: T0 }); // sorted [10,20,30]; devs [10,0,10] -> median 10
 
     const p95 = await baselineRow("checkout", "POST /checkout", "p95");
     expect(p95).toEqual({ median: 200, mad: 100, computed_at: T0 });
+
+    // mkRollup sets p50_ms = p95Ms / 2, so the p50 series is [150, 50, 100] -> median 100, MAD 50.
+    const p50 = await baselineRow("checkout", "POST /checkout", "p50");
+    expect(p50).toEqual({ median: 100, mad: 50, computed_at: T0 });
 
     const errorRate = await baselineRow("checkout", "POST /checkout", "error_rate");
     expect(errorRate).toEqual({ median: 0, mad: 0, computed_at: T0 }); // all error_count 0
@@ -105,6 +109,8 @@ describe("computeBaselines", () => {
     expect(reqRate).toEqual({ median: 50, mad: 0, computed_at: T0 });
     const p95 = await baselineRow("payments", "charge", "p95");
     expect(p95).toEqual({ median: 90, mad: 0, computed_at: T0 });
+    const p50 = await baselineRow("payments", "charge", "p50");
+    expect(p50).toEqual({ median: 45, mad: 0, computed_at: T0 });
   });
 
   it("excludes count=0 minutes from error_rate but still includes them (as 0) in req_rate/p95", async () => {
@@ -115,7 +121,7 @@ describe("computeBaselines", () => {
     ]);
 
     const written = await computeBaselines(env.DB, T0);
-    expect(written).toBe(3);
+    expect(written).toBe(4);
 
     // req_rate includes the zero-traffic minute as a literal 0: sorted [0,50,100] -> median 50.
     const reqRate = await baselineRow("notifications", "send_receipt", "req_rate");
@@ -133,7 +139,7 @@ describe("computeBaselines", () => {
     ]);
 
     const written = await computeBaselines(env.DB, T0);
-    expect(written).toBe(2); // req_rate + p95 only, no error_rate
+    expect(written).toBe(3); // req_rate + p95 + p50 only, no error_rate
 
     const errorRate = await baselineRow("idle-service", "noop", "error_rate");
     expect(errorRate).toBeNull();
@@ -163,27 +169,27 @@ describe("computeBaselines", () => {
     ]);
 
     const firstWritten = await computeBaselines(env.DB, T0);
-    expect(firstWritten).toBe(3);
+    expect(firstWritten).toBe(4);
     const rowCountAfterFirst = await env.DB.prepare(
       "SELECT count(*) as n FROM baselines WHERE service = ? AND operation = ?",
     )
       .bind(service, operation)
       .first<{ n: number }>();
-    expect(rowCountAfterFirst?.n).toBe(3);
+    expect(rowCountAfterFirst?.n).toBe(4);
     expect((await baselineRow(service, operation, "req_rate"))?.median).toBe(15); // median of [10,20]
 
     // A new rollup minute lands, and time advances — still within the trailing 24h of everything
     // above, so the recompute sees three data points instead of two.
     await insertRollups(env.DB, [mkRollup(service, operation, T0, 90, 0, 300)]);
     const secondWritten = await computeBaselines(env.DB, T0 + MIN);
-    expect(secondWritten).toBe(3);
+    expect(secondWritten).toBe(4);
 
     const rowCountAfterSecond = await env.DB.prepare(
       "SELECT count(*) as n FROM baselines WHERE service = ? AND operation = ?",
     )
       .bind(service, operation)
       .first<{ n: number }>();
-    expect(rowCountAfterSecond?.n).toBe(3); // still 3 rows, not 6 — REPLACE, not INSERT
+    expect(rowCountAfterSecond?.n).toBe(4); // still 4 rows, not 8 — REPLACE, not INSERT
 
     const reqRateAfterSecond = await baselineRow(service, operation, "req_rate");
     expect(reqRateAfterSecond?.median).toBe(20); // sorted [10,20,90] -> median 20
@@ -196,7 +202,7 @@ describe("computeBaselines", () => {
       mkRollup("service-b", "op-b", T0 - MIN, 999, 0, 999),
     ]);
     const written = await computeBaselines(env.DB, T0);
-    expect(written).toBe(6); // 3 metrics x 2 groups
+    expect(written).toBe(8); // 4 metrics x 2 groups
 
     expect((await baselineRow("service-a", "op-a", "req_rate"))?.median).toBe(10);
     expect((await baselineRow("service-b", "op-b", "req_rate"))?.median).toBe(999);
@@ -214,10 +220,11 @@ describe("getBaselines", () => {
     await computeBaselines(env.DB, T0);
 
     const map = await getBaselines(env.DB);
-    expect(map.size).toBe(3);
+    expect(map.size).toBe(4);
     expect(map.get(baselineKey("checkout", "POST /checkout", "req_rate"))).toEqual({ median: 100, mad: 0 });
     expect(map.get(baselineKey("checkout", "POST /checkout", "error_rate"))).toEqual({ median: 0.05, mad: 0 });
     expect(map.get(baselineKey("checkout", "POST /checkout", "p95"))).toEqual({ median: 150, mad: 0 });
+    expect(map.get(baselineKey("checkout", "POST /checkout", "p50"))).toEqual({ median: 75, mad: 0 });
     expect(map.get(baselineKey("checkout", "POST /checkout", "req_rate" as const))).not.toBeUndefined();
     expect(map.get("nonexistent:key:req_rate")).toBeUndefined();
   });

@@ -62,7 +62,7 @@ export interface ToolDef {
 
 const LOG_LEVELS = ["info", "warn", "error"] as const;
 const FIND_TRACES_CRITERIA = ["errors", "slowest"] as const;
-const BASELINE_METRICS = ["req_rate", "error_rate", "p95"] as const;
+const BASELINE_METRICS = ["req_rate", "error_rate", "p95", "p50"] as const;
 const CONFIDENCE_LEVELS = ["low", "medium", "high"] as const;
 
 /** Shared window schema fragment — see `WindowInput` for exactly what each bound accepts. */
@@ -86,7 +86,7 @@ const QUERY_METRICS_SCHEMA: JSONSchema = {
     metrics: {
       type: ["array", "null"],
       description:
-        "Which baseline/delta classes to overlay on each point (req_rate | error_rate | p95). Narrows the `baseline`/`delta` fields only — count/p50/p95/p99 raw values are always returned in full. Omit/null to see every class with a baseline.",
+        "Which baseline/delta classes to overlay on each point (req_rate | error_rate | p95 | p50). Narrows the `baseline`/`delta` fields only — count/p50/p95/p99 raw values are always returned in full. Omit/null to see every class with a baseline.",
       items: { type: "string", enum: BASELINE_METRICS },
     },
     window: WINDOW_SCHEMA,
@@ -158,7 +158,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: "query_metrics",
     description:
-      `Timeseries of request rate, error rate, and latency percentiles (p50/p95/p99) per service/operation, bucketed by \`step\` minutes, with a trailing-24h baseline (median/MAD) and a value-vs-baseline delta overlaid per point wherever a baseline exists. Start here to scope which services and time ranges are abnormal before drilling into logs or traces — a delta near 1 is normal; a delta of several-x on error_rate or p95 marks a genuine anomaly worth chasing. Use \`metrics\` to narrow the baseline/delta overlay once you know which signal matters; omit it to see all three. Returns at most ${MAX_METRIC_POINTS} points (the first ${MAX_METRIC_POINTS}, deterministically ordered by service/operation/bucket); \`truncated: true\` plus a \`note\` mean there were more — narrow the window, add a service/operation filter, or raise \`step\` to see the rest.`,
+      `Timeseries of request rate, error rate, and latency percentiles (p50/p95/p99) per service/operation, bucketed by \`step\` minutes, with a trailing-24h baseline (median/MAD) and a value-vs-baseline delta overlaid per point wherever a baseline exists. Start here to scope which services and time ranges are abnormal before drilling into logs or traces — a delta near 1 is normal; a delta of several-x on error_rate or p95 marks a genuine anomaly worth chasing. Use \`metrics\` to narrow the baseline/delta overlay once you know which signal matters; omit it to see every class. Returns at most ${MAX_METRIC_POINTS} points (the first ${MAX_METRIC_POINTS}, deterministically ordered by service/operation/bucket); \`truncated: true\` plus a \`note\` mean there were more — narrow the window, add a service/operation filter, or raise \`step\` to see the rest.`,
     input_schema: QUERY_METRICS_SCHEMA,
     strict: true,
   },

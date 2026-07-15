@@ -42,9 +42,11 @@ export interface Deploy {
   note: string;
 }
 
-/** The three metric classes baselines are computed over (spec §8): `req_rate` maps to a
- * `MetricPoint`'s `count`, `error_rate`/`p95` map to the like-named fields. */
-export type BaselineMetric = "req_rate" | "error_rate" | "p95";
+/** The four metric classes baselines are computed over (spec §8 v2.1): `req_rate` maps to a
+ * `MetricPoint`'s `count`, `error_rate`/`p95`/`p50` map to the like-named fields. `p50` exists to
+ * back the latency rules' distribution-shift confirmation (p50 >= 1.5x its baseline), not as an
+ * alerting metric of its own. */
+export type BaselineMetric = "req_rate" | "error_rate" | "p95" | "p50";
 
 /**
  * One bucketed point of a metrics timeseries (`read.ts`'s `queryMetrics`), optionally overlaid
