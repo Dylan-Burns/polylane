@@ -2,9 +2,11 @@
   "name": "watchtower",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
-  "build": {
-    "command": "mkdir -p ui/dist && [ -f ui/dist/index.html ] || echo '<h1>watchtower</h1>' > ui/dist/index.html"
-  },
+  // No `build.command` here: the UI is built by the root `build:ui` script
+  // (`vite build` in ui/ -> ui/dist). The canonical deploy path is
+  // `pnpm deploy`, which runs `build:ui && wrangler deploy`. Running bare
+  // `wrangler deploy`/`wrangler dev` will serve whatever is already in
+  // ui/dist (or 404 on assets if it hasn't been built yet).
   "assets": {
     "directory": "ui/dist",
     "not_found_handling": "single-page-application",
