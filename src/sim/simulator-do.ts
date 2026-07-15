@@ -10,13 +10,14 @@
  *    traffic, independent of persistence sampling).
  *  - Own fault state (`POST /fault` / `POST /restore`) and the 30s chaos cooldown.
  *  - Own reset sequencing (`POST /reset`): wipe telemetry tables, chunk a 24h backfill across
- *    alarm ticks (~4h/chunk), recompute baselines (injected hook — real impl lands in Task 3.1),
- *    seed one seeded incident, then go live.
+ *    alarm ticks (~4h/chunk), recompute baselines (`detect/baselines.ts`'s `computeBaselines`,
+ *    injected as a hook so tests can substitute a spy), seed one seeded incident, then go live.
  *  - Own the world-generation counter: every write batch checks it immediately before its D1
  *    writes and discards (skips the insert) if a reset bumped it underneath the batch.
  */
 
 import { DurableObject } from "cloudflare:workers";
+import { computeBaselines } from "../detect/baselines";
 import type { Env } from "../env";
 import { insertLogs, insertRollups, insertSpans } from "../telemetry/queries";
 import type { Deploy, LogLine, RollupRow, Span } from "../telemetry/types";
@@ -60,13 +61,6 @@ interface PartialMinute {
   stats: RequestStat[];
 }
 
-/** STUB — real detector-baseline computation lands in Task 3.1 (detect/baselines.ts). Returns the
- * count of baseline rows written (0 here, since it writes none). */
-async function recomputeBaselinesStub(_db: D1Database, _nowMs: number): Promise<number> {
-  // TODO(Task 3.1): replace with detect/baselines.ts's real computeBaselines.
-  return 0;
-}
-
 function jsonResponse(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
@@ -86,9 +80,9 @@ function randomSeed(): number {
 export class SimulatorDO extends DurableObject<Env> {
   /** Injected hook invoked once backfill's final chunk completes (spec §6: "backfill ends with a
    * synchronous baseline recompute — the detector is never armed without baselines"). Kept as a
-   * mutable instance property (not a closed-over stub) so tests can substitute a spy via
-   * `runInDurableObject`; Task 3.1 will overwrite the default with the real implementation. */
-  recomputeBaselines: (db: D1Database, nowMs: number) => Promise<number> = recomputeBaselinesStub;
+   * mutable instance property (not a closed-over reference) so tests can substitute a spy via
+   * `runInDurableObject`; defaults to the real `computeBaselines` (Task 3.1). */
+  recomputeBaselines: (db: D1Database, nowMs: number) => Promise<number> = computeBaselines;
 
   /** TEST-ONLY wall-clock override — always `null` in production, where `now()` reads
    * `Date.now()`. No HTTP route sets this; it's only reachable via `runInDurableObject`'s direct

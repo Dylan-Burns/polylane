@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
+import { computeBaselines } from "../../src/detect/baselines";
 import { BACKFILL_CHUNK_MS, MINUTE_MS } from "../../src/sim/backfill";
 import { insertSeededIncident } from "../../src/sim/seed-incident";
 import { insertSpans } from "../../src/telemetry/queries";
@@ -154,7 +155,7 @@ describe("SimulatorDO fault/restore", () => {
 
 describe("SimulatorDO reset", () => {
   it(
-    "transitions unseeded -> seeding -> running; wipes telemetry; preserves incidents; invokes recomputeBaselines once after the final chunk",
+    "transitions unseeded -> seeding -> running; wipes telemetry; preserves incidents; invokes the real computeBaselines once after the final chunk, leaving baselines non-empty",
     async () => {
       const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("test-reset-1"));
 
@@ -165,12 +166,16 @@ describe("SimulatorDO reset", () => {
       ).run();
 
       const T0 = Date.UTC(2026, 0, 5, 0, 0, 0); // already minute-aligned
+      // Wraps (rather than replaces) the real `computeBaselines` (Task 3.1's default hook) so this
+      // test both proves the call-count/timing contract (`hookCalls`) AND exercises the real
+      // computation, letting the assertion below confirm `baselines` is actually populated after a
+      // reset — the carry-forward assertion this task's brief calls for.
       const hookCalls: number[] = [];
       await runInDurableObject(stub, async (instance) => {
         instance.setTestNow(T0);
-        instance.recomputeBaselines = async (_db, nowMs) => {
+        instance.recomputeBaselines = async (db, nowMs) => {
           hookCalls.push(nowMs);
-          return 0;
+          return computeBaselines(db, nowMs);
         };
       });
 
@@ -212,6 +217,11 @@ describe("SimulatorDO reset", () => {
 
       const spansAfterBackfill = await env.DB.prepare("SELECT count(*) as n FROM spans").first<{ n: number }>();
       expect(spansAfterBackfill?.n).toBeGreaterThan(0);
+
+      // The detector must never be armed without baselines (spec §6): the synchronous post-backfill
+      // recompute above must have actually written rows, not just been invoked.
+      const baselinesAfterSeed = await env.DB.prepare("SELECT count(*) as n FROM baselines").first<{ n: number }>();
+      expect(baselinesAfterSeed?.n).toBeGreaterThan(0);
     },
     60_000,
   );
