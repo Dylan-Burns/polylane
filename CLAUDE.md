@@ -21,7 +21,7 @@ polylane ("Watchtower") is an AI incident investigator on Cloudflare Workers: a 
 - `src/sim/` — SimulatorDO (singleton `world`): topology, generator, fault scenarios, backfill/reset
 - `src/telemetry/` — D1 read/write layer (`read.ts` is the query seam; shape-aware result caps live here), incidents lifecycle, retention
 - `src/detect/` — baselines (median/MAD), rules, the cron sweep (world gate → detect → lifecycle → baselines → retention)
-- `src/agent/` — the loop core (`loop.ts`, domain-agnostic; LLM seam in `llm.ts` with `scriptedLLM`/`streamingLLM` doubles), tools (strict schemas), prompts, InvestigatorDO (persistence/resume/budgets), chat prompt
+- `src/agent/` — the loop core (`loop.ts`, domain-agnostic; LLM seam in `llm.ts`: `realLLM`/`streamingLLM` are the real adapters, `scriptedLLM`/`scriptedStreamingLLM` the test doubles), tools (strict schemas), prompts, InvestigatorDO (persistence/resume/budgets), chat prompt
 - `src/api/chat.ts` — hardened SSE chat endpoint (validation, meta-backed cost guardrails)
 - `ui/` — Vite SPA served from `ui/dist` via Workers assets (`run_worker_first=["/api/*"]`)
 - Tests: `test/unit/` (pure/D1 logic) and `test/integration/` (SELF fetch, DOs via `runInDurableObject`); all local, no network — LLM paths use scripted doubles

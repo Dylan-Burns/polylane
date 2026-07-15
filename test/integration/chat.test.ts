@@ -151,14 +151,15 @@ describe("POST /api/chat — SSE event sequence", () => {
     expect(events[0]).toEqual({ type: "thinking" }); // no `text`/`thinking` field on the wire
   });
 
-  it("releases the concurrent-SSE slot and records one chat turn after a normal completion", async () => {
+  it("releases the concurrent-SSE lease and records one chat turn after a normal completion", async () => {
     const r1 = makeMessage({ content: [text("ok")], stop_reason: "end_turn" });
     const app = createChatApp({ llmFactory: (_env, hooks) => scriptedStreamingLLM([r1], hooks), nowFn: () => Date.now() });
 
     await postChat(app, CLEAN_BODY);
 
-    const concurrent = await env.DB.prepare(`SELECT value FROM meta WHERE key = 'chat_concurrent_sse'`).first<{ value: string }>();
-    expect(concurrent?.value).toBe("0"); // incremented then released, never left dangling
+    // Acquired as a chat_sse_lease:<uuid> row, then deleted in the finally -- never left dangling.
+    const leases = await env.DB.prepare(`SELECT COUNT(*) AS n FROM meta WHERE key GLOB 'chat_sse_lease:*'`).first<{ n: number }>();
+    expect(leases?.n).toBe(0);
 
     const turns = await env.DB.prepare(`SELECT value FROM meta WHERE key = 'chat_turns_hour'`).first<{ value: string }>();
     expect(JSON.parse(turns?.value ?? "{}")).toMatchObject({ count: 1 });
@@ -225,13 +226,18 @@ describe("POST /api/chat — a genuine (non-cap) failure surfaces as error -> do
 // ============================================================================================
 
 describe("POST /api/chat — over-cap guardrails", () => {
-  it("a pre-set concurrent-SSE gauge at the limit -> a single graceful error event, no loop ever runs", async () => {
-    await env.DB.prepare(`REPLACE INTO meta (key, value) VALUES ('chat_concurrent_sse', '2')`).run();
+  it("both SSE slots held by unexpired leases -> a single graceful error event, no loop ever runs", async () => {
+    const nowMs = Date.UTC(2026, 0, 5, 14, 0, 0);
+    const liveExpiry = String(nowMs + 60_000); // both leases still live at request time
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO meta (key, value) VALUES ('chat_sse_lease:held-1', ?)`).bind(liveExpiry),
+      env.DB.prepare(`INSERT INTO meta (key, value) VALUES ('chat_sse_lease:held-2', ?)`).bind(liveExpiry),
+    ]);
 
     // An empty script: if the gate were buggy and let the turn through anyway, the very first
     // `llm.create` call would throw ("script only has 0 responses") and this test would fail loud
     // rather than silently passing for the wrong reason.
-    const app = createChatApp({ llmFactory: (_env, hooks) => scriptedStreamingLLM([], hooks), nowFn: () => Date.now() });
+    const app = createChatApp({ llmFactory: (_env, hooks) => scriptedStreamingLLM([], hooks), nowFn: () => nowMs });
 
     const { res, events } = await postChat(app, CLEAN_BODY);
 
@@ -239,9 +245,30 @@ describe("POST /api/chat — over-cap guardrails", () => {
     expect(events).toHaveLength(1);
     expect(events[0]?.type).toBe("error");
 
-    // The gauge itself is untouched by a rejected request (still exactly "2", not bumped further).
-    const gauge = await env.DB.prepare(`SELECT value FROM meta WHERE key = 'chat_concurrent_sse'`).first<{ value: string }>();
-    expect(gauge?.value).toBe("2");
+    // The two held leases are untouched by a rejected request (no third row, none reaped).
+    const leases = await env.DB.prepare(`SELECT key FROM meta WHERE key GLOB 'chat_sse_lease:*' ORDER BY key`).all<{ key: string }>();
+    expect((leases.results ?? []).map((r) => r.key)).toEqual(["chat_sse_lease:held-1", "chat_sse_lease:held-2"]);
+  });
+
+  it("EXPIRED leases (a hard-killed isolate's leak) are reaped at acquisition -- the next turn succeeds instead of chat wedging shut", async () => {
+    const nowMs = Date.UTC(2026, 0, 5, 14, 0, 0);
+    const staleExpiry = String(nowMs - 1); // both slots leaked by crashes, TTLs already passed
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO meta (key, value) VALUES ('chat_sse_lease:leaked-1', ?)`).bind(staleExpiry),
+      env.DB.prepare(`INSERT INTO meta (key, value) VALUES ('chat_sse_lease:leaked-2', ?)`).bind(staleExpiry),
+    ]);
+
+    const r1 = makeMessage({ content: [text("recovered")], stop_reason: "end_turn" });
+    const app = createChatApp({ llmFactory: (_env, hooks) => scriptedStreamingLLM([r1], hooks), nowFn: () => nowMs });
+
+    const { events } = await postChat(app, CLEAN_BODY);
+
+    // The turn ran to completion -- the leaked slots did NOT permanently consume capacity.
+    expect(events.map((e) => e.type)).toEqual(["text_delta", "done"]);
+
+    // Both stale leases were reaped and this turn's own lease was released: nothing left behind.
+    const leases = await env.DB.prepare(`SELECT COUNT(*) AS n FROM meta WHERE key GLOB 'chat_sse_lease:*'`).first<{ n: number }>();
+    expect(leases?.n).toBe(0);
   });
 
   it("a pre-set chat_turns_hour count at the hourly limit -> a single graceful error event", async () => {
@@ -258,10 +285,10 @@ describe("POST /api/chat — over-cap guardrails", () => {
     expect(events).toHaveLength(1);
     expect(events[0]?.type).toBe("error");
 
-    // Rejected on the hourly budget: the concurrency slot is acquired first (the atomic gate)
+    // Rejected on the hourly budget: the concurrency lease is acquired first (the atomic gate)
     // and released on the hourly rejection -- net zero, never a leaked slot.
-    const gauge = await env.DB.prepare(`SELECT value FROM meta WHERE key = 'chat_concurrent_sse'`).first<{ value: string }>();
-    expect(gauge?.value).toBe("0");
+    const leases = await env.DB.prepare(`SELECT COUNT(*) AS n FROM meta WHERE key GLOB 'chat_sse_lease:*'`).first<{ n: number }>();
+    expect(leases?.n).toBe(0);
   });
 });
 
@@ -319,6 +346,25 @@ describe("POST /api/chat — validation at the HTTP layer", () => {
     );
     await waitOnExecutionContext(ctx);
     expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("byte limit");
+  });
+
+  it("413s on a declared Content-Length over the cap before reading the body (header precheck; the post-read check stays authoritative)", async () => {
+    const app = createChatApp();
+    const ctx = createExecutionContext();
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "content-length": String(40 * 1024) },
+        body: JSON.stringify(CLEAN_BODY),
+      },
+      env as unknown as Env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(413);
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain("byte limit");
   });

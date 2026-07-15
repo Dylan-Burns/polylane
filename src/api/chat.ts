@@ -22,19 +22,23 @@
  *    history can add to, remove from, or override it.
  *  - Two cost guardrails, both backed by the `meta` key/value table: a global `chat_turns_hour`
  *    counter (<= 60/hour; the fixed-window pattern from `detect/sweep.ts`'s
- *    `tryConsumeInvestigationBudget`, with its documented accepted race) and a
- *    `chat_concurrent_sse` gauge (<= 2; atomic single-statement check-and-increment — see
- *    `tryAcquireConcurrentSSESlot` for why the gauge specifically cannot tolerate the
- *    read-then-write race the hourly counter accepts). The slot is acquired right before a turn's
- *    stream opens and ALWAYS released in a `finally` around the whole pump — wrapped in
- *    `waitUntil` so a client that disconnects mid-turn (or any other crash) can never leak it.
- *    Either cap being over budget — or the gate check itself failing on a D1 error — produces a
- *    graceful single SSE `error` event at HTTP 200 (never a hard failure the UI has to
- *    special-case), per the task brief.
- *  - The loop itself is capped tighter than the investigator's (8 tool steps / 90s wall / ~30k in /
- *    ~4k out per turn — spec §9's cost-guardrail numbers) — a trip surfaces as a `budget_reached`
- *    SSE event (never a hang), classified via `LoopResult.failure`'s structural discriminant
- *    (`"budget"` | `"aborted"` | `"error"`), never by matching error-step prose.
+ *    `tryConsumeInvestigationBudget`, with its documented accepted race) and <= 2 concurrent SSE
+ *    slots held as expiring LEASES (`chat_sse_lease:<uuid>` rows; atomic count-gated acquisition —
+ *    see `tryAcquireConcurrentSSESlot` for both the atomicity and the self-heal rationale). A
+ *    lease is acquired right before a turn's stream opens and ALWAYS released in a `finally`
+ *    around the whole pump — wrapped in `waitUntil` so a client that disconnects mid-turn (or any
+ *    other in-request crash) can never leak it; for the crashes not even `waitUntil` survives
+ *    (isolate hard-kill), the lease TTL reaps the slot at the next acquisition attempt, so
+ *    capacity can never ratchet down permanently. Either cap being over budget — or the gate
+ *    check itself failing on a D1 error — produces a graceful single SSE `error` event at HTTP
+ *    200 (never a hard failure the UI has to special-case), per the task brief.
+ *  - The loop itself is capped tighter than the investigator's (8 tool steps / 90s wall / 30k-in /
+ *    4k-out budget thresholds — spec §9's cost-guardrail numbers; since the loop checks caps at
+ *    each iteration TOP, the effective worst-case output is the ~4k threshold plus one final
+ *    call's `MAX_TOKENS_PER_CALL` (8192) ≈ 12k tokens — still hard-bounded, just honestly stated)
+ *    — a trip surfaces as a `budget_reached` SSE event (never a hang), classified via
+ *    `LoopResult.failure`'s structural discriminant (`"budget"` | `"aborted"` | `"error"`), never
+ *    by matching error-step prose.
  *  - A disconnected client stops the turn: `shouldAbort` polls the request's abort signal (and
  *    Hono's stream-level flag) every iteration, so a dropped tab burns at most one in-flight model
  *    call, not the full turn budget.
@@ -169,8 +173,20 @@ const CHAT_TURNS_META_KEY = "chat_turns_hour";
 const CHAT_TURNS_LIMIT = 60;
 const CHAT_TURNS_WINDOW_MS = 60 * 60_000;
 
-const CHAT_CONCURRENT_SSE_META_KEY = "chat_concurrent_sse";
+/** Per-slot lease keys: `chat_sse_lease:<uuid>` -> expiry epoch-ms. See
+ * `tryAcquireConcurrentSSESlot` for the lease design. */
+const CHAT_SSE_LEASE_PREFIX = "chat_sse_lease:";
 const CHAT_CONCURRENT_SSE_LIMIT = 2;
+
+/** How long an acquired slot lease lives before any OTHER acquisition may reap it as leaked.
+ * Chosen to strictly dominate a turn's worst-case real duration — the 90s wall cap is checked at
+ * each iteration top, after which at most one more model call (per-call timeout <= 60s) plus tool
+ * executions and SSE flush can run, so a legitimate turn is hard-bounded well under ~3 minutes.
+ * 5 minutes of slack on top of that means an unexpired lease ALWAYS corresponds to a turn that
+ * could still be live, and an expired one never does — which is why no per-iteration heartbeat
+ * refresh is needed: a heartbeat would only matter if a turn could legitimately outlive the TTL,
+ * and the wall cap precludes that by construction. */
+const CHAT_SSE_LEASE_TTL_MS = 5 * 60_000;
 
 interface ChatRateState {
   windowStartMs: number;
@@ -219,72 +235,80 @@ async function tryConsumeChatTurnBudget(db: D1Database, nowMs: number): Promise<
 }
 
 /**
- * Atomic check-and-increment on the concurrent-SSE gauge: a single conditional `UPDATE ... WHERE
- * CAST(value AS INTEGER) < limit`, judged by `meta.changes` — SQLite executes each statement
- * atomically (writers are serialized), so unlike a read-then-write pair, two overlapping requests
- * can never BOTH observe "1 < 2" and both take the last slot (over-admission), and increments can
- * never be lost. This matters far more for the gauge than for the hourly counter: a lost gauge
- * decrement would never self-heal (there is no window reset — a wedged gauge is a permanent
- * denial of service on the whole endpoint), which is why THIS counter gets the atomic treatment
- * while `chat_turns_hour` keeps the sweep.ts pattern (see `tryConsumeChatTurnBudget`'s caveat).
+ * Acquires one of the `CHAT_CONCURRENT_SSE_LIMIT` slots as a LEASE — a `chat_sse_lease:<uuid>`
+ * meta row whose value is an expiry timestamp — rather than a bare counter. Returns the lease key
+ * on success (the caller must release it), `null` when both slots are held.
  *
- * The seed INSERT and the conditional UPDATE run in one `db.batch` (a transaction — one round
- * trip). A corrupt (non-numeric) stored value CASTs to 0 in SQLite, i.e. the gauge fails OPEN,
- * matching `parseChatRateState`'s convention.
+ * **Why leases and not a counter** (review FIX 1): a counter has no self-heal — an isolate
+ * hard-killed between the increment and the `finally`'s `waitUntil` release (eviction, crash
+ * beyond the `waitUntil` guarantee) would leak a decrement FOREVER, ratcheting capacity
+ * 2 -> 1 -> 0 until chat wedged shut permanently with no code path able to notice. A lease
+ * carries its own expiry, so a leaked slot frees itself: every acquisition first reaps expired
+ * leases, meaning the damage from any crash is bounded to one slot for at most
+ * `CHAT_SSE_LEASE_TTL_MS` (5 min — see its doc comment for why no per-iteration heartbeat is
+ * needed: the TTL strictly dominates a turn's wall-cap-bounded worst-case duration). Chosen over
+ * the alternative backstop (a sweep-side clamp) because it is self-contained in this file and
+ * heals exactly at the moment capacity is next needed, rather than depending on the cron sweep
+ * running and a separate activity stamp aging out.
+ *
+ * **Atomicity**: the reap and a count-gated `INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) <
+ * limit` run inside one `db.batch` (a transaction; SQLite serializes writers), so two overlapping
+ * requests can never both observe "1 slot held" and both take the last slot, and the count the
+ * INSERT gates on already excludes anything the same transaction's reap just deleted. `GLOB`
+ * (not `LIKE`) matches the prefix because `_` in `chat_sse_lease:` would be a LIKE wildcard.
  */
-async function tryAcquireConcurrentSSESlot(db: D1Database): Promise<boolean> {
+async function tryAcquireConcurrentSSESlot(db: D1Database, nowMs: number): Promise<string | null> {
+  const leaseKey = `${CHAT_SSE_LEASE_PREFIX}${crypto.randomUUID()}`;
   const results = await db.batch([
-    db.prepare(`INSERT OR IGNORE INTO meta (key, value) VALUES (?, '0')`).bind(CHAT_CONCURRENT_SSE_META_KEY),
+    // Reap expired leases first — the self-heal: a slot leaked by a hard-killed isolate frees
+    // itself here, at the next acquisition attempt after its TTL passes.
+    db.prepare(`DELETE FROM meta WHERE key GLOB ? AND CAST(value AS INTEGER) <= ?`).bind(`${CHAT_SSE_LEASE_PREFIX}*`, nowMs),
     db
-      .prepare(`UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = ? AND CAST(value AS INTEGER) < ?`)
-      .bind(CHAT_CONCURRENT_SSE_META_KEY, CHAT_CONCURRENT_SSE_LIMIT),
+      .prepare(`INSERT INTO meta (key, value) SELECT ?, ? WHERE (SELECT COUNT(*) FROM meta WHERE key GLOB ?) < ?`)
+      .bind(leaseKey, String(nowMs + CHAT_SSE_LEASE_TTL_MS), `${CHAT_SSE_LEASE_PREFIX}*`, CHAT_CONCURRENT_SSE_LIMIT),
   ]);
-  return (results[1]?.meta.changes ?? 0) === 1;
+  return (results[1]?.meta.changes ?? 0) === 1 ? leaseKey : null;
 }
 
-/** Decrements the concurrent-SSE gauge — one atomic `UPDATE`, floored at 0 in SQL (`MAX(..., 0)`),
- * so concurrent releases can never lose a decrement the way a read-then-write pair could (a lost
- * decrement would ratchet the gauge upward until chat wedged shut permanently). Called from the
- * pump's `finally` via `waitUntil` so a client disconnect or any other crash mid-turn can't leak
- * the slot (the task brief's explicit requirement), and from `tryEnterChatTurn`'s own unwind
- * paths. Never throws outward: a failure to release is logged, not propagated — there is nothing
- * further the caller can meaningfully do about a D1 error at that point. */
-async function releaseConcurrentSSESlot(db: D1Database): Promise<void> {
+/** Releases one held lease — a single atomic `DELETE` of exactly that lease row (idempotent: a
+ * double release, or releasing a lease the reaper already collected, deletes nothing). Called
+ * from the pump's `finally` via `waitUntil` so a client disconnect or any other in-request crash
+ * can't leak the slot (the task brief's explicit requirement), and from `tryEnterChatTurn`'s own
+ * unwind paths; the lease TTL is the backstop for the crashes no `finally` survives. Never throws
+ * outward: a failure to release is logged, not propagated — the TTL will reap it. */
+async function releaseConcurrentSSESlot(db: D1Database, leaseKey: string): Promise<void> {
   try {
-    await db
-      .prepare(`UPDATE meta SET value = CAST(MAX(CAST(value AS INTEGER) - 1, 0) AS TEXT) WHERE key = ?`)
-      .bind(CHAT_CONCURRENT_SSE_META_KEY)
-      .run();
+    await db.prepare(`DELETE FROM meta WHERE key = ?`).bind(leaseKey).run();
   } catch (err) {
-    console.error("chat: failed to release the concurrent-SSE slot", err);
+    console.error("chat: failed to release the concurrent-SSE lease (the TTL will reap it)", err);
   }
 }
 
-type ChatGate = { ok: true } | { ok: false; reason: string };
+type ChatGate = { ok: true; leaseKey: string } | { ok: false; reason: string };
 
 /** The combined over-cap gate. Order: the concurrency slot is acquired FIRST (it's the check that
  * must be atomic — see `tryAcquireConcurrentSSESlot`), then the hourly budget; an hourly rejection
- * (or a thrown D1 error mid-sequence) releases the just-acquired slot, so a rejected request is
- * always net-zero on the gauge and never consumes an hourly slot it didn't use. A side benefit of
+ * (or a thrown D1 error mid-sequence) releases the just-acquired lease, so a rejected request is
+ * always net-zero on the slots and never consumes an hourly slot it didn't use. A side benefit of
  * this order: the hourly counter's read-then-write race window only ever has at most
- * `CHAT_CONCURRENT_SSE_LIMIT` participants, since everyone racing it already holds a gauge slot. */
+ * `CHAT_CONCURRENT_SSE_LIMIT` participants, since everyone racing it already holds a lease. */
 async function tryEnterChatTurn(db: D1Database, nowMs: number): Promise<ChatGate> {
-  const acquired = await tryAcquireConcurrentSSESlot(db);
-  if (!acquired) {
+  const leaseKey = await tryAcquireConcurrentSSESlot(db, nowMs);
+  if (leaseKey === null) {
     return { ok: false, reason: "too many people are chatting right now — please try again in a moment" };
   }
   let allowed: boolean;
   try {
     allowed = await tryConsumeChatTurnBudget(db, nowMs);
   } catch (err) {
-    await releaseConcurrentSSESlot(db);
+    await releaseConcurrentSSESlot(db, leaseKey);
     throw err;
   }
   if (!allowed) {
-    await releaseConcurrentSSESlot(db);
+    await releaseConcurrentSSESlot(db, leaseKey);
     return { ok: false, reason: "chat has hit its hourly limit — please try again later" };
   }
-  return { ok: true };
+  return { ok: true, leaseKey };
 }
 
 // --- Loop wiring ---------------------------------------------------------------------------
@@ -292,7 +316,13 @@ async function tryEnterChatTurn(db: D1Database, nowMs: number): Promise<ChatGate
 /** Chat's own, tighter loop caps (spec §9's cost guardrails: "chat: <= 8 tool steps/turn" plus
  * "maxTokens sensible (~30k in/4k out per turn), 90s wall" from the task brief) — the
  * investigator's caps (`investigator-do.ts`'s `MAX_STEPS`/etc.) are an order of magnitude larger
- * and belong to a fundamentally different budget (one investigation vs. one chat turn). */
+ * and belong to a fundamentally different budget (one investigation vs. one chat turn).
+ *
+ * Honest reading of the token caps: these are the loop's TRIP THRESHOLDS, checked at each
+ * iteration top (`loop.ts`'s cap check), so one final call can still land after the threshold is
+ * crossed — the effective per-turn worst case is ~`maxTokensOut` + one call's
+ * `MAX_TOKENS_PER_CALL` (8192) ≈ 12k out, and ~`maxTokensIn` + one call's full context on the
+ * input side. Bounded either way; the thresholds are the spend control, not an exact ceiling. */
 const CHAT_CAPS: LoopCaps = {
   maxSteps: 8,
   maxWallMs: 90_000,
@@ -417,9 +447,9 @@ async function pumpChatTurn(stream: SSEStreamingApi, args: PumpArgs): Promise<vo
 
   // Fire-and-forget by design: `StreamHooks` callbacks are synchronous (they fire from inside the
   // SDK's stream-event dispatch), so per-delta writes can't be awaited here. The un-awaited
-  // buffering this allows is bounded by the turn's own caps (<= ~4k output tokens, 90s wall), not
-  // by client behavior — and `sendEvent` never rejects, so nothing here can become an unhandled
-  // rejection.
+  // buffering this allows is bounded by the turn's own caps (effective worst case ~12k output
+  // tokens — see CHAT_CAPS's doc comment — and the 90s wall), not by client behavior — and
+  // `sendEvent` never rejects, so nothing here can become an unhandled rejection.
   const hooks: StreamHooks = {
     onTextDelta: (text) => {
       void sendEvent(stream, { type: "text_delta", text });
@@ -498,6 +528,14 @@ export function createChatApp({ llmFactory = streamingLLM, nowFn = Date.now }: C
   const app = new Hono<{ Bindings: Env }>();
 
   app.post("/", async (c) => {
+    // Cheapest rejection first: a declared Content-Length over the cap 413s before the body is
+    // even read. Defense-in-depth only — the header is client-supplied (absent on chunked
+    // requests, and free to lie), so the post-read wire-bytes check below stays authoritative.
+    const declaredLength = Number(c.req.header("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > CHAT_MAX_BODY_BYTES) {
+      return c.json({ error: `request body exceeds the ${CHAT_MAX_BODY_BYTES}-byte limit` }, 413);
+    }
+
     // Wire-level size check BEFORE parsing: `validateChatBody`'s own 32KB check judges the
     // re-serialized form (the unit-testable contract), but a raw body padded with insignificant
     // whitespace could be far larger on the wire than after re-serialization — and JSON.parse on
@@ -539,6 +577,7 @@ export function createChatApp({ llmFactory = streamingLLM, nowFn = Date.now }: C
         await sendEvent(stream, { type: "error", message: reason });
       });
     }
+    const leaseKey = gate.leaseKey;
 
     return streamSSE(c, async (stream) => {
       try {
@@ -558,10 +597,11 @@ export function createChatApp({ llmFactory = streamingLLM, nowFn = Date.now }: C
         await sendEvent(stream, { type: "error", message: GENERIC_TURN_ERROR });
       } finally {
         // waitUntil, not a bare await: the response stream may already be fully flushed (or the
-        // client may have disconnected) by the time this finally runs, and the slot-release write
-        // must still happen — this is exactly the "crashed stream must not leak the slot"
-        // requirement the task brief calls out.
-        c.executionCtx.waitUntil(releaseConcurrentSSESlot(c.env.DB));
+        // client may have disconnected) by the time this finally runs, and the lease-release
+        // write must still happen — the task brief's "crashed stream must not leak the slot"
+        // requirement. For crashes even waitUntil can't survive (isolate hard-kill), the lease
+        // TTL is the backstop (see tryAcquireConcurrentSSESlot).
+        c.executionCtx.waitUntil(releaseConcurrentSSESlot(c.env.DB, leaseKey));
       }
     });
   });
