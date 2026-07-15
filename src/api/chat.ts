@@ -179,14 +179,15 @@ const CHAT_SSE_LEASE_PREFIX = "chat_sse_lease:";
 const CHAT_CONCURRENT_SSE_LIMIT = 2;
 
 /** How long an acquired slot lease lives before any OTHER acquisition may reap it as leaked.
- * Chosen to strictly dominate a turn's worst-case real duration — the 90s wall cap is checked at
- * each iteration top, after which at most one more model call (per-call timeout <= 60s) plus tool
- * executions and SSE flush can run, so a legitimate turn is hard-bounded well under ~3 minutes.
- * 5 minutes of slack on top of that means an unexpired lease ALWAYS corresponds to a turn that
- * could still be live, and an expired one never does — which is why no per-iteration heartbeat
- * refresh is needed: a heartbeat would only matter if a turn could legitimately outlive the TTL,
- * and the wall cap precludes that by construction. */
-const CHAT_SSE_LEASE_TTL_MS = 5 * 60_000;
+ * Chosen to strictly dominate a turn's worst-case real duration INCLUDING SDK retries: the 90s
+ * wall cap is checked at each iteration top, after which at most one more create() can run — and
+ * with maxRetries: 3 that create is up to 4 attempts x its <= 60s per-attempt timeout plus
+ * backoff, so the true worst case is ~4.5-5 min, not the naive ~2.5 min. 10 minutes keeps the
+ * TTL comfortably above even that; leases are reaped lazily so a longer TTL costs nothing in
+ * steady state (breach impact would anyway be one transient extra stream, self-correcting).
+ * No per-iteration heartbeat is needed: a heartbeat would only matter if a turn could
+ * legitimately outlive the TTL, and the wall cap + retry arithmetic preclude that. */
+const CHAT_SSE_LEASE_TTL_MS = 10 * 60_000;
 
 interface ChatRateState {
   windowStartMs: number;
@@ -245,7 +246,7 @@ async function tryConsumeChatTurnBudget(db: D1Database, nowMs: number): Promise<
  * 2 -> 1 -> 0 until chat wedged shut permanently with no code path able to notice. A lease
  * carries its own expiry, so a leaked slot frees itself: every acquisition first reaps expired
  * leases, meaning the damage from any crash is bounded to one slot for at most
- * `CHAT_SSE_LEASE_TTL_MS` (5 min — see its doc comment for why no per-iteration heartbeat is
+ * `CHAT_SSE_LEASE_TTL_MS` (10 min — see its doc comment for why no per-iteration heartbeat is
  * needed: the TTL strictly dominates a turn's wall-cap-bounded worst-case duration). Chosen over
  * the alternative backstop (a sweep-side clamp) because it is self-contained in this file and
  * heals exactly at the moment capacity is next needed, rather than depending on the cron sweep
