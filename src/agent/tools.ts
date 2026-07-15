@@ -21,9 +21,11 @@ import { parseWindow, WindowError, type WindowInput } from "./window";
 import {
   FIND_TRACES_MAX_LIMIT,
   findTraces,
+  GET_INCIDENTS_MAX_LIMIT,
   getIncidents,
   getTrace,
   listDeploys,
+  MAX_METRIC_POINTS,
   MAX_TRACE_SPANS,
   queryMetrics,
   SEARCH_LOGS_MAX_LIMIT,
@@ -156,7 +158,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: "query_metrics",
     description:
-      "Timeseries of request rate, error rate, and latency percentiles (p50/p95/p99) per service/operation, bucketed by `step` minutes, with a trailing-24h baseline (median/MAD) and a value-vs-baseline delta overlaid per point wherever a baseline exists. Start here to scope which services and time ranges are abnormal before drilling into logs or traces — a delta near 1 is normal; a delta of several-x on error_rate or p95 marks a genuine anomaly worth chasing. Use `metrics` to narrow the baseline/delta overlay once you know which signal matters; omit it to see all three.",
+      `Timeseries of request rate, error rate, and latency percentiles (p50/p95/p99) per service/operation, bucketed by \`step\` minutes, with a trailing-24h baseline (median/MAD) and a value-vs-baseline delta overlaid per point wherever a baseline exists. Start here to scope which services and time ranges are abnormal before drilling into logs or traces — a delta near 1 is normal; a delta of several-x on error_rate or p95 marks a genuine anomaly worth chasing. Use \`metrics\` to narrow the baseline/delta overlay once you know which signal matters; omit it to see all three. Returns at most ${MAX_METRIC_POINTS} points (the first ${MAX_METRIC_POINTS}, deterministically ordered by service/operation/bucket); \`truncated: true\` plus a \`note\` mean there were more — narrow the window, add a service/operation filter, or raise \`step\` to see the rest.`,
     input_schema: QUERY_METRICS_SCHEMA,
     strict: true,
   },
@@ -191,7 +193,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: "get_incidents",
     description:
-      "Past incidents — status, severity, trigger, and (once written) the submitted report — either one by `id`, or every incident whose opened_at falls in the window, newest first. Powers \"what happened at 14:32?\" style questions in chat, and gives the investigator prior-incident context (has this fingerprint fired before? what was the root cause, and did it recur?) before treating a new trigger as novel.",
+      `Past incidents — status, severity, trigger, and (once written) the submitted report — either one by \`id\`, or every incident whose opened_at falls in the window, newest first. Powers "what happened at 14:32?" style questions in chat, and gives the investigator prior-incident context (has this fingerprint fired before? what was the root cause, and did it recur?) before treating a new trigger as novel. A window lookup returns at most ${GET_INCIDENTS_MAX_LIMIT} incidents plus \`total\`, the full match count; \`truncated: true\` means only the newest \`count\` of \`total\` are shown — narrow the window to see the rest.`,
     input_schema: GET_INCIDENTS_SCHEMA,
     strict: true,
   },
@@ -391,7 +393,22 @@ async function runQueryMetrics(input: unknown, ctx: ExecuteToolCtx): Promise<obj
 
   const points = await queryMetrics(ctx.db, { service, operation, fromMs, toMs, stepMin });
   const shaped = metrics && metrics.length > 0 ? points.map((p) => filterMetricPoint(p, metrics)) : points;
-  return { points: shaped, count: shaped.length };
+
+  // Shape-aware cap applied here (not in read.ts — see MAX_METRIC_POINTS's doc comment): take the
+  // first MAX_METRIC_POINTS of the read layer's own deterministic order, same "first N, honestly
+  // flagged" contract as every other capped tool result.
+  const truncated = shaped.length > MAX_METRIC_POINTS;
+  const page = truncated ? shaped.slice(0, MAX_METRIC_POINTS) : shaped;
+  return {
+    points: page,
+    count: page.length,
+    truncated,
+    ...(truncated
+      ? {
+          note: `showing ${page.length} of ${shaped.length} points; narrow the window, add a service/operation filter, or raise \`step\` to see the rest`,
+        }
+      : {}),
+  };
 }
 
 async function runSearchLogs(input: unknown, ctx: ExecuteToolCtx): Promise<object> {
@@ -449,12 +466,19 @@ async function runGetIncidents(input: unknown, ctx: ExecuteToolCtx): Promise<obj
   const rec = asRecord(input);
   const id = optionalString(rec, "id");
   if (id !== undefined) {
-    const incidents = await getIncidents(ctx.db, { id });
-    return { incidents, count: incidents.length };
+    const { incidents, total } = await getIncidents(ctx.db, { id });
+    return { incidents, count: incidents.length, total, truncated: false };
   }
   const { fromMs, toMs } = parseWindow(optionalWindow(rec), ctx.nowMs);
-  const incidents = await getIncidents(ctx.db, { fromMs, toMs });
-  return { incidents, count: incidents.length };
+  const { incidents, total } = await getIncidents(ctx.db, { fromMs, toMs });
+  const truncated = total > incidents.length;
+  return {
+    incidents,
+    count: incidents.length,
+    total,
+    truncated,
+    ...(truncated ? { note: `showing ${incidents.length} of ${total} matching incidents` } : {}),
+  };
 }
 
 /**

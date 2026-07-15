@@ -8,10 +8,10 @@
  * Shared conventions across every function below:
  *  - Time windows are half-open `[fromMs, toMs)`, matching `generateWindow`'s own convention.
  *  - Row/span caps are *shape-aware*, never byte-sliced: every capped result says so
- *    (`truncated: true` on `getTrace`; a `total` match count alongside `searchLogs`/`findTraces`
- *    pages so `total > page.length` is an exact truncation signal) rather than silently dropping
- *    data the caller can't tell is missing (spec §9's "Result caps are shape-aware, never
- *    byte-sliced").
+ *    (`truncated: true` on `getTrace`; a `total` match count alongside `searchLogs`/`findTraces`/
+ *    `getIncidents` pages so `total > page.length` is an exact truncation signal) rather than
+ *    silently dropping data the caller can't tell is missing (spec §9's "Result caps are
+ *    shape-aware, never byte-sliced").
  *  - "Newest first" (descending by the row's own timestamp) is the default sort for
  *    investigation-facing lookups (`findTraces`, `searchLogs`, `getIncidents` by window) since the
  *    agent/UI usually wants the most recent evidence first; `listDeploys` sorts chronologically
@@ -87,6 +87,16 @@ export interface QueryMetricsArgs {
   stepMin: number;
 }
 
+/** Shape-aware page cap for `query_metrics` (points across the whole returned timeseries).
+ * Enforced by the tool layer (`agent/tools.ts`), not here: `queryMetrics` already has to build
+ * every bucketed point to answer the request (there's no row-level SQL `LIMIT` that means
+ * anything once rollup rows have been bucketed into per-service/operation/minute points), so the
+ * cap is a flat "take the first N of what came back" rule applied after this function returns,
+ * exactly like `MAX_TRACE_SPANS` is enforced after the span rows are fetched. Exported here anyway
+ * so the tool layer's cap-mentioning schema description reads from the same constant instead of a
+ * copy that could go stale — the same reason as `SEARCH_LOGS_MAX_LIMIT`. */
+export const MAX_METRIC_POINTS = 120;
+
 interface BaselineRowDb {
   service: string;
   operation: string;
@@ -121,7 +131,10 @@ function metricValueFor(point: Pick<MetricPoint, "count" | "error_rate" | "p95">
  * approximation and is exact when `stepMin` is 1 (one rollup row per point, no averaging).
  */
 export async function queryMetrics(db: D1Database, args: QueryMetricsArgs): Promise<MetricPoint[]> {
-  const stepMin = Math.max(1, Math.floor(args.stepMin));
+  // A `NaN` `stepMin` (e.g. an explicit `step: NaN`, which bypasses a `?? 1` fallback since `NaN`
+  // isn't nullish) falls back to the default of 1 rather than propagating — `Math.max(1, NaN)` is
+  // itself `NaN`, so this needs its own guard, the same treatment `clampInt` gives `limit`.
+  const stepMin = Number.isNaN(args.stepMin) ? 1 : Math.max(1, Math.floor(args.stepMin));
   const stepMs = stepMin * 60_000;
 
   const conditions: string[] = ["minute_ts >= ?", "minute_ts < ?"];
@@ -416,8 +429,16 @@ function isCollapsedMarker(span: Span): boolean {
 
 /**
  * Collapses `spans` (already known to exceed `MAX_TRACE_SPANS`) down to the cap — a *hard*, honest
- * cap: every path below either gets the result to `MAX_TRACE_SPANS` or hits the one documented
- * exception (below), never a silent "close enough".
+ * cap in the common case: every path below either gets the result to `MAX_TRACE_SPANS` or hits the
+ * one documented exception (below), not a silent "close enough". One residual is NOT covered by
+ * that exception, and is a doc-only caveat rather than something this function fixes: a
+ * leaf-collapse marker (step 1) parented directly on a `mustKeep` span is permanent once created —
+ * neither leaf-trim (step 2) nor subtree-drop (step 3) will ever remove a marker (both explicitly
+ * exclude `isCollapsedMarker` spans; see their own doc comments) — so a trace whose must-keep
+ * spans fan out into many distinct `(parent, service, operation)` groups, each producing its own
+ * marker, can still land over `MAX_TRACE_SPANS` even though `mustKeep.size` alone stays comfortably
+ * under it. Pathological marker saturation like that has no cap-enforcement lever left; it is
+ * flagged here rather than silently ignored.
  *
  * Domain caveat this must NOT "fix": async spans (the notifications fire-and-forget subtree, per
  * `generator.ts`'s `ASYNC_STEP_KEYS` branch) may legitimately end *after* their parent ends — the
@@ -690,6 +711,21 @@ export async function listDeploys(db: D1Database, args: ListDeploysArgs): Promis
 
 export type GetIncidentsArgs = { id: string } | { fromMs: number; toMs: number };
 
+/** Row cap for `getIncidents`'s window lookup (newest-first by `opened_at`). Exported for the
+ * same stale-copy-prevention reason as `SEARCH_LOGS_MAX_LIMIT`/`FIND_TRACES_MAX_LIMIT`. The `id`
+ * lookup is never capped (at most one row can ever match). */
+export const GET_INCIDENTS_MAX_LIMIT = 20;
+
+export interface GetIncidentsResult {
+  /** The returned page: for a window lookup, at most `GET_INCIDENTS_MAX_LIMIT` incidents, newest
+   * first; for an `id` lookup, the single matching incident or none. */
+  incidents: IncidentView[];
+  /** Total incidents matching the same filters, ignoring the cap — see `SearchLogsResult.total`.
+   * For an `id` lookup this is simply `incidents.length` (0 or 1), since there's no cap to hide
+   * anything behind. */
+  total: number;
+}
+
 interface IncidentRowDb {
   id: string;
   status: IncidentView["status"];
@@ -747,28 +783,38 @@ async function fetchFingerprints(db: D1Database, incidentIds: readonly string[])
 }
 
 /**
- * Incidents either by `id` (single-element array, or `[]` if not found) or by `opened_at` window
- * (newest first) — `trigger_json`/`report_json` are parsed into `trigger`/`report` (spec §9: the
- * report's evidence is embedded at submit time, so this reads correctly even after raw telemetry
- * has aged out of retention), and each incident's fingerprint set is joined in from
- * `incident_fingerprints`.
+ * Incidents either by `id` (at most one match) or by `opened_at` window, newest first and capped
+ * to `GET_INCIDENTS_MAX_LIMIT` (a busy window can accumulate more incidents than any investigation
+ * needs to see at once) — `trigger_json`/`report_json` are parsed into `trigger`/`report` (spec
+ * §9: the report's evidence is embedded at submit time, so this reads correctly even after raw
+ * telemetry has aged out of retention), and each incident's fingerprint set is joined in from
+ * `incident_fingerprints`. The window branch's `total` comes from a `COUNT(*)` over the same
+ * `WHERE`, batched alongside the page query (same pattern as `searchLogs`/`findTraces`), so
+ * `total > incidents.length` is the exact truncation signal.
  */
-export async function getIncidents(db: D1Database, args: GetIncidentsArgs): Promise<IncidentView[]> {
+export async function getIncidents(db: D1Database, args: GetIncidentsArgs): Promise<GetIncidentsResult> {
   if ("id" in args) {
     const row = await db
       .prepare(`SELECT ${INCIDENT_COLUMNS} FROM incidents WHERE id = ?`)
       .bind(args.id)
       .first<IncidentRowDb>();
-    if (!row) return [];
+    if (!row) return { incidents: [], total: 0 };
     const fingerprints = await fetchFingerprints(db, [row.id]);
-    return [rowToIncidentView(row, fingerprints.get(row.id) ?? [])];
+    return { incidents: [rowToIncidentView(row, fingerprints.get(row.id) ?? [])], total: 1 };
   }
 
-  const { results } = await db
-    .prepare(`SELECT ${INCIDENT_COLUMNS} FROM incidents WHERE opened_at >= ? AND opened_at < ? ORDER BY opened_at DESC`)
-    .bind(args.fromMs, args.toMs)
-    .all<IncidentRowDb>();
-  const rows = results ?? [];
+  const [pageRes, countRes] = await db.batch([
+    db
+      .prepare(
+        `SELECT ${INCIDENT_COLUMNS} FROM incidents WHERE opened_at >= ? AND opened_at < ? ORDER BY opened_at DESC LIMIT ?`,
+      )
+      .bind(args.fromMs, args.toMs, GET_INCIDENTS_MAX_LIMIT),
+    db.prepare(`SELECT COUNT(*) AS total FROM incidents WHERE opened_at >= ? AND opened_at < ?`).bind(args.fromMs, args.toMs),
+  ]);
+  const rows = (pageRes?.results ?? []) as IncidentRowDb[];
+  const totalRow = countRes?.results?.[0] as { total: number } | undefined;
+  const total = totalRow?.total ?? rows.length;
   const fingerprints = await fetchFingerprints(db, rows.map((r) => r.id));
-  return rows.map((row) => rowToIncidentView(row, fingerprints.get(row.id) ?? []));
+  const incidents = rows.map((row) => rowToIncidentView(row, fingerprints.get(row.id) ?? []));
+  return { incidents, total };
 }

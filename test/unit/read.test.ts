@@ -16,6 +16,11 @@ import type { LogLine, RollupRow, Span } from "../../src/telemetry/types";
 const T0 = Date.UTC(2026, 0, 5, 14, 0, 0);
 const MIN = 60_000;
 
+/** Start of the 25-incident fixture window for `getIncidents`' 20-cap test — placed well past
+ * every other window used in this file (traces D/F/G run up to T0+45*MIN) so it can't perturb any
+ * other test's window-scanned assertions. */
+const INCIDENT_CAP_START = T0 + 60 * MIN;
+
 /**
  * Inserts one deterministic mini-world, once for the whole file (read functions never mutate
  * data, so — unlike `queries-insert.test.ts` — there's nothing to clean up between tests):
@@ -395,6 +400,21 @@ async function seedFixture(): Promise<void> {
       "INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES (?, ?, ?, ?)",
     ).bind("incident-open-1", "payments:latency", T0 + 15 * MIN, 1),
   ]);
+
+  // 25 incidents, one per minute starting at INCIDENT_CAP_START, purely to exercise
+  // getIncidents' 20-cap + exact-total reporting on the window branch.
+  const INCIDENT_CAP_COUNT = 25;
+  await env.DB.batch(
+    Array.from({ length: INCIDENT_CAP_COUNT }, (_, i) =>
+      env.DB.prepare(
+        "INSERT INTO incidents (id, status, severity, opened_at, reported_at, resolved_at, trigger_json, report_json, follow_up_of) VALUES (?, 'investigating', 'warning', ?, NULL, NULL, ?, NULL, NULL)",
+      ).bind(
+        `incident-cap-test-${i}`,
+        INCIDENT_CAP_START + i * MIN,
+        JSON.stringify({ statement: `synthetic cap-test incident ${i}` }),
+      ),
+    ),
+  );
 }
 
 beforeAll(async () => {
@@ -511,6 +531,15 @@ describe("queryMetrics", () => {
     for (const p of points) {
       expect(Number.isNaN(p.delta?.req_rate)).toBe(false);
     }
+  });
+
+  it("falls back to the default step (1 minute) when `stepMin` is NaN, rather than propagating NaN into the bucketing", async () => {
+    // `Math.max(1, Math.floor(NaN))` is itself NaN, so this needs its own guard (mirroring
+    // clampInt's NaN handling for `limit`) rather than relying on the outer Math.max/floor.
+    const points = await queryMetrics(env.DB, { fromMs: T0, toMs: T0 + MIN, stepMin: Number.NaN });
+    const explicit = await queryMetrics(env.DB, { fromMs: T0, toMs: T0 + MIN, stepMin: 1 });
+    expect(points).toEqual(explicit);
+    expect(points).toHaveLength(2); // checkout + payments, both have a T0 row
   });
 });
 
@@ -695,8 +724,9 @@ describe("listDeploys", () => {
 
 describe("getIncidents", () => {
   it("by id returns a single-element array with report/trigger parsed and fingerprints oldest-first", async () => {
-    const incidents = await getIncidents(env.DB, { id: "incident-resolved-1" });
+    const { incidents, total } = await getIncidents(env.DB, { id: "incident-resolved-1" });
     expect(incidents).toHaveLength(1);
+    expect(total).toBe(1);
     expect(incidents[0]).toMatchObject({
       id: "incident-resolved-1",
       status: "resolved",
@@ -709,18 +739,35 @@ describe("getIncidents", () => {
     expect(incidents[0]?.fingerprints).toEqual(["checkout:errors", "payments:latency"]);
   });
 
-  it("by id returns [] for an unknown id", async () => {
-    const incidents = await getIncidents(env.DB, { id: "does-not-exist" });
+  it("by id returns [] and total 0 for an unknown id", async () => {
+    const { incidents, total } = await getIncidents(env.DB, { id: "does-not-exist" });
     expect(incidents).toEqual([]);
+    expect(total).toBe(0);
   });
 
-  it("by window returns matching incidents newest first, report null when absent, fingerprints attached", async () => {
-    const incidents = await getIncidents(env.DB, { fromMs: T0 - 5 * MIN, toMs: T0 + 30 * MIN });
+  it("by window returns matching incidents newest first, report null when absent, fingerprints attached, with an exact total", async () => {
+    const { incidents, total } = await getIncidents(env.DB, { fromMs: T0 - 5 * MIN, toMs: T0 + 30 * MIN });
     expect(incidents.map((i) => i.id)).toEqual(["incident-open-1", "incident-resolved-1"]);
+    expect(total).toBe(2); // nothing capped: total equals the page size
     expect(incidents[0]?.report).toBeNull();
     expect(incidents[0]?.status).toBe("investigating");
     expect(incidents[0]?.fingerprints).toEqual(["payments:latency"]);
     expect(incidents[1]?.report).not.toBeNull();
     expect(incidents[1]?.fingerprints).toEqual(["checkout:errors", "payments:latency"]);
+  });
+
+  it("by window clamps to the 20-incident cap, newest first, while total reports the full match count", async () => {
+    // 25 incidents seeded (see seedFixture's INCIDENT_CAP_START block) well outside every other
+    // test's window, so this can't perturb the by-window assertions above.
+    const { incidents, total } = await getIncidents(env.DB, {
+      fromMs: INCIDENT_CAP_START,
+      toMs: INCIDENT_CAP_START + 25 * MIN,
+    });
+    expect(incidents).toHaveLength(20);
+    expect(total).toBe(25); // uncapped match count
+    // Newest first: the 20 kept are the last 20 seeded (highest opened_at), descending.
+    expect(incidents.map((i) => i.id)).toEqual(
+      Array.from({ length: 20 }, (_, i) => `incident-cap-test-${24 - i}`),
+    );
   });
 });
