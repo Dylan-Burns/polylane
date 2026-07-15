@@ -1,10 +1,12 @@
 /**
  * `investigation_steps.content_json` (and `incidents.report_json`/`trigger_json`) are all typed
  * `unknown` by the time they reach the UI (spec/`telemetry/read.ts`'s own convention — parsed JSON,
- * not re-validated). Two real shapes exist for tool_call/tool_result specifically: the seeded
- * incident (`sim/seed-incident.ts`) writes `{tool, input}` / `{tool, output}` by hand, while a live
- * investigation (`agent/loop.ts`'s `record` calls) writes `{tool_use_id, name, input}` /
- * `{tool_use_id, name, output, is_error}`. Every normalizer below accepts either.
+ * not re-validated). The seeded incident (`sim/seed-incident.ts`) and a live investigation
+ * (`agent/loop.ts`'s `record` calls) both write the same tool_call/tool_result shape —
+ * `{tool_use_id, name, input}` / `{tool_use_id, name, output, is_error}` — so seeded and live steps
+ * render identically. The `rec.tool` fallback below is a defensive leftover, not load-bearing for
+ * either producer; every normalizer keeps it as a no-cost safety net against some future caller
+ * that writes a nonstandard shape.
  */
 
 import { isRecord, prettyJson } from "../../lib/format";
@@ -63,11 +65,12 @@ export function reportStepSummary(content: unknown): string | undefined {
   return typeof rec.summary === "string" ? rec.summary : undefined;
 }
 
-/** Best-effort one-line summary of a tool_result's `output`, spanning both the live executor's
- * shapes (`agent/tools.ts`: `{points|logs|traces|deploys|incidents|spans, count, total, truncated,
- * note}`) and the seeded incident's ad hoc shapes (`{summary}` / `{deploys, ...}` / `{traces,
- * logExcerpt}`) — falls back to a generic key-count description. The full JSON is always still
- * reachable via the caller's "show full result" disclosure, so this never needs to be exhaustive. */
+/** Best-effort one-line summary of a tool_result's `output` — the live executor's shapes
+ * (`agent/tools.ts`: `{points|logs|traces|deploys|incidents|spans, count, total, truncated, note}`),
+ * which the seeded incident's tool results also match — falling back to a generic key-count
+ * description. The `summary`/`logExcerpt` branches are a defensive leftover for any future caller
+ * that isn't shaped like `agent/tools.ts`'s executors. The full JSON is always still reachable via
+ * the caller's "show full result" disclosure, so this never needs to be exhaustive. */
 export function summarizeToolOutput(output: unknown): string {
   if (!isRecord(output)) return prettyJson(output);
   if (typeof output.error === "string") return `error: ${output.error}`;

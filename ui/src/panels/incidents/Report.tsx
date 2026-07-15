@@ -5,13 +5,13 @@ import type { Report, ReportEvidenceEntry, ReportTimelineEntry } from "../../lib
 /**
  * `isFullReport` (see `panels/incidents/normalize.ts`) only checks that `timeline`/`evidence` are
  * arrays of objects — it can't guarantee each entry's individual fields match `ReportTimelineEntry`/
- * `ReportEvidenceEntry` exactly, and in practice at least one producer doesn't: the seeded incident
- * (`sim/seed-incident.ts`) writes `timeline` entries as `{ts_ms, label}` and `evidence` entries as
- * an ad hoc `{type, service, metric, baseline, observed, ...}` union, not this schema's `{time,
- * description}` / `{description, trace_id, metric, log_excerpt}` (spec §9 / `agent/report-schema.ts`).
- * Rather than render blank text for a field that isn't actually a string, these helpers fall back
- * to a compact raw dump — the same "degrade honestly, never render silence" convention the rest of
- * this codebase uses for malformed persisted JSON.
+ * `ReportEvidenceEntry` exactly. Both real producers (a live investigation's `submit_report` call
+ * and the seeded incident, `sim/seed-incident.ts`) write this schema's actual `{time, description}`
+ * / `{description, trace_id, metric, log_excerpt}` shapes (spec §9 / `agent/report-schema.ts`), so
+ * the fallbacks below are defensive only — guarding against some future non-conforming producer,
+ * not a known divergence. Rather than render blank text for a field that isn't actually a string,
+ * these helpers fall back to a compact raw dump — the same "degrade honestly, never render
+ * silence" convention the rest of this codebase uses for malformed persisted JSON.
  */
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
