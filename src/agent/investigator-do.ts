@@ -259,11 +259,14 @@ export class InvestigatorDO extends DurableObject<Env> {
         tokensOut: 0,
         elapsedMs: 0,
       };
-      // Any lingering `cancelled` flag is stale by definition here (no investigation is active,
-      // so there is nothing left for it to cancel -- e.g. an aborted loop's isolate died before
-      // its own cleanup could observe and consume the flag). Cleared so it can never bleed into
-      // this new run (whose fresh runId wouldn't match it anyway -- belt and suspenders).
-      await this.ctx.storage.delete("cancelled");
+      // A lingering `cancelled` flag is stale only when no loop is live in this isolate. If a
+      // cancelled zombie loop is still in flight here (`loopRunning`), deleting the flag would
+      // UN-cancel it before its next shouldAbort check — the exact budget burn the flag exists
+      // to stop — so we leave it for the zombie to consume; the fresh runId means it can never
+      // apply to this new run anyway.
+      if (!this.loopRunning) {
+        await this.ctx.storage.delete("cancelled");
+      }
       await this.ctx.storage.put("active", incidentId);
       await this.ctx.storage.put(`conv:${incidentId}`, buildInitialMessages(statement));
       await this.ctx.storage.put(`meta:${incidentId}`, meta);
