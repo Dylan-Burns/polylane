@@ -1,0 +1,3 @@
+-- Watchtower D1 schema
+-- Placeholder migration: real tables (spans, logs, rollups, incidents, ...)
+-- land in Task 1.1 (D1 schema + insert helpers).

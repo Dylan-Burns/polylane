@@ -16,3 +16,4 @@ dist/
 
 # Test / coverage
 coverage/
+.superpowers/
