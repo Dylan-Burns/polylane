@@ -1,10 +1,11 @@
 /**
  * The public GET data-surface (spec §10): `/api/health` (moved here from `index.ts`, which now just
- * mounts this app), `/api/state`, `/api/traces/:id`, `/api/logs` — every GET endpoint the UI polls
- * or drills into. POST routes (chaos, admin reset, chat) stay in their own files (`api/chaos.ts`,
- * future `api/chat.ts`) since they're a fundamentally different shape (proxies / SSE, not a query
- * layer passthrough); this file is specifically the read side, mirroring `telemetry/read.ts`'s own
- * "reads only" boundary at the HTTP layer.
+ * mounts this app), `/api/state`, `/api/incidents`, `/api/incidents/:id`, `/api/traces/:id`,
+ * `/api/logs` — every GET endpoint the UI polls or drills into. POST routes (chaos, admin reset,
+ * chat) stay in their own files (`api/chaos.ts`, future `api/chat.ts`) since they're a
+ * fundamentally different shape (proxies / SSE, not a query layer passthrough); this file is
+ * specifically the read side, mirroring `telemetry/read.ts`'s own "reads only" boundary at the
+ * HTTP layer.
  *
  * Every handler here is a thin adapter, exactly like `agent/tools.ts`'s executors: parse/validate
  * query params, resolve the window via `parseWindow`, call the matching `telemetry/read.ts` /
@@ -16,11 +17,26 @@ import { Hono } from "hono";
 import { getBaselines } from "../detect/baselines";
 import type { Env } from "../env";
 import { simulatorStub } from "../sim/simulator-do";
-import { getTrace, searchLogs } from "../telemetry/read";
+import { getIncidents, getTrace, listInvestigationSteps, searchLogs, type StepView } from "../telemetry/read";
 import { buildTopology, getOpsHealth, serviceHealth, sparklineSeries, type StateResponse, type WorldStatusView } from "../telemetry/state";
+import type { IncidentView } from "../telemetry/types";
 import { parseWindow, WindowError } from "../agent/window";
 
 const LOG_LEVELS = ["info", "warn", "error"] as const;
+
+/** `GET /api/incidents`' default lookback when no `from` is supplied — incidents are the UI's
+ * durable history panel (spec §6: kept indefinitely, surviving resets), so its default window is
+ * a day, not `parseWindow`'s generic 30-minute telemetry default. */
+const INCIDENTS_DEFAULT_FROM = "-24h";
+
+/** `GET /api/incidents/:id`'s response shape (spec §10: "incident + steps") — exported alongside
+ * `StateResponse` so Task 5.2's UI (which polls this at 2s during an investigation) types against
+ * the same definition this handler builds. `steps` is ordered by `step_no` ascending — see
+ * `read.ts`'s `listInvestigationSteps`. */
+export interface IncidentDetailResponse {
+  incident: IncidentView;
+  steps: StepView[];
+}
 
 /** Fetches `SimulatorDO`'s `/status` for the singleton `idFromName('world')` instance and returns
  * its body verbatim (`WorldStatusView`) — `null` on any failure (network error, non-2xx, malformed
@@ -64,6 +80,35 @@ routes.get("/state", async (c) => {
     worldStatus: world ?? FALLBACK_WORLD_STATUS,
     opsHealth,
   };
+  return c.json(body);
+});
+
+routes.get("/incidents", async (c) => {
+  const nowMs = Date.now();
+  try {
+    const { fromMs, toMs } = parseWindow(
+      { from: c.req.query("from") ?? INCIDENTS_DEFAULT_FROM, to: c.req.query("to") },
+      nowMs,
+    );
+    // getIncidents' window branch is already newest-first (spec §10: "recent first") and carries
+    // the {incidents, total} envelope with its 20-row cap -- passed through verbatim.
+    const result = await getIncidents(c.env.DB, { fromMs, toMs });
+    return c.json(result);
+  } catch (err) {
+    if (err instanceof WindowError) return c.json({ error: err.message }, 400);
+    throw err;
+  }
+});
+
+routes.get("/incidents/:id", async (c) => {
+  const id = c.req.param("id");
+  const { incidents } = await getIncidents(c.env.DB, { id });
+  const incident = incidents[0];
+  if (incident === undefined) {
+    return c.json({ error: "not_found" }, 404);
+  }
+  const steps = await listInvestigationSteps(c.env.DB, id);
+  const body: IncidentDetailResponse = { incident, steps };
   return c.json(body);
 });
 

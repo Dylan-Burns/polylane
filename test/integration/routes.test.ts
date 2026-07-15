@@ -1,8 +1,10 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
+import { insertInvestigationStep } from "../../src/telemetry/incidents";
 import { insertLogs, insertSpans } from "../../src/telemetry/queries";
-import type { LogLine, Span } from "../../src/telemetry/types";
+import type { StepView } from "../../src/telemetry/read";
+import type { IncidentView, LogLine, Span } from "../../src/telemetry/types";
 
 /** Confirms the actual HTTP wiring in `src/api/routes.ts` (mounted at `/api` from `index.ts`) --
  * `serviceHealth`/`sparklineSeries`/`getOpsHealth`/`buildTopology` themselves are unit-tested in
@@ -55,6 +57,113 @@ describe("GET /api/state", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { worldStatus: { worldStatus: string } };
     expect(body.worldStatus.worldStatus).toBe("unseeded");
+  });
+});
+
+describe("GET /api/incidents", () => {
+  async function seedIncident(id: string, openedAt: number, status = "open"): Promise<void> {
+    await env.DB
+      .prepare("INSERT INTO incidents (id, status, severity, opened_at, trigger_json) VALUES (?, ?, 'warning', ?, '{}')")
+      .bind(id, status, openedAt)
+      .run();
+  }
+
+  it("defaults to the last 24h, recent first, with the {incidents, total} envelope", async () => {
+    const now = Date.now();
+    await seedIncident("inc-recent", now - 60 * 60_000); // 1h ago -- in the default window
+    await seedIncident("inc-older", now - 2 * 60 * 60_000); // 2h ago -- also in
+    await seedIncident("inc-ancient", now - 48 * 60 * 60_000); // 48h ago -- outside the 24h default
+
+    const res = await SELF.fetch("https://example.com/api/incidents");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { incidents: IncidentView[]; total: number };
+    expect(body.incidents.map((i) => i.id)).toEqual(["inc-recent", "inc-older"]); // newest first
+    expect(body.total).toBe(2);
+  });
+
+  it("honors explicit from/to query params via parseWindow", async () => {
+    const now = Date.now();
+    await seedIncident("inc-in-window", now - 30 * 60_000);
+    await seedIncident("inc-out-of-window", now - 3 * 60 * 60_000);
+
+    const res = await SELF.fetch("https://example.com/api/incidents?from=-1h");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { incidents: IncidentView[]; total: number };
+    expect(body.incidents.map((i) => i.id)).toEqual(["inc-in-window"]);
+    expect(body.total).toBe(1);
+  });
+
+  it("400s an unparseable window bound", async () => {
+    const res = await SELF.fetch("https://example.com/api/incidents?from=yesterday-ish");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("neither an ISO-8601 timestamp nor a relative offset");
+  });
+});
+
+describe("GET /api/incidents/:id", () => {
+  it("returns {incident, steps} with steps ordered by step_no and content parsed", async () => {
+    await env.DB.batch([
+      env.DB
+        .prepare(
+          "INSERT INTO incidents (id, status, severity, opened_at, trigger_json) VALUES ('inc-detail', 'investigating', 'critical', 1000, ?)",
+        )
+        .bind(JSON.stringify({ statements: ["payments error_rate 30.0% vs baseline 1.0% (hard trip) since 14:00Z"] })),
+      env.DB
+        .prepare("INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES ('inc-detail', 'payments:errors', 1000, 1)"),
+    ]);
+    // Inserted out of step_no order (1 before 0) so the ordering assertion exercises the ORDER BY.
+    await insertInvestigationStep(env.DB, {
+      incidentId: "inc-detail",
+      stepNo: 1,
+      kind: "tool_call",
+      contentJson: JSON.stringify({ name: "query_metrics", input: { service: "payments" } }),
+      tsMs: 2500,
+      tokensIn: 1100,
+      tokensOut: 60,
+    });
+    await insertInvestigationStep(env.DB, {
+      incidentId: "inc-detail",
+      stepNo: 0,
+      kind: "note",
+      contentJson: JSON.stringify({ note: "investigation started" }),
+      tsMs: 2000,
+      tokensIn: 0,
+      tokensOut: 0,
+    });
+
+    const res = await SELF.fetch("https://example.com/api/incidents/inc-detail");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { incident: IncidentView; steps: StepView[] };
+
+    expect(body.incident.id).toBe("inc-detail");
+    expect(body.incident.status).toBe("investigating");
+    expect(body.incident.fingerprints).toEqual(["payments:errors"]);
+    expect(body.incident.trigger).toEqual({ statements: ["payments error_rate 30.0% vs baseline 1.0% (hard trip) since 14:00Z"] });
+
+    expect(body.steps.map((s) => s.step_no)).toEqual([0, 1]);
+    expect(body.steps[0]?.content).toEqual({ note: "investigation started" }); // parsed, not a raw string
+    expect(body.steps[1]?.content).toEqual({ name: "query_metrics", input: { service: "payments" } });
+    expect(body.steps[1]?.tokens_in).toBe(1100);
+    expect(body.steps[1]?.tokens_out).toBe(60);
+  });
+
+  it("returns an empty steps array for an incident with no investigation steps yet", async () => {
+    await env.DB
+      .prepare("INSERT INTO incidents (id, status, severity, opened_at, trigger_json) VALUES ('inc-stepless', 'open', 'warning', 1000, '{}')")
+      .run();
+
+    const res = await SELF.fetch("https://example.com/api/incidents/inc-stepless");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { incident: IncidentView; steps: StepView[] };
+    expect(body.incident.id).toBe("inc-stepless");
+    expect(body.steps).toEqual([]);
+  });
+
+  it("404s an unknown incident id", async () => {
+    const res = await SELF.fetch("https://example.com/api/incidents/does-not-exist");
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "not_found" });
   });
 });
 

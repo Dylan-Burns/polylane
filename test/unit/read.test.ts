@@ -1,11 +1,13 @@
 import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
+import { insertInvestigationStep } from "../../src/telemetry/incidents";
 import { insertDeploy, insertLogs, insertRollups, insertSpans } from "../../src/telemetry/queries";
 import {
   findTraces,
   getIncidents,
   getTrace,
   listDeploys,
+  listInvestigationSteps,
   queryMetrics,
   searchLogs,
 } from "../../src/telemetry/read";
@@ -401,6 +403,38 @@ async function seedFixture(): Promise<void> {
     ).bind("incident-open-1", "payments:latency", T0 + 15 * MIN, 1),
   ]);
 
+  // Investigation steps for the open incident, inserted OUT of step_no order (2, 0, 1) so the
+  // listInvestigationSteps ordering assertion exercises the ORDER BY rather than passing on
+  // insertion order. Step 1's content_json is deliberately NOT valid JSON, to prove the
+  // fail-safe raw-string fallback (one corrupt row must not take down the timeline).
+  await insertInvestigationStep(env.DB, {
+    incidentId: "incident-open-1",
+    stepNo: 2,
+    kind: "tool_result",
+    contentJson: JSON.stringify({ result: { points: 3 } }),
+    tsMs: T0 + 16 * MIN,
+    tokensIn: 900,
+    tokensOut: 40,
+  });
+  await insertInvestigationStep(env.DB, {
+    incidentId: "incident-open-1",
+    stepNo: 0,
+    kind: "note",
+    contentJson: JSON.stringify({ note: "investigation started" }),
+    tsMs: T0 + 15 * MIN,
+    tokensIn: 0,
+    tokensOut: 0,
+  });
+  await insertInvestigationStep(env.DB, {
+    incidentId: "incident-open-1",
+    stepNo: 1,
+    kind: "tool_call",
+    contentJson: "{not valid json",
+    tsMs: T0 + 15 * MIN + 30_000,
+    tokensIn: 1200,
+    tokensOut: 80,
+  });
+
   // 25 incidents, one per minute starting at INCIDENT_CAP_START, purely to exercise
   // getIncidents' 20-cap + exact-total reporting on the window branch.
   const INCIDENT_CAP_COUNT = 25;
@@ -754,6 +788,26 @@ describe("getIncidents", () => {
     expect(incidents[0]?.fingerprints).toEqual(["payments:latency"]);
     expect(incidents[1]?.report).not.toBeNull();
     expect(incidents[1]?.fingerprints).toEqual(["checkout:errors", "payments:latency"]);
+  });
+
+  it("listInvestigationSteps returns steps ordered by step_no with content parsed and token columns intact", async () => {
+    const steps = await listInvestigationSteps(env.DB, "incident-open-1");
+    expect(steps.map((s) => s.step_no)).toEqual([0, 1, 2]); // seeded 2, 0, 1 -- only passes via ORDER BY
+    expect(steps.map((s) => s.kind)).toEqual(["note", "tool_call", "tool_result"]);
+
+    expect(steps[0]?.content).toEqual({ note: "investigation started" }); // parsed, not a raw string
+    expect(steps[2]?.content).toEqual({ result: { points: 3 } });
+    // The corrupt content_json row degrades to the raw string rather than throwing or vanishing.
+    expect(steps[1]?.content).toBe("{not valid json");
+
+    expect(steps[1]?.tokens_in).toBe(1200);
+    expect(steps[1]?.tokens_out).toBe(80);
+    expect(steps[0]?.ts_ms).toBe(T0 + 15 * MIN);
+  });
+
+  it("listInvestigationSteps returns [] for an unknown incident id and for one with no steps", async () => {
+    expect(await listInvestigationSteps(env.DB, "does-not-exist")).toEqual([]);
+    expect(await listInvestigationSteps(env.DB, "incident-resolved-1")).toEqual([]); // real incident, zero steps
   });
 
   it("by window clamps to the 20-incident cap, newest first, while total reports the full match count", async () => {

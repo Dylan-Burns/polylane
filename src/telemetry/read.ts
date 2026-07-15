@@ -820,3 +820,70 @@ export async function getIncidents(db: D1Database, args: GetIncidentsArgs): Prom
   const incidents = rows.map((row) => rowToIncidentView(row, fingerprints.get(row.id) ?? []));
   return { incidents, total };
 }
+
+// --- listInvestigationSteps ---------------------------------------------------------------------
+
+/** One `investigation_steps` row shaped for consumption (`GET /api/incidents/:id`'s timeline —
+ * Task 5.2's UI polls it at 2s during an investigation, so this shape is JSON-stable by contract):
+ * `content` is the row's `content_json` parsed (an `unknown`, never a raw JSON string — matching
+ * `IncidentView`'s own `trigger`/`report` convention), and the token columns ride along so the UI
+ * can render per-step cost. `incident_id` is deliberately omitted: every caller already scoped the
+ * query by it. */
+export interface StepView {
+  step_no: number;
+  kind: "tool_call" | "tool_result" | "note" | "report" | "error";
+  content: unknown;
+  ts_ms: number;
+  tokens_in: number;
+  tokens_out: number;
+}
+
+interface StepRowDb {
+  step_no: number;
+  kind: StepView["kind"];
+  content_json: string;
+  ts_ms: number;
+  tokens_in: number;
+  tokens_out: number;
+}
+
+/**
+ * Every `investigation_steps` row for `incidentId`, ordered by `step_no` ascending (the
+ * investigation's own timeline order). Returns `[]` for an unknown incident id or one whose
+ * investigation hasn't written a step yet — the caller ( `GET /api/incidents/:id`) distinguishes
+ * "no such incident" via `getIncidents`, not via an empty step list, since a freshly-opened
+ * incident legitimately has zero steps. No row cap: the investigator's own budgets bound an
+ * investigation to 15 steps (Global Constraints), so this can never grow past a few dozen rows
+ * even with salvage/error entries — nothing here for a shape-aware cap to protect.
+ *
+ * A `content_json` that fails to parse degrades to the raw string as `content` (logged) rather
+ * than throwing — one corrupt row must not take down the whole timeline the UI is polling,
+ * mirroring `incidents.ts`'s `parseTrigger` fail-safe convention for the same class of column.
+ */
+export async function listInvestigationSteps(db: D1Database, incidentId: string): Promise<StepView[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT step_no, kind, content_json, ts_ms, tokens_in, tokens_out
+       FROM investigation_steps WHERE incident_id = ? ORDER BY step_no ASC`,
+    )
+    .bind(incidentId)
+    .all<StepRowDb>();
+
+  return (results ?? []).map((row) => {
+    let content: unknown;
+    try {
+      content = JSON.parse(row.content_json);
+    } catch (err) {
+      console.error(`read: investigation_steps content_json failed to parse (incident ${incidentId}, step ${row.step_no})`, err);
+      content = row.content_json;
+    }
+    return {
+      step_no: row.step_no,
+      kind: row.kind,
+      content,
+      ts_ms: row.ts_ms,
+      tokens_in: row.tokens_in,
+      tokens_out: row.tokens_out,
+    };
+  });
+}
