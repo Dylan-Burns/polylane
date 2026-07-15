@@ -141,9 +141,17 @@ function walkStep(
       continue;
     }
 
+    if (ASYNC_STEP_KEYS.has(stepKey(child))) {
+      // Fire-and-forget branch (spec §6 scenario 2: "notifications degrade; checkout
+      // unaffected"): the async child starts at the current cursor but the parent does NOT wait
+      // for it — no cursor advance, no contribution to the parent's duration, and no status
+      // propagation. Its span may legitimately end after the parent's does.
+      walkStep(child, cursor, traceId, spanId, effects, rng, ctx);
+      continue;
+    }
     const result = walkStep(child, cursor, traceId, spanId, effects, rng, ctx);
     cursor = result.endMs;
-    if (result.errored && !ASYNC_STEP_KEYS.has(stepKey(child))) {
+    if (result.errored) {
       downstreamErrored = true;
       causeService = child.service;
       causeLogMessage = null; // generic template below — the child's own span already logged specifics
@@ -199,7 +207,9 @@ export function generateWindow(fromMs: number, toMs: number, effects: FaultEffec
     const count = poisson(rng, lambda);
 
     for (let i = 0; i < count; i++) {
-      const requestStartMs = secStart + Math.floor(rng() * 1000);
+      // Clamp: for non-second-aligned windows the sub-second jitter could otherwise place a
+      // request up to 999ms past `toMs`, leaking traffic outside the requested window.
+      const requestStartMs = Math.min(secStart + Math.floor(rng() * 1000), toMs - 1);
       const flow = pickFlow(rng);
       const traceId = randomHex(rng, 16);
       const root = walkStep(flow.entry, requestStartMs, traceId, null, effects, rng, ctx);

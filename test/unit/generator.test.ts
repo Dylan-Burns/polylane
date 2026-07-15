@@ -8,7 +8,7 @@ import {
   type RequestStat,
 } from "../../src/sim/generator";
 import { mulberry32 } from "../../src/sim/rng";
-import { ERROR_LOG_MESSAGES, FLOWS, SERVICES } from "../../src/sim/topology";
+import { ASYNC_STEP_KEYS, ERROR_LOG_MESSAGES, FLOWS, SERVICES } from "../../src/sim/topology";
 import type { Span } from "../../src/telemetry/types";
 
 const NO_EFFECTS: FaultEffects = { latencyMult: new Map(), errorRateOverride: new Map(), trafficMult: 1 };
@@ -25,6 +25,30 @@ describe("topology", () => {
     expect(byName["checkout"]).toBeCloseTo(0.15, 5);
     expect(byName["browse"]).toBeCloseTo(0.7, 5);
     expect(byName["status"]).toBeCloseTo(0.15, 5);
+  });
+
+  it("gives every internal service 2-3 operations with distinct latency profiles (spec §6)", () => {
+    type StepLike = { service: string; operation: string; latency: { mu: number; sigma: number }; children: StepLike[] };
+    const opsByService = new Map<string, Map<string, { mu: number; sigma: number }>>();
+    const visit = (step: StepLike) => {
+      if (step.service !== "email-provider") {
+        const ops = opsByService.get(step.service) ?? new Map<string, { mu: number; sigma: number }>();
+        ops.set(step.operation, step.latency);
+        opsByService.set(step.service, ops);
+      }
+      step.children.forEach(visit);
+    };
+    for (const flow of FLOWS) visit(flow.entry);
+
+    for (const service of SERVICES) {
+      const ops = opsByService.get(service);
+      expect(ops).toBeDefined();
+      expect(ops!.size).toBeGreaterThanOrEqual(2);
+      expect(ops!.size).toBeLessThanOrEqual(3);
+      // distinct profiles: no two operations of a service share the same (mu, sigma).
+      const profiles = new Set([...ops!.values()].map((l) => `${l.mu}|${l.sigma}`));
+      expect(profiles.size).toBe(ops!.size);
+    }
   });
 });
 
@@ -84,17 +108,26 @@ describe("error propagation", () => {
     expect(dbErrorSpans.length).toBeGreaterThan(0);
 
     for (const dbSpan of dbErrorSpans) {
-      const traceSpans = batch.spans.filter((s) => s.trace_id === dbSpan.trace_id);
-      const payments = traceSpans.find((s) => s.service === "payments");
-      const checkout = traceSpans.find((s) => s.service === "checkout");
-      const gateway = traceSpans.find((s) => s.service === "gateway");
+      const bySpanId = new Map(batch.spans.filter((s) => s.trace_id === dbSpan.trace_id).map((s) => [s.span_id, s]));
+      // Walk the ancestor chain from the erroring db span to the root: every ancestor on the
+      // call path (payments -> checkout -> gateway) must report a downstream error. This is the
+      // on-path chain — sibling spans off the path (e.g. checkout.get_cart) are rightly
+      // unaffected.
+      const ancestors: Span[] = [];
+      let cursor = dbSpan.parent_span_id === null ? undefined : bySpanId.get(dbSpan.parent_span_id);
+      while (cursor !== undefined) {
+        ancestors.push(cursor);
+        cursor = cursor.parent_span_id === null ? undefined : bySpanId.get(cursor.parent_span_id);
+      }
 
-      expect(payments?.status).toBe("error");
-      expect(payments?.error_type).toBe("downstream");
-      expect(checkout?.status).toBe("error");
-      expect(checkout?.error_type).toBe("downstream");
-      expect(gateway?.status).toBe("error");
-      expect(gateway?.error_type).toBe("downstream");
+      const ancestorServices = ancestors.map((s) => s.service);
+      expect(ancestorServices).toContain("payments");
+      expect(ancestorServices).toContain("checkout");
+      expect(ancestorServices).toContain("gateway");
+      for (const ancestor of ancestors) {
+        expect(ancestor.status).toBe("error");
+        expect(ancestor.error_type).toBe("downstream");
+      }
     }
   });
 
@@ -125,11 +158,56 @@ describe("error propagation", () => {
 
     for (const notifSpan of notificationErrorSpans) {
       const traceSpans = batch.spans.filter((s) => s.trace_id === notifSpan.trace_id);
-      const checkout = traceSpans.find((s) => s.service === "checkout");
-      const gateway = traceSpans.find((s) => s.service === "gateway");
-      expect(checkout?.status).toBe("ok");
-      expect(gateway?.status).toBe("ok");
+      // EVERY checkout/gateway span in the trace stays ok — the async failure must not leak.
+      for (const span of traceSpans) {
+        if (span.service === "checkout" || span.service === "gateway") {
+          expect(span.status).toBe("ok");
+        }
+      }
     }
+  });
+});
+
+describe("async branch duration isolation (fire-and-forget)", () => {
+  it("100% email-provider errors leave checkout durations and error rate at baseline", () => {
+    const from = PEAK_HOUR_ANCHOR_MS;
+    const to = from + 60 * 60_000; // 1 hour at peak: ~800 checkout-flow traces
+    const healthy = generateWindow(from, to, NO_EFFECTS, mulberry32(31), 1);
+    const effects: FaultEffects = {
+      latencyMult: new Map(),
+      errorRateOverride: new Map([
+        ["email-provider", { rate: 1, errorType: "outage", logMessage: "upstream 503 from provider" }],
+      ]),
+      trafficMult: 1,
+    };
+    const faulted = generateWindow(from, to, effects, mulberry32(31), 1);
+
+    const placeOrderMean = (spans: Span[]) => {
+      const durations = spans
+        .filter((s) => s.service === "checkout" && s.operation === "place_order")
+        .map((s) => s.duration_ms);
+      expect(durations.length).toBeGreaterThan(100);
+      return durations.reduce((a, b) => a + b, 0) / durations.length;
+    };
+
+    // Sanity: the fault is actually firing — every notifications.send_email span degrades.
+    const sendSpans = faulted.spans.filter((s) => s.service === "notifications" && s.operation === "send_email");
+    expect(sendSpans.length).toBeGreaterThan(100);
+    expect(sendSpans.every((s) => s.status === "error")).toBe(true);
+
+    // (a) The duration-leak regression this guards against inflated checkout ~14x (notifications'
+    // downstream-timeout floor folding into checkout's timeline). 1.5x is generous headroom for
+    // rng-stream divergence between the two runs, but far below the failure mode.
+    const healthyMean = placeOrderMean(healthy.spans);
+    const faultedMean = placeOrderMean(faulted.spans);
+    expect(faultedMean).toBeLessThan(healthyMean * 1.5);
+    expect(faultedMean).toBeGreaterThan(healthyMean / 1.5);
+
+    // (b) checkout's error rate stays at ambient baseline — the async failure must not turn
+    // checkout spans into errors (would be ~50% of checkout-service spans if propagation leaked).
+    const checkoutSpans = faulted.spans.filter((s) => s.service === "checkout");
+    const errorRate = checkoutSpans.filter((s) => s.status === "error").length / checkoutSpans.length;
+    expect(errorRate).toBeLessThan(0.02);
   });
 });
 
@@ -240,7 +318,14 @@ describe("span tree shape", () => {
           const parent = bySpanId.get(span.parent_span_id);
           expect(parent).toBeDefined();
           expect(parent?.start_ms).toBeLessThanOrEqual(span.start_ms);
-          expect(span.start_ms + span.duration_ms).toBeLessThanOrEqual((parent?.start_ms ?? 0) + (parent?.duration_ms ?? 0));
+          const parentEnd = (parent?.start_ms ?? 0) + (parent?.duration_ms ?? 0);
+          if (ASYNC_STEP_KEYS.has(`${span.service}:${span.operation}`)) {
+            // Fire-and-forget branch: starts inside the parent's window, but the parent does
+            // not wait for it, so it may legitimately end after the parent ends.
+            expect(span.start_ms).toBeLessThanOrEqual(parentEnd);
+          } else {
+            expect(span.start_ms + span.duration_ms).toBeLessThanOrEqual(parentEnd);
+          }
         }
         seenSpanIds.add(span.span_id);
       }

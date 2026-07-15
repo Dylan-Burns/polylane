@@ -9,7 +9,8 @@
  * ```
  *
  * Six internal services emit spans; `email-provider` is an external dependency (no internal
- * spans of its own, only call results — see `EXTERNAL_SERVICE` below). `generator.ts` walks
+ * spans of its own, only call results — see `EXTERNAL_SERVICE` below). Each internal service
+ * exposes 2-3 operations with distinct latency/error profiles (spec §6). `generator.ts` walks
  * `FLOWS` to build traces; this file only holds data, no generation logic.
  */
 
@@ -33,6 +34,9 @@ export interface Latency {
  * latency, errorRate, children}`) — symptom-only error message templates and the async-branch
  * marker live *alongside* the step defs below (`ERROR_LOG_MESSAGES`, `ASYNC_STEP_KEYS`), keyed
  * by `${service}:${operation}`, rather than as extra fields on `Step` itself.
+ *
+ * Step objects are immutable data; a leaf may be shared by several parents (e.g. both payments
+ * operations hit the same payments-db steps) — the generator never mutates them.
  */
 export interface Step {
   service: string;
@@ -54,8 +58,9 @@ export function stepKey(step: Pick<Step, "service" | "operation">): string {
 }
 
 // --- Step definitions (leaves first) ---------------------------------------------------------
+// Latency `mu` is log-space, so `exp(mu)` is the operation's median duration in ms.
 
-const paymentsDbStep: Step = {
+const paymentsDbQueryStep: Step = {
   service: "payments-db",
   operation: "query_ledger",
   latency: { mu: Math.log(12), sigma: 0.45 },
@@ -63,12 +68,29 @@ const paymentsDbStep: Step = {
   children: [],
 };
 
-const paymentsStep: Step = {
+const paymentsDbUpdateStep: Step = {
+  service: "payments-db",
+  operation: "update_ledger",
+  latency: { mu: Math.log(18), sigma: 0.5 },
+  errorRate: 0.004,
+  children: [],
+};
+
+const paymentsChargeStep: Step = {
   service: "payments",
   operation: "charge",
   latency: { mu: Math.log(25), sigma: 0.35 },
   errorRate: 0.002,
-  children: [paymentsDbStep],
+  // Read the ledger, then write the charge — both payments-db operations on every charge.
+  children: [paymentsDbQueryStep, paymentsDbUpdateStep],
+};
+
+const paymentsRefundStep: Step = {
+  service: "payments",
+  operation: "refund",
+  latency: { mu: Math.log(30), sigma: 0.4 },
+  errorRate: 0.003,
+  children: [paymentsDbQueryStep, paymentsDbUpdateStep],
 };
 
 const emailProviderStep: Step = {
@@ -79,44 +101,86 @@ const emailProviderStep: Step = {
   children: [],
 };
 
-const notificationsStep: Step = {
+const notificationsRenderStep: Step = {
+  service: "notifications",
+  operation: "render_template",
+  latency: { mu: Math.log(3), sigma: 0.25 },
+  errorRate: 0.001,
+  children: [],
+};
+
+const notificationsSendStep: Step = {
   service: "notifications",
   operation: "send_email",
   latency: { mu: Math.log(6), sigma: 0.3 },
   errorRate: 0.002,
-  children: [emailProviderStep],
+  // Render the template (internal sub-operation), then call the external provider.
+  children: [notificationsRenderStep, emailProviderStep],
 };
 
-const checkoutStep: Step = {
+const checkoutGetCartStep: Step = {
+  service: "checkout",
+  operation: "get_cart",
+  latency: { mu: Math.log(7), sigma: 0.3 },
+  errorRate: 0.001,
+  children: [],
+};
+
+const checkoutPlaceOrderStep: Step = {
   service: "checkout",
   operation: "place_order",
   latency: { mu: Math.log(15), sigma: 0.4 },
   errorRate: 0.002,
   // Two children: the synchronous payments chain, and the async notifications branch (see
-  // ASYNC_STEP_KEYS below) — both nest inside checkout's span, but only the former's errors
-  // bubble up to checkout/gateway.
-  children: [paymentsStep, notificationsStep],
+  // ASYNC_STEP_KEYS below). The async branch starts inside place_order's window but does not
+  // extend it, and its errors do NOT bubble up to checkout/gateway.
+  children: [paymentsChargeStep, notificationsSendStep],
 };
 
-const catalogStep: Step = {
+const checkoutRefundOrderStep: Step = {
+  service: "checkout",
+  operation: "refund_order",
+  latency: { mu: Math.log(12), sigma: 0.35 },
+  errorRate: 0.002,
+  children: [paymentsRefundStep],
+};
+
+const catalogListStep: Step = {
   service: "catalog",
-  operation: "search",
+  operation: "list_products",
   latency: { mu: Math.log(40), sigma: 0.45 },
   errorRate: 0.002,
   children: [],
 };
 
-// Gateway is the entry point for every flow; each flow gets its own gateway operation, which
-// naturally gives `gateway` the "2-3 operations with distinct profiles" spec §6 calls for.
-// Downstream services in this demo topology each sit on exactly one call path, so they get one
-// operation apiece — a deliberate scope decision (see task report), not an oversight.
+const catalogGetStep: Step = {
+  service: "catalog",
+  operation: "get_product",
+  latency: { mu: Math.log(15), sigma: 0.35 },
+  errorRate: 0.0015,
+  children: [],
+};
+
+// Gateway is the entry point for every flow. It exposes exactly three operations
+// (route_checkout, route_browse, get_status) — the refund flow enters through route_checkout
+// (gateway routes both order placement and refunds to checkout), keeping every service within
+// spec §6's "2-3 operations" band.
 
 const gatewayCheckoutEntry: Step = {
   service: "gateway",
   operation: "route_checkout",
   latency: { mu: Math.log(8), sigma: 0.35 },
   errorRate: 0.002,
-  children: [checkoutStep],
+  // Fetch the cart, then place the order.
+  children: [checkoutGetCartStep, checkoutPlaceOrderStep],
+};
+
+const gatewayRefundEntry: Step = {
+  service: "gateway",
+  operation: "route_checkout", // same (service, operation) profile as gatewayCheckoutEntry
+  latency: { mu: Math.log(8), sigma: 0.35 },
+  errorRate: 0.002,
+  children: [checkoutRefundOrderStep],
 };
 
 const gatewayBrowseEntry: Step = {
@@ -124,7 +188,8 @@ const gatewayBrowseEntry: Step = {
   operation: "route_browse",
   latency: { mu: Math.log(6), sigma: 0.3 },
   errorRate: 0.002,
-  children: [catalogStep],
+  // List products, then view one — exercises both catalog operations per browse.
+  children: [catalogListStep, catalogGetStep],
 };
 
 const gatewayStatusEntry: Step = {
@@ -135,37 +200,48 @@ const gatewayStatusEntry: Step = {
   children: [],
 };
 
-/** Flows: checkout ~15%, browse ~70%, status ~15% (spec §6). Weights need not sum to 1 —
- * `generator.ts` normalizes them — but they do here for readability. */
+/**
+ * Flows: checkout ~15%, browse ~70%, status ~15% (spec §6), plus a rare `refund` flow (~2%;
+ * weights are normalized by `generator.ts`) that exercises checkout.refund_order /
+ * payments.refund so every service genuinely has 2-3 operations with distinct profiles.
+ */
 export const FLOWS: Flow[] = [
   { name: "checkout", weight: 0.15, entry: gatewayCheckoutEntry },
   { name: "browse", weight: 0.7, entry: gatewayBrowseEntry },
   { name: "status", weight: 0.15, entry: gatewayStatusEntry },
+  { name: "refund", weight: 0.02, entry: gatewayRefundEntry },
 ];
 
 /**
  * Symptom-only log message for when a step is the one with its own intrinsic error (spec §6
  * telemetry honesty calibration: realistic-sounding, but never names the injected root cause —
- * no deploy/version/scenario references). Keyed by `stepKey`. `payments-db` and `email-provider`
- * use the exact example strings from spec §6 / the task brief.
+ * no deploy/version/scenario references). Keyed by `stepKey`. `payments-db:query_ledger` and
+ * `email-provider:send` use the exact example strings from spec §6 / the task brief. Note
+ * `gateway:route_checkout` covers both gateway entry Steps that share that operation.
  */
 export const ERROR_LOG_MESSAGES: Readonly<Record<string, string>> = {
   [stepKey(gatewayCheckoutEntry)]: "request handling failed: unexpected client disconnect",
   [stepKey(gatewayBrowseEntry)]: "request handling failed: unexpected client disconnect",
   [stepKey(gatewayStatusEntry)]: "request handling failed: unexpected client disconnect",
-  [stepKey(checkoutStep)]: "checkout processing failed: invalid cart state",
-  [stepKey(paymentsStep)]: "payment authorization failed: card issuer declined",
-  [stepKey(paymentsDbStep)]: "connection pool exhausted: 25/25 in use, acquire timeout 5000ms",
-  [stepKey(notificationsStep)]: "notification dispatch failed: template render error",
+  [stepKey(checkoutGetCartStep)]: "cart lookup failed: session state missing",
+  [stepKey(checkoutPlaceOrderStep)]: "checkout processing failed: invalid cart state",
+  [stepKey(checkoutRefundOrderStep)]: "refund processing failed: order state conflict",
+  [stepKey(paymentsChargeStep)]: "payment authorization failed: card issuer declined",
+  [stepKey(paymentsRefundStep)]: "refund request failed: settlement batch not found",
+  [stepKey(paymentsDbQueryStep)]: "connection pool exhausted: 25/25 in use, acquire timeout 5000ms",
+  [stepKey(paymentsDbUpdateStep)]: "write conflict: ledger row lock timeout after 3 retries",
+  [stepKey(notificationsSendStep)]: "email send failed: connection reset by peer",
+  [stepKey(notificationsRenderStep)]: "template render error: missing field 'order_id'",
   [stepKey(emailProviderStep)]: "upstream 503 from provider",
-  [stepKey(catalogStep)]: "catalog search failed: index shard timeout",
+  [stepKey(catalogListStep)]: "catalog search failed: index shard timeout",
+  [stepKey(catalogGetStep)]: "product lookup failed: cache read timeout",
 };
 
 /**
  * Keys of steps whose failures are fire-and-forget from the caller's perspective — the brief's
- * "async branch" (checkout -> notifications -> email-provider). An async step's span still
- * nests inside its parent's duration (generator.ts walks it like any other child), but its
- * error does NOT bubble up to mark the parent 'error' (spec §6 scenario 2: "notifications
- * degrade; checkout unaffected").
+ * "async branch" (checkout -> notifications -> email-provider). An async step's span starts
+ * within its parent's window but the parent does not wait for it: no duration contribution and
+ * no error propagation to the parent (spec §6 scenario 2: "notifications degrade; checkout
+ * unaffected").
  */
-export const ASYNC_STEP_KEYS: ReadonlySet<string> = new Set([stepKey(notificationsStep)]);
+export const ASYNC_STEP_KEYS: ReadonlySet<string> = new Set([stepKey(notificationsSendStep)]);
