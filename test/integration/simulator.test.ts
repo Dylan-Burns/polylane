@@ -1,0 +1,251 @@
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
+import { afterEach, describe, expect, it } from "vitest";
+import { MINUTE_MS } from "../../src/sim/backfill";
+import { insertSpans } from "../../src/telemetry/queries";
+import type { Span } from "../../src/telemetry/types";
+
+// Documented pattern (task brief): vitest-pool-workers' `runDurableObjectAlarm` only fires an
+// *already-scheduled* alarm immediately, which doesn't let us control what wall-clock time the
+// handler perceives. Instead we drive alarm-based flows by calling `instance.alarm()` directly
+// via `runInDurableObject` (which gives raw instance + state access, bypassing HTTP), combined
+// with `SimulatorDO`'s `setTestNow` seam so `this.now()` inside the DO is fully test-controlled.
+
+const PEAK_HOUR_T0 = Date.UTC(2026, 0, 5, 14, 0, 0); // minute-aligned, diurnal peak for reliable volume
+
+interface StatusBody {
+  worldStatus: string;
+  fault: { scenario: string; startedMs: number } | null;
+  generation: number;
+  seedProgress?: number;
+}
+
+async function statusOf(stub: DurableObjectStub): Promise<StatusBody> {
+  const res = await stub.fetch("http://simulator/status");
+  return (await res.json()) as StatusBody;
+}
+
+function makeSpan(i: number): Span {
+  return {
+    trace_id: `pre-existing-trace-${i}`,
+    span_id: `pre-existing-span-${i}`,
+    parent_span_id: null,
+    service: "checkout",
+    operation: "place_order",
+    start_ms: 1_700_000_000_000 + i,
+    duration_ms: 10,
+    status: "ok",
+    error_type: null,
+  };
+}
+
+afterEach(async () => {
+  // Children (FK-referencing `incidents`) must be cleared before `incidents` itself.
+  for (const table of [
+    "spans",
+    "logs",
+    "rollups",
+    "deploys",
+    "incident_fingerprints",
+    "investigation_steps",
+    "incidents",
+    "baselines",
+    "meta",
+  ]) {
+    await env.DB.exec(`DELETE FROM ${table}`);
+  }
+});
+
+describe("SimulatorDO tick", () => {
+  it("writes sampled spans every tick and closes rollups only for minutes that fully finished within the tick", async () => {
+    const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("test-tick-1"));
+
+    const alarmAfter = await runInDurableObject(stub, async (instance, state) => {
+      await state.storage.put("worldStatus", "running");
+      await state.storage.put("generation", 1);
+      await state.storage.put("lastTickMs", PEAK_HOUR_T0);
+      instance.setTestNow(PEAK_HOUR_T0 + 70_000); // crosses exactly one minute boundary
+      await instance.alarm();
+      return state.storage.getAlarm();
+    });
+
+    // Re-armed at the top of the handler: a pending alarm exists after the call returns.
+    expect(alarmAfter).not.toBeNull();
+
+    const spanCount = await env.DB.prepare("SELECT count(*) as n FROM spans").first<{ n: number }>();
+    expect(spanCount?.n).toBeGreaterThan(0);
+
+    const closedMinuteRollups = await env.DB.prepare("SELECT count(*) as n FROM rollups WHERE minute_ts = ?")
+      .bind(PEAK_HOUR_T0)
+      .first<{ n: number }>();
+    expect(closedMinuteRollups?.n).toBeGreaterThan(0);
+
+    // The still-open minute (T0+60s..T0+70s) hasn't closed yet — no rollup row for it, its stats
+    // carry to the next tick via `partialMinute` storage instead.
+    const openMinuteRollups = await env.DB.prepare("SELECT count(*) as n FROM rollups WHERE minute_ts = ?")
+      .bind(PEAK_HOUR_T0 + MINUTE_MS)
+      .first<{ n: number }>();
+    expect(openMinuteRollups?.n).toBe(0);
+  });
+});
+
+describe("SimulatorDO fault/restore", () => {
+  it("fault set 200 -> effects visible in next tick; second fault while active -> 409; restore -> 200 and effects clear", async () => {
+    const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("test-fault-1"));
+
+    await runInDurableObject(stub, async (instance, state) => {
+      await state.storage.put("worldStatus", "running");
+      await state.storage.put("generation", 1);
+      await state.storage.put("lastTickMs", PEAK_HOUR_T0);
+      instance.setTestNow(PEAK_HOUR_T0);
+    });
+
+    const setRes = await stub.fetch("http://simulator/fault", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ scenario: "bad-deploy" }),
+    });
+    expect(setRes.status).toBe(200);
+    expect(await setRes.json()).toMatchObject({ fault: { scenario: "bad-deploy", startedMs: PEAK_HOUR_T0 } });
+
+    const secondRes = await stub.fetch("http://simulator/fault", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ scenario: "traffic-spike" }),
+    });
+    expect(secondRes.status).toBe(409);
+    expect(await secondRes.json()).toEqual({ error: "scenario_active" });
+
+    // Advance well past the 30s onset with a wide (5min) window so pool-exhaustion errors are
+    // all but certain to appear (25% error rate on payments once active).
+    await runInDurableObject(stub, async (instance) => {
+      instance.setTestNow(PEAK_HOUR_T0 + 5 * MINUTE_MS);
+      await instance.alarm();
+    });
+
+    const faultedErrors = await env.DB.prepare(
+      "SELECT count(*) as n FROM spans WHERE service = 'payments' AND error_type = 'pool_exhausted'",
+    ).first<{ n: number }>();
+    expect(faultedErrors?.n).toBeGreaterThan(0);
+
+    const restoreRes = await stub.fetch("http://simulator/restore", { method: "POST" });
+    expect(restoreRes.status).toBe(200);
+    expect(await restoreRes.json()).toEqual({ fault: null });
+
+    const statusAfterRestore = await statusOf(stub);
+    expect(statusAfterRestore.fault).toBeNull();
+
+    // A tick entirely after restore must not add any *new* pool-exhaustion spans.
+    const restoreTickStart = PEAK_HOUR_T0 + 5 * MINUTE_MS;
+    await runInDurableObject(stub, async (instance) => {
+      instance.setTestNow(restoreTickStart + 5 * MINUTE_MS);
+      await instance.alarm();
+    });
+
+    const postRestoreErrors = await env.DB.prepare(
+      "SELECT count(*) as n FROM spans WHERE service = 'payments' AND error_type = 'pool_exhausted' AND start_ms >= ?",
+    )
+      .bind(restoreTickStart)
+      .first<{ n: number }>();
+    expect(postRestoreErrors?.n).toBe(0);
+  }, 20_000);
+});
+
+describe("SimulatorDO reset", () => {
+  it(
+    "transitions unseeded -> seeding -> running; wipes telemetry; preserves incidents; invokes recomputeBaselines once after the final chunk",
+    async () => {
+      const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("test-reset-1"));
+
+      // Pre-existing rows prove the wipe is scoped to telemetry only.
+      await insertSpans(env.DB, [makeSpan(1)]);
+      await env.DB.prepare(
+        "INSERT INTO incidents (id, status, severity, opened_at, trigger_json) VALUES ('pre-existing', 'resolved', 'warning', 1, '{}')",
+      ).run();
+
+      const T0 = Date.UTC(2026, 0, 5, 0, 0, 0); // already minute-aligned
+      const hookCalls: number[] = [];
+      await runInDurableObject(stub, async (instance) => {
+        instance.setTestNow(T0);
+        instance.recomputeBaselines = async (_db, nowMs) => {
+          hookCalls.push(nowMs);
+          return 0;
+        };
+      });
+
+      const before = await statusOf(stub);
+      expect(before.worldStatus).toBe("unseeded");
+
+      const resetRes = await stub.fetch("http://simulator/reset", { method: "POST" });
+      expect(resetRes.status).toBe(202);
+
+      const afterReset = await statusOf(stub);
+      expect(afterReset.worldStatus).toBe("seeding");
+      expect(afterReset.seedProgress).toBe(0);
+
+      const spansAfterWipe = await env.DB.prepare("SELECT count(*) as n FROM spans").first<{ n: number }>();
+      expect(spansAfterWipe?.n).toBe(0);
+      const incidentsAfterWipe = await env.DB.prepare("SELECT count(*) as n FROM incidents").first<{ n: number }>();
+      expect(incidentsAfterWipe?.n).toBe(1); // pre-existing incident survives the wipe
+
+      // Drive the chunked backfill to completion by invoking alarm() repeatedly (each firing
+      // processes exactly one ~4h chunk); 24h / 4h = 6 chunks exactly.
+      let status = "seeding";
+      let iterations = 0;
+      while (status !== "running" && iterations < 10) {
+        await runInDurableObject(stub, async (instance, state) => {
+          instance.setTestNow(T0);
+          await instance.alarm();
+          status = (await state.storage.get<string>("worldStatus")) ?? "";
+        });
+        iterations++;
+      }
+
+      expect(status).toBe("running");
+      expect(iterations).toBe(6);
+
+      expect(hookCalls).toEqual([T0]); // invoked exactly once, after the final chunk, with backfill's end time
+
+      const incidentsAfterSeed = await env.DB.prepare("SELECT count(*) as n FROM incidents").first<{ n: number }>();
+      expect(incidentsAfterSeed?.n).toBe(2); // pre-existing (preserved) + the newly seeded incident
+
+      const spansAfterBackfill = await env.DB.prepare("SELECT count(*) as n FROM spans").first<{ n: number }>();
+      expect(spansAfterBackfill?.n).toBeGreaterThan(0);
+    },
+    60_000,
+  );
+});
+
+describe("SimulatorDO stale-generation guard", () => {
+  it("discards a tick's write if its captured generation no longer matches storage after a reset", async () => {
+    const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("test-stale-gen-1"));
+
+    await runInDurableObject(stub, async (instance, state) => {
+      await state.storage.put("worldStatus", "running");
+      await state.storage.put("generation", 1);
+      await state.storage.put("lastTickMs", PEAK_HOUR_T0);
+      instance.setTestNow(PEAK_HOUR_T0);
+    });
+    const preResetGeneration = 1;
+
+    // A reset lands — bumping generation to 2 and wiping telemetry — as if it happened while a
+    // tick that had already captured generation 1 was still in flight.
+    await runInDurableObject(stub, (instance) => instance.setTestNow(PEAK_HOUR_T0 + MINUTE_MS));
+    const resetRes = await stub.fetch("http://simulator/reset", { method: "POST" });
+    expect(resetRes.status).toBe(202);
+
+    const spansAfterReset = await env.DB.prepare("SELECT count(*) as n FROM spans").first<{ n: number }>();
+    expect(spansAfterReset?.n).toBe(0);
+
+    // The stale tick (still holding the pre-reset generation) finally reaches its write check.
+    const staleResult = await runInDurableObject(stub, (instance) => instance.runLiveTickForTest(preResetGeneration));
+    expect(staleResult.wrote).toBe(false);
+
+    const spansAfterStaleWrite = await env.DB.prepare("SELECT count(*) as n FROM spans").first<{ n: number }>();
+    expect(spansAfterStaleWrite?.n).toBe(0); // discarded — nothing was inserted
+
+    // Sanity check the guard is a real, reachable branch: a matching (current) generation does write.
+    const currentResult = await runInDurableObject(stub, (instance) => instance.runLiveTickForTest(2));
+    expect(currentResult.wrote).toBe(true);
+  });
+});

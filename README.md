@@ -35,6 +35,15 @@ _Filled incrementally through phase 7: key design decisions and what got
 traded off for time — e.g. single active investigation, the D1 write budget,
 no hand-rolled retry logic._
 
+- **Measured D1 write volume (Task 1.4 gate):** a full 24h backfill (same
+  generator, same 1.0 sim rate, full diurnal cycle) writes 37,336 spans +
+  11,917 logs + 19,437 rollups ≈ **69k raw inserts/day**; a 17-minute live
+  sample extrapolates consistently (~64k/day after diurnal adjustment).
+  Billable (spans ×3, logs ×2, rollups ×2) ≈ **175k rows/day** before
+  retention deletes — comfortably inside the ≈0.5M/day budget from spec §6.
+  Below the spec's rough ~105k/day estimate because logs are ~1 access log
+  per *sampled request* plus error logs (~12k/day), not the ~40k/day guess.
+
 ## What's deliberately missing
 
 _Filled at phase 7: scope boundaries from the break-it checklist — what was

@@ -8,5 +8,10 @@ declare namespace Cloudflare {
   interface Env {
     DB: D1Database;
     TEST_MIGRATIONS: import("cloudflare:test").D1Migration[];
+    // Real DO/env bindings (mirrors src/env.d.ts) so integration tests can reach SimulatorDO via
+    // `import { env } from "cloudflare:workers"` the same way production code does.
+    SIMULATOR: DurableObjectNamespace<import("../src/sim/simulator-do").SimulatorDO>;
+    INVESTIGATOR: DurableObjectNamespace;
+    SIM_RATE: string;
   }
 }
