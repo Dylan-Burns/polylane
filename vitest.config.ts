@@ -30,6 +30,9 @@ export default defineConfig(async () => {
     ],
     test: {
       setupFiles: ["./test/apply-migrations.ts"],
+      // Only real suites: keeps scratch/tooling dirs (.superpowers) and any
+      // parked *.bak copies out of the run.
+      include: ["test/**/*.test.ts"],
     },
   };
 });

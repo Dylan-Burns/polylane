@@ -31,8 +31,12 @@ import type {
 
 // --- Small shared helpers ------------------------------------------------------------------
 
-/** Clamps `n` into `[min, max]`, flooring to an integer. Used for every caller-supplied `limit`. */
+/** Clamps `n` into `[min, max]`, flooring to an integer. Used for every caller-supplied `limit`.
+ * A `NaN` `n` (e.g. a caller passing `limit: NaN` explicitly, which bypasses a `?? default`
+ * fallback since `NaN` isn't nullish) falls back to `max` rather than propagating — every current
+ * call site's default limit is also its `max`, so this is exactly "fall back to the default". */
 function clampInt(n: number, min: number, max: number): number {
+  if (Number.isNaN(n)) return max;
   return Math.min(max, Math.max(min, Math.floor(n)));
 }
 
@@ -371,7 +375,9 @@ function isCollapsedMarker(span: Span): boolean {
 }
 
 /**
- * Collapses `spans` (already known to exceed `MAX_TRACE_SPANS`) down to the cap.
+ * Collapses `spans` (already known to exceed `MAX_TRACE_SPANS`) down to the cap — a *hard*, honest
+ * cap: every path below either gets the result to `MAX_TRACE_SPANS` or hits the one documented
+ * exception (below), never a silent "close enough".
  *
  * Domain caveat this must NOT "fix": async spans (the notifications fire-and-forget subtree, per
  * `generator.ts`'s `ASYNC_STEP_KEYS` branch) may legitimately end *after* their parent ends — the
@@ -379,17 +385,30 @@ function isCollapsedMarker(span: Span): boolean {
  * by wall-clock overlap, or otherwise treats that as malformed; span identity is entirely
  * `parent_span_id`-driven, never inferred from timing.
  *
- * Algorithm:
- *  1. `mustKeep` = every `status: 'error'` span plus all of its ancestors up to the root — this is
- *     exactly "the full error path root→leaf" for every error branch in the tree (an error span
- *     with no error children is, by construction, already a leaf of that path).
- *  2. Group every remaining (non-must-keep) *leaf* span (spans with children are never grouped —
- *     collapsing one would orphan its descendants) by `(parent_span_id, service, operation)`.
- *     Groups of >=2 become one synthetic "…N similar ok spans" marker span; singletons stay as
- *     individual spans (nothing to summarize).
- *  3. Defensive fallback, only reachable when step 2 alone doesn't reach the cap (e.g. many
- *     *distinct* ok leaves with no repeats to collapse): drop the earliest-starting non-must-keep,
- *     non-marker *leaf* spans (same orphan-avoidance rule) until at the cap.
+ * Cap semantics, in order — each step only runs if the previous one left the result over the cap:
+ *  1. **Leaf-collapse**: group ok *leaf* spans (spans with children are never grouped — collapsing
+ *     one would orphan its descendants) by `(parent_span_id, service, operation)`; groups of >=2
+ *     become one synthetic "…N similar ok spans" marker.
+ *  2. **Leaf-trim**: a defensive fallback, only reachable when step 1 alone doesn't reach the cap
+ *     (e.g. many *distinct* ok leaves with no repeats to collapse): drop the earliest-starting
+ *     non-must-keep, non-marker *leaf* spans (same orphan-avoidance rule) until at the cap.
+ *  3. **Subtree-drop**: reachable when even step 2 can't reach the cap because what's left is
+ *     spans *with* children (wide-but-deep ok fan-out, or simply many collapse-markers) — drop
+ *     whole non-error subtrees, largest first, each replaced by one synthetic
+ *     "…subtree of N spans under <service>.<operation> omitted" marker parented where the
+ *     subtree's root was (see `dropOversizedSubtrees`).
+ *  4. **Error-path exception**: `mustKeep` (every `status: 'error'` span plus all of its ancestors
+ *     up to the root — the full root→leaf error path for every error branch) is never touched by
+ *     steps 1–3, so if `mustKeep` alone already exceeds `MAX_TRACE_SPANS`, no amount of
+ *     collapsing/trimming/dropping non-error spans could ever bring the result under the cap.
+ *     Error-path integrity outranks the cap: ALL of `mustKeep` is returned regardless, with
+ *     `truncated: true` and a note explaining the cap was exceeded to preserve the error path.
+ *     (Checked up front below rather than literally last — since `mustKeep` is invariant across
+ *     steps 1–3, checking early is equivalent to checking last, just without the wasted work.)
+ *
+ * Tree validity invariant maintained throughout: a span is never left in the result with its
+ * `parent_span_id` pointing at a span that got dropped — every drop (leaf-trim or subtree-drop)
+ * either removes a childless span or removes an entire subtree (root + all descendants) together.
  */
 function collapseTrace(spans: readonly Span[], errorLogs: readonly LogLine[]): TraceView {
   const bySpanId = new Map(spans.map((s) => [s.span_id, s] as const));
@@ -408,6 +427,18 @@ function collapseTrace(spans: readonly Span[], errorLogs: readonly LogLine[]): T
     }
   }
 
+  // Step 4 (documented exception), checked up front: see doc comment above.
+  if (mustKeep.size > MAX_TRACE_SPANS) {
+    const errorPathSpans = spans.filter((s) => mustKeep.has(s.span_id)).sort((a, b) => a.start_ms - b.start_ms);
+    return {
+      spans: errorPathSpans,
+      errorLogs: [...errorLogs],
+      truncated: true,
+      note: `showing ${errorPathSpans.length} of ${spans.length} spans; cap of ${MAX_TRACE_SPANS} exceeded to preserve the full error path (error spans and their ancestors are never dropped)`,
+    };
+  }
+
+  // Step 1: leaf-collapse.
   const groups = new Map<string, Span[]>();
   for (const s of spans) {
     if (mustKeep.has(s.span_id) || hasChildren.has(s.span_id)) continue;
@@ -418,14 +449,14 @@ function collapseTrace(spans: readonly Span[], errorLogs: readonly LogLine[]): T
   }
 
   const collapsedIds = new Set<string>();
-  const markers: Span[] = [];
+  const leafMarkers: Span[] = [];
   for (const group of groups.values()) {
     if (group.length < 2) continue;
     for (const s of group) collapsedIds.add(s.span_id);
     const first = group[0] as Span;
     const startMs = Math.min(...group.map((s) => s.start_ms));
     const avgDurationMs = Math.round(group.reduce((sum, s) => sum + s.duration_ms, 0) / group.length);
-    markers.push({
+    leafMarkers.push({
       trace_id: first.trace_id,
       span_id: `${COLLAPSED_SPAN_ID_PREFIX}${first.parent_span_id ?? "root"}:${first.service}:${first.operation}`,
       parent_span_id: first.parent_span_id,
@@ -438,26 +469,131 @@ function collapseTrace(spans: readonly Span[], errorLogs: readonly LogLine[]): T
     });
   }
 
-  let kept = [...spans.filter((s) => !collapsedIds.has(s.span_id)), ...markers];
+  let kept = [...spans.filter((s) => !collapsedIds.has(s.span_id)), ...leafMarkers];
 
+  // Step 2: leaf-trim (defensive fallback).
+  let trimmedCount = 0;
   if (kept.length > MAX_TRACE_SPANS) {
     const droppable = kept
       .filter((s) => !mustKeep.has(s.span_id) && !isCollapsedMarker(s) && !hasChildren.has(s.span_id))
       .sort((a, b) => a.start_ms - b.start_ms);
     const overBy = kept.length - MAX_TRACE_SPANS;
     const toDrop = new Set(droppable.slice(0, overBy).map((s) => s.span_id));
+    trimmedCount = toDrop.size;
     kept = kept.filter((s) => !toDrop.has(s.span_id));
+  }
+
+  // Step 3: subtree-drop.
+  let subtreeDroppedSpanCount = 0;
+  let subtreeMarkerCount = 0;
+  if (kept.length > MAX_TRACE_SPANS) {
+    const dropped = dropOversizedSubtrees(kept, mustKeep);
+    kept = dropped.kept;
+    subtreeDroppedSpanCount = dropped.droppedSpanCount;
+    subtreeMarkerCount = dropped.markerCount;
   }
 
   kept.sort((a, b) => a.start_ms - b.start_ms);
 
-  // Original spans no longer individually visible = every span that either got merged into a
-  // marker (`collapsedIds.size`) or was dropped by the step-3 fallback with no marker at all. Each
-  // marker is a *new* synthetic entry (not a surviving original span), so it must be added back:
-  // `spans.length - kept.length` alone undercounts by exactly `markers.length`.
-  const omitted = spans.length - kept.length + markers.length;
-  const note = `showing ${kept.length} of ${spans.length} spans (${omitted} similar ok spans collapsed across ${markers.length} group${markers.length === 1 ? "" : "s"})`;
+  const noteParts: string[] = [];
+  if (leafMarkers.length > 0) {
+    noteParts.push(
+      `${collapsedIds.size} similar ok spans collapsed across ${leafMarkers.length} group${leafMarkers.length === 1 ? "" : "s"}`,
+    );
+  }
+  if (trimmedCount > 0) {
+    noteParts.push(`${trimmedCount} oldest ok leaves omitted`);
+  }
+  if (subtreeMarkerCount > 0) {
+    noteParts.push(
+      `${subtreeDroppedSpanCount} spans across ${subtreeMarkerCount} subtree${subtreeMarkerCount === 1 ? "" : "s"} omitted`,
+    );
+  }
+  const note = `showing ${kept.length} of ${spans.length} spans${noteParts.length > 0 ? `; ${noteParts.join("; ")}` : ""}`;
   return { spans: kept, errorLogs: [...errorLogs], truncated: true, note };
+}
+
+/**
+ * Step 3 of `collapseTrace`'s cap enforcement: only reached when leaf-collapse + leaf-trim still
+ * leave `kept` over `MAX_TRACE_SPANS`. Leaf-trim removes every droppable *leaf* it can find, so
+ * anything still over the cap afterward must be a span *with* children — exactly what leaf-collapse
+ * refuses to touch (collapsing an internal node would orphan its descendants).
+ *
+ * Repeatedly finds the largest "non-error subtree" — a span `R` that is not in `mustKeep` (by
+ * `mustKeep`'s own construction — error span or ancestor of one — that means no error span exists
+ * anywhere under `R`) whose parent is either absent (`R` is the trace root) or itself in
+ * `mustKeep` (so `R` is the *topmost* droppable node on its path; a deeper non-must-keep node is
+ * left for a later iteration once its ancestor's subtree has actually been dropped) — and
+ * collapses the whole thing (root + every descendant still present) into one synthetic marker
+ * parented where `R` was. Recomputes subtree sizes each iteration, since removing one subtree can
+ * change another node's child count (e.g. its only remaining child was just dropped as a leaf).
+ * Stops at the cap, or when no droppable subtree remains (nothing left over the cap is either
+ * childless or has a non-must-keep parent still above it) — the caller may still be over the cap
+ * in that case, but nothing more can be done without violating the error-path or orphan rules.
+ */
+function dropOversizedSubtrees(
+  kept: readonly Span[],
+  mustKeep: ReadonlySet<string>,
+): { kept: Span[]; droppedSpanCount: number; markerCount: number } {
+  let current = [...kept];
+  let droppedSpanCount = 0;
+  let markerCount = 0;
+
+  while (current.length > MAX_TRACE_SPANS) {
+    const byId = new Map(current.map((s) => [s.span_id, s] as const));
+    const childrenOf = new Map<string, string[]>();
+    for (const s of current) {
+      if (s.parent_span_id === null) continue;
+      const arr = childrenOf.get(s.parent_span_id);
+      if (arr) arr.push(s.span_id);
+      else childrenOf.set(s.parent_span_id, [s.span_id]);
+    }
+    const sizeOf = (id: string): number => {
+      let total = 1;
+      for (const c of childrenOf.get(id) ?? []) total += sizeOf(c);
+      return total;
+    };
+
+    const candidates = current.filter((s) => {
+      if (mustKeep.has(s.span_id) || isCollapsedMarker(s)) return false;
+      const children = childrenOf.get(s.span_id);
+      if (!children || children.length === 0) return false; // no gain in "dropping" a childless node
+      const parentId = s.parent_span_id;
+      if (parentId === null) return true;
+      return !byId.has(parentId) || mustKeep.has(parentId);
+    });
+    if (candidates.length === 0) break;
+
+    candidates.sort((a, b) => sizeOf(b.span_id) - sizeOf(a.span_id));
+    const root = candidates[0] as Span;
+    const subtreeSize = sizeOf(root.span_id);
+
+    const toRemove = new Set<string>();
+    const stack = [root.span_id];
+    while (stack.length > 0) {
+      const id = stack.pop() as string;
+      toRemove.add(id);
+      for (const c of childrenOf.get(id) ?? []) stack.push(c);
+    }
+
+    const marker: Span = {
+      trace_id: root.trace_id,
+      span_id: `${COLLAPSED_SPAN_ID_PREFIX}subtree:${root.span_id}`,
+      parent_span_id: root.parent_span_id,
+      service: root.service,
+      operation: `…subtree of ${subtreeSize} spans under ${root.service}.${root.operation} omitted`,
+      start_ms: root.start_ms,
+      duration_ms: root.duration_ms,
+      status: "ok",
+      error_type: null,
+    };
+
+    current = [...current.filter((s) => !toRemove.has(s.span_id)), marker];
+    droppedSpanCount += subtreeSize;
+    markerCount += 1;
+  }
+
+  return { kept: current, droppedSpanCount, markerCount };
 }
 
 /**
@@ -465,6 +601,9 @@ function collapseTrace(spans: readonly Span[], errorLogs: readonly LogLine[]): T
  * linked error logs. Returns an empty, non-truncated view for an unknown `traceId` (no spans to
  * cap) — callers distinguish "no such trace" from "this trace has been truncated" via `spans`
  * being empty vs. `truncated: true`.
+ *
+ * The cap is enforced in this order: leaf-collapse → leaf-trim → subtree-drop →
+ * error-path-exception (see `collapseTrace`'s doc comment for the full detail on each step).
  */
 export async function getTrace(db: D1Database, traceId: string): Promise<TraceView> {
   const { results: spanRows } = await db

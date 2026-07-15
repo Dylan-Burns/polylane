@@ -265,7 +265,98 @@ async function seedFixture(): Promise<void> {
     },
   ];
 
-  await insertSpans(env.DB, [...cascadeSpans, ...capSpans, ...fallbackSpans, ...healthySpans]);
+  // --- Trace F: wide-but-deep ok fan-out forcing the subtree-drop pass ------------------------
+  // 4 branches x 13-deep chains of ok spans-with-children (52 spans, only the last node per chain
+  // is a true leaf) + a 3-span error path (root -> mid -> leaf), for 55 spans total. Leaf-collapse
+  // can't touch any of the 48 internal (has-children) nodes, and leaf-trim can only drop the 4
+  // true leaves — nowhere near enough to reach the 40 cap alone — so this only passes if the new
+  // subtree-drop pass (step 3) kicks in. Placed well outside every other suite's shared time
+  // window (T0..T0+30*MIN) so it can't perturb findTraces/searchLogs/listDeploys/getIncidents
+  // assertions that scan by window rather than by trace_id.
+  const wfRootStart = T0 + 40 * MIN;
+  const wideFanoutSpans: Span[] = [
+    {
+      trace_id: "trace-wide-fanout",
+      span_id: "wf-root",
+      parent_span_id: null,
+      service: "gateway",
+      operation: "POST /checkout",
+      start_ms: wfRootStart,
+      duration_ms: 900,
+      status: "error",
+      error_type: "downstream",
+    },
+    {
+      trace_id: "trace-wide-fanout",
+      span_id: "wf-error-mid",
+      parent_span_id: "wf-root",
+      service: "checkout",
+      operation: "POST /checkout",
+      start_ms: wfRootStart + 1,
+      duration_ms: 800,
+      status: "error",
+      error_type: "downstream",
+    },
+    {
+      trace_id: "trace-wide-fanout",
+      span_id: "wf-error-leaf",
+      parent_span_id: "wf-error-mid",
+      service: "payments",
+      operation: "charge",
+      start_ms: wfRootStart + 2,
+      duration_ms: 700,
+      status: "error",
+      error_type: "pool_exhausted",
+    },
+  ];
+  const WF_BRANCHES = 4;
+  const WF_DEPTH = 13;
+  for (let b = 0; b < WF_BRANCHES; b++) {
+    for (let d = 0; d < WF_DEPTH; d++) {
+      const isLeaf = d === WF_DEPTH - 1;
+      wideFanoutSpans.push({
+        trace_id: "trace-wide-fanout",
+        span_id: `wf-b${b}-${d}`,
+        parent_span_id: d === 0 ? "wf-root" : `wf-b${b}-${d - 1}`,
+        service: "catalog",
+        // Every node's parent_span_id is unique to its own branch/depth, so leaf-collapse's
+        // (parent_span_id, service, operation) grouping never finds >=2 siblings to collapse —
+        // this fixture is only reachable/testable via the subtree-drop pass.
+        operation: isLeaf ? "get_item" : `fanout_step_${d}`,
+        start_ms: wfRootStart + 10 + b * WF_DEPTH + d,
+        duration_ms: 5,
+        status: "ok",
+        error_type: null,
+      });
+    }
+  }
+  expect(wideFanoutSpans).toHaveLength(3 + WF_BRANCHES * WF_DEPTH); // 55
+
+  // --- Trace G: 45-span straight chain, leaf is the error (all 45 are error-path ancestors) ---
+  // Exercises getTrace's documented exception: mustKeep (every ancestor of the error, here the
+  // entire chain) already exceeds MAX_TRACE_SPANS on its own, so all 45 must still be returned.
+  const chainRootStart = T0 + 45 * MIN;
+  const CHAIN_LEN = 45;
+  const errorChainSpans: Span[] = Array.from({ length: CHAIN_LEN }, (_, i) => ({
+    trace_id: "trace-long-error-chain",
+    span_id: `chain-${i}`,
+    parent_span_id: i === 0 ? null : `chain-${i - 1}`,
+    service: "catalog",
+    operation: `step_${i}`,
+    start_ms: chainRootStart + i,
+    duration_ms: 5,
+    status: i === CHAIN_LEN - 1 ? "error" : "ok",
+    error_type: i === CHAIN_LEN - 1 ? "downstream" : null,
+  }));
+
+  await insertSpans(env.DB, [
+    ...cascadeSpans,
+    ...capSpans,
+    ...fallbackSpans,
+    ...healthySpans,
+    ...wideFanoutSpans,
+    ...errorChainSpans,
+  ]);
 
   const noiseLogs: LogLine[] = Array.from({ length: 60 }, (_, i) => ({
     ts_ms: T0 + i * 1000,
@@ -458,6 +549,19 @@ describe("searchLogs", () => {
 
     const small = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "catalog", level: "info", limit: 5 });
     expect(small).toHaveLength(5);
+  });
+
+  it("falls back to the default limit (50) when `limit` is NaN, rather than propagating NaN into the query", async () => {
+    // `args.limit ?? 50` doesn't catch this: NaN isn't nullish, so an explicit NaN limit would
+    // otherwise flow straight into `clampInt` and then the bound SQL parameter.
+    const logs = await searchLogs(env.DB, {
+      fromMs: T0,
+      toMs: T0 + 30 * MIN,
+      service: "catalog",
+      level: "info",
+      limit: Number.NaN,
+    });
+    expect(logs).toHaveLength(50);
   });
 });
 
