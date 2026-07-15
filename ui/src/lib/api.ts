@@ -9,9 +9,11 @@
  * return a discriminated result instead.
  */
 
+import { readSSEStream } from "./sse";
 import type {
   ChaosErrorBody,
   ChaosFaultBody,
+  ChatSSEEvent,
   FaultState,
   IncidentDetailResponse,
   IncidentListResponse,
@@ -109,4 +111,58 @@ export async function resetWorld(): Promise<ResetResult> {
   }
   const message = (body as ChaosErrorBody)?.error ?? `HTTP ${res.status}`;
   return { kind: "error", status: res.status, message };
+}
+
+// --- Chat --------------------------------------------------------------------------------------
+
+/** One turn of the client-held chat history, as `POST /api/chat` expects it (`ChatTurn` in
+ * `src/api/chat.ts`, re-declared here for the same D1-free-import reason as `lib/types.ts`'s
+ * header comment). */
+export interface ChatRequestTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/**
+ * Streams one `/api/chat` turn, POSTing `messages` and pumping the SSE response through
+ * `lib/sse.ts`'s `readSSEStream`, calling `onEvent` with each parsed `ChatSSEEvent` in order.
+ *
+ * Every failure path funnels into `onEvent` as a synthetic `{type: "error"}` event too — including
+ * the ones that never reach an SSE body at all: a `validateChatBody` 400 (a plain JSON `{error}`
+ * response, not a stream — e.g. a fabricated request that slips past client-side checks) and a
+ * network failure reaching the worker at all. This gives the panel exactly one code path to render
+ * a failure inline, matching the task brief's "400s carry specific error strings — surface them
+ * inline" — the specific string comes along for the ride either way.
+ *
+ * An `AbortSignal`, if given, aborts the underlying fetch (and, per the Fetch spec, any in-flight
+ * body read) — an `AbortError` is rethrown rather than turned into a user-facing error event, since
+ * an abort means nobody local is listening anymore either.
+ */
+export async function streamChat(messages: ChatRequestTurn[], onEvent: (event: ChatSSEEvent) => void, signal?: AbortSignal): Promise<void> {
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages }),
+    signal,
+  });
+
+  if (!res.ok) {
+    // validateChatBody rejections (and any other non-2xx) land here as plain JSON, never a stream
+    // (`src/api/chat.ts` only calls `streamSSE` once a request has cleared validation and the cap
+    // gate) — surfaced as one synthetic error event so the caller doesn't need a second code path.
+    const body = await parseBody(res);
+    const message = (body as ChaosErrorBody)?.error ?? `request failed (HTTP ${res.status})`;
+    onEvent({ type: "error", message });
+    return;
+  }
+
+  await readSSEStream(res, (raw) => {
+    let event: ChatSSEEvent;
+    try {
+      event = JSON.parse(raw) as ChatSSEEvent;
+    } catch {
+      return; // a malformed frame — drop it rather than crash the whole turn over one bad event
+    }
+    onEvent(event);
+  });
 }

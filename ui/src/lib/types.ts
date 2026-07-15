@@ -139,3 +139,16 @@ export interface ChaosErrorBody {
   error?: string;
   retryAfterMs?: number;
 }
+
+// --- /api/chat (mirrors src/api/chat.ts's ChatSSEEvent) -----------------------------------------
+// Hand-mirrored, not imported: `chat.ts` pulls in Hono/the Anthropic SDK, which the Vite project
+// never installs (same reasoning as this file's header comment for the D1-typed server modules).
+
+export type ChatSSEEvent =
+  | { type: "text_delta"; text: string }
+  | { type: "thinking" }
+  | { type: "tool_call"; name: string; summary: string }
+  | { type: "tool_result"; name: string; summary: string }
+  | { type: "budget_reached" }
+  | { type: "done" }
+  | { type: "error"; message: string };
