@@ -136,6 +136,10 @@ export function validateReport(input: unknown): Report {
  * stay fully viewable after raw telemetry expires (6h)". A fetch failure (unknown/already-expired
  * trace_id) embeds `{error}` on that entry rather than failing the whole report — one stale
  * citation must not discard an otherwise-complete investigation.
+ *
+ * Only `trace_id` is dereferenced — intended, not an omission: `metric` and `log_excerpt` are
+ * inline model-authored text (the model pastes the delta/excerpt it saw straight into the
+ * report), already self-contained with no external raw data left to fetch.
  */
 export async function embedEvidence(db: D1Database, report: Report): Promise<Report> {
   const evidence = await Promise.all(

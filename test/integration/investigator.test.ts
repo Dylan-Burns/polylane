@@ -11,6 +11,7 @@ import type {
 } from "@anthropic-ai/sdk/resources/messages";
 import type { LLM } from "../../src/agent/llm";
 import { scriptedLLM } from "../../src/agent/llm";
+import { RESUME_CONTINUE_TEXT } from "../../src/agent/investigator-do";
 import { insertSpans } from "../../src/telemetry/queries";
 import type { Span } from "../../src/telemetry/types";
 
@@ -234,11 +235,13 @@ describe("InvestigatorDO: end-to-end mock investigation", () => {
     expect(report.evidence[0].embedded.spans).toHaveLength(1);
     expect(report.evidence[0].embedded.spans[0].span_id).toBe("span-1");
 
-    // --- Conv state cleared after. ---
+    // --- Conv state cleared after; alarm quiesced (review FIX 2: a completed investigator must
+    // not heartbeat forever). ---
     await runInDurableObject(stub, async (_instance, state) => {
       expect(await state.storage.get(`conv:${incidentId}`)).toBeUndefined();
       expect(await state.storage.get(`meta:${incidentId}`)).toBeUndefined();
       expect(await state.storage.get("active")).toBeUndefined();
+      expect(await state.storage.getAlarm()).toBeNull();
     });
   });
 });
@@ -273,6 +276,7 @@ describe("InvestigatorDO: resume after a simulated death", () => {
       await state.storage.put(`meta:${incidentId}`, {
         statement: "payments p95 8x baseline",
         openedAtMs: NOW0 - 60_000,
+        runId: "run-resume-1",
         nextStepNo: 3,
         iterations: 1,
         tokensIn: 1500,
@@ -317,6 +321,54 @@ describe("InvestigatorDO: resume after a simulated death", () => {
       expect(await state.storage.get("active")).toBeUndefined();
     });
   });
+
+  it("a snapshot ending in a COMPLETE assistant turn resumes with a neutral 'continue' user message, not an assistant prefill", async () => {
+    const incidentId = "inc-resume-tail-1";
+    await insertIncident(incidentId, "investigating", NOW0 - 30_000);
+
+    const stub = env.INVESTIGATOR.get(env.INVESTIGATOR.idFromName("test-resume-tail-1"));
+
+    // Died right after snapshotting a tool_use-free assistant turn (e.g. an end_turn the loop
+    // never got to react to): the transcript's tail is assistant-final -- review minor: replaying
+    // that verbatim would be an instruction to CONTINUE generating that same turn (prefill).
+    const preCrashConv: MessageParam[] = [
+      { role: "user", content: [{ type: "text", text: "Anomaly detected: catalog latency" }] },
+      { role: "assistant", content: [{ type: "text", text: "I believe the investigation is complete." }] as unknown as ContentBlockParam[] },
+    ];
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put("active", incidentId);
+      await state.storage.put(`conv:${incidentId}`, preCrashConv);
+      await state.storage.put(`meta:${incidentId}`, {
+        statement: "catalog latency",
+        openedAtMs: NOW0 - 30_000,
+        runId: "run-resume-tail-1",
+        nextStepNo: 1,
+        iterations: 0,
+        tokensIn: 0,
+        tokensOut: 0,
+        elapsedMs: 0,
+      });
+    });
+
+    const r1 = makeMessage({ content: [toolUse("rt-1", "submit_report", GOOD_REPORT_NO_EVIDENCE)], stop_reason: "tool_use" });
+    const llm = scriptedLLM([r1]);
+
+    await runInDurableObject(stub, async (instance) => {
+      instance.setTestNow(NOW0);
+      instance.llmFactory = () => llm;
+      await instance.alarm();
+    });
+
+    // The resumed request's last message is the neutral user turn -- roles alternate correctly.
+    const messages = llm.requests[0]?.messages ?? [];
+    const lastMsg = messages[messages.length - 1];
+    expect(lastMsg?.role).toBe("user");
+    const lastText = ((lastMsg?.content as ContentBlockParam[] | undefined)?.[0] as { text?: string } | undefined)?.text;
+    expect(lastText).toBe(RESUME_CONTINUE_TEXT);
+
+    expect((await getIncident(incidentId))?.status).toBe("reported");
+  });
 });
 
 describe("InvestigatorDO: guarded report write", () => {
@@ -331,6 +383,7 @@ describe("InvestigatorDO: guarded report write", () => {
       await state.storage.put(`meta:${incidentId}`, {
         statement: "anomaly",
         openedAtMs: NOW0 - 30_000,
+        runId: "run-guarded-1",
         nextStepNo: 1,
         iterations: 0,
         tokensIn: 0,
@@ -432,6 +485,87 @@ describe("InvestigatorDO: /start, /abort lifecycle", () => {
     });
     expect(startC.status).toBe(202);
     expect((await getIncident(incidentC))?.status).toBe("investigating");
+  });
+});
+
+describe("InvestigatorDO: cooperative abort mid-run", () => {
+  it("/abort during an in-flight model call stops the loop within one iteration: no further model calls, no salvage, step rows bounded to the in-flight iteration + abort marker, incident failed with the abort reason", async () => {
+    const incidentId = "inc-coop-abort-1";
+    await insertIncident(incidentId, "open", NOW0 - 10_000);
+
+    const stub = env.INVESTIGATOR.get(env.INVESTIGATOR.idFromName("test-coop-abort-1"));
+
+    // The script deliberately holds MORE responses than an aborted loop may consume (a second
+    // tool turn + a salvage-shaped submit_report): the request-count assertion below proves the
+    // loop stopped after the one in-flight call instead of continuing into them.
+    const r1 = makeMessage({
+      content: [toolUse("ca-1", "query_metrics", { service: "payments", operation: null, metrics: null, window: null, step: null })],
+      stop_reason: "tool_use",
+    });
+    const r2 = makeMessage({
+      content: [toolUse("ca-2", "search_logs", { service: "payments", level: "error", contains: null, window: null, limit: null })],
+      stop_reason: "tool_use",
+    });
+    const wouldBeSalvage = makeMessage({ content: [toolUse("ca-3", "submit_report", GOOD_REPORT_NO_EVIDENCE)], stop_reason: "tool_use" });
+    const script = scriptedLLM([r1, r2, wouldBeSalvage]);
+
+    await runInDurableObject(stub, async (instance) => {
+      instance.setTestNow(NOW0);
+      const wrapped: LLM = {
+        create: async (params, timeoutMs) => {
+          if (script.requests.length === 0) {
+            // /abort lands while the FIRST model call is in flight -- a direct instance.fetch,
+            // exactly the request api/chaos.ts's reset path sends.
+            const res = await instance.fetch(
+              new Request("http://investigator/abort", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ reason: "abort mid-run" }),
+              }),
+            );
+            if (res.status !== 202) throw new Error(`abort unexpectedly returned ${res.status}`);
+          }
+          return script.create(params, timeoutMs);
+        },
+      };
+      instance.llmFactory = () => wrapped;
+    });
+
+    const startRes = await stub.fetch("http://investigator/start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ incidentId, statement: "payments error_rate 24% vs baseline 0.3%" }),
+    });
+    expect(startRes.status).toBe(202);
+
+    await runInDurableObject(stub, async (instance) => {
+      await instance.alarm();
+    });
+
+    // Exactly ONE model call -- the one already in flight when /abort landed. No second
+    // iteration, and critically NO salvage call (no request ever carried a forced tool_choice).
+    expect(script.requests).toHaveLength(1);
+    expect(script.requests[0]?.tool_choice).toBeUndefined();
+
+    // The incident carries /abort's OWN failure reason -- the cancelled loop wrote nothing over it.
+    const incident = await getIncident(incidentId);
+    expect(incident?.status).toBe("failed");
+    expect(JSON.parse(incident?.report_json ?? "{}")).toEqual({ failure_reason: "abort mid-run" });
+
+    // Step rows bounded: the in-flight iteration's tool_call/tool_result, then the abort marker
+    // as the FINAL row -- nothing accrues afterwards.
+    const steps = await getSteps(incidentId);
+    expect(steps.map((s) => s.kind)).toEqual(["tool_call", "tool_result", "error"]);
+    expect(JSON.parse(steps[2]?.content_json ?? "{}")).toEqual({ message: "aborted" });
+
+    // Full terminal cleanup: conv/meta/active/cancelled gone, alarm quiesced (review FIX 2).
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(await state.storage.get(`conv:${incidentId}`)).toBeUndefined();
+      expect(await state.storage.get(`meta:${incidentId}`)).toBeUndefined();
+      expect(await state.storage.get("active")).toBeUndefined();
+      expect(await state.storage.get("cancelled")).toBeUndefined();
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
   });
 });
 

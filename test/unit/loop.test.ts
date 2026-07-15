@@ -551,6 +551,36 @@ describe("runLoop", () => {
     expect(result.steps.some((s) => s.kind === "note" && (s.content as { update: string }).update === "checkout p95 now 9x baseline")).toBe(true);
   });
 
+  it("[6b] shouldAbort true at an iteration top -> outcome failed with an 'aborted' error step, NO salvage call", async () => {
+    const r1 = makeMessage({ content: [toolUse("c1", "query_metrics", { service: null, operation: null, metrics: null, window: null, step: null })], stop_reason: "tool_use" });
+    // Only ONE scripted response: if the abort path incorrectly attempted a salvage call, the
+    // script would run dry and the failure reason would say "scriptedLLM", not "aborted".
+    const llm = scriptedLLM([r1]);
+
+    let checks = 0;
+    const cfg: LoopConfig = {
+      llm,
+      model: "claude-sonnet-5",
+      system: [{ type: "text", text: "sys" }],
+      tools: TOOLS,
+      executeTool: async () => ({ ok: true }),
+      caps: baseCaps(),
+      submitReportTool: SUBMIT_REPORT,
+      shouldAbort: async () => {
+        checks += 1;
+        return checks >= 2; // false at iteration 1's top, true at iteration 2's
+      },
+      nowFn: () => NOW0,
+    };
+
+    const result = await runLoop(cfg, INITIAL_MESSAGES);
+
+    expect(result.outcome).toBe("failed");
+    expect(llm.requests).toHaveLength(1); // the in-flight iteration only -- no second call, no salvage
+    expect(result.steps.map((s) => s.kind)).toEqual(["tool_call", "tool_result", "error"]);
+    expect(result.steps[2]?.content).toEqual({ message: "aborted" });
+  });
+
   it("[7] chat mode (no submitReportTool): end_turn with text -> outcome text", async () => {
     const r1 = makeMessage({ content: [text("The checkout error rate returned to baseline at 14:45Z.")], stop_reason: "end_turn" });
     const llm = scriptedLLM([r1]);

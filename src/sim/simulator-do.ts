@@ -246,10 +246,15 @@ export class SimulatorDO extends DurableObject<Env> {
    * after a partial failure — the wipe re-runs harmlessly, and the gated transition below re-checks
    * the generation so a superseding reset makes this one a no-op.
    *
-   * Investigation-abort and the telemetry wipe are not `ctx.storage` operations, so they run
-   * outside the input gate (spec §6: "DO input gates do not protect across D1/fetch awaits").
-   * That's safe: worldStatus is 'resetting' throughout, so no tick/backfill can run concurrently,
-   * and a competing /reset is rejected (non-wedged in-progress state) until this reaches 'seeding'.
+   * The telemetry wipe is not a `ctx.storage` operation, so it runs outside the input gate
+   * (spec §6: "DO input gates do not protect across D1/fetch awaits"). That's safe: worldStatus
+   * is 'resetting' throughout, so no tick/backfill can run concurrently, and a competing /reset
+   * is rejected (non-wedged in-progress state) until this reaches 'seeding'.
+   *
+   * Investigation aborting deliberately does NOT live here (spec §6: fault state lives in
+   * SimulatorDO storage only, telemetry writes live in D1 — this DO never mixes the two):
+   * `api/chaos.ts`'s `handleAdminReset` fails active incidents in D1 and calls InvestigatorDO's
+   * `/abort` once a reset is confirmed underway (Task 4.2).
    */
   private async advanceReset(): Promise<void> {
     const pending = await this.ctx.storage.get<PendingReset>("pendingReset");
@@ -260,7 +265,6 @@ export class SimulatorDO extends DurableObject<Env> {
       return;
     }
 
-    await this.abortActiveInvestigation();
     await this.wipeTelemetryTables();
 
     await this.ctx.blockConcurrencyWhile(async () => {
@@ -299,14 +303,6 @@ export class SimulatorDO extends DurableObject<Env> {
       this.env.DB.prepare("DELETE FROM rollups"),
       this.env.DB.prepare("DELETE FROM deploys"),
     ]);
-  }
-
-  private async abortActiveInvestigation(): Promise<void> {
-    // TODO(Task 3.3/4.2): once InvestigatorDO tracks an active investigation, fail it here via an
-    // INVESTIGATOR fetch (spec §6: "mark any active investigation failed ('world reset', partial
-    // timeline preserved)"). No-op today — InvestigatorDO is still the Task-1.4-era 501 stub with
-    // no investigation state to abort; this task's controller resolution explicitly defers the
-    // wiring to those later tasks.
   }
 
   /**

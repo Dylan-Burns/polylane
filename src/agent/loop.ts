@@ -94,6 +94,13 @@ export interface LoopConfig {
   /** Undelivered detector updates, checked once per iteration; a non-null return is injected as a
    * user message (prefixed `"detector update: "`) immediately before the next model call. */
   checkUpdates?: () => Promise<string | null>;
+  /** Cooperative cancellation (Task 4.2 review FIX 1): checked once at the top of every
+   * iteration, BEFORE the cap check and the model call. A `true` return ends the loop immediately
+   * with outcome `'failed'` and a final `error` step `{message: "aborted"}` — and deliberately
+   * WITHOUT the salvage epilogue: cancellation means the caller no longer wants a report at all
+   * (e.g. the incident was already force-failed by `/abort` or a world reset), so spending one
+   * more model call to conclude would be pure waste against a world that no longer exists. */
+  shouldAbort?: () => Promise<boolean>;
   /** No `Date.now()` anywhere in this module — every timestamp and every wall-clock comparison
    * goes through this. */
   nowFn: () => number;
@@ -386,6 +393,14 @@ export async function runLoop(cfg: LoopConfig, initialMessages: MessageParam[]):
 
   try {
     while (true) {
+      // --- Cooperative cancellation, before anything else -- even before the cap check, since
+      // an aborted investigation must not fall into the salvage path either (see
+      // `LoopConfig.shouldAbort`'s doc comment). ----------------------------------------------
+      if (cfg.shouldAbort && (await cfg.shouldAbort())) {
+        await record("error", { message: "aborted" });
+        return { outcome: "failed", steps, usage: usage() };
+      }
+
       // --- Cap check, before doing anything else this iteration ---------------------------
       const elapsedMs = cfg.nowFn() - startMs;
       if (
