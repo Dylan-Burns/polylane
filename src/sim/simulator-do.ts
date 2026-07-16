@@ -163,6 +163,14 @@ export class SimulatorDO extends DurableObject<Env> {
     }
 
     return this.ctx.blockConcurrencyWhile(async () => {
+      // Chaos requires a running world: `handleReset` clears `fault` and the seeding backfill can
+      // outlive the 30s chaos cooldown, so without this gate a direct POST mid-seed would be
+      // silently accepted and the fault would sit invisibly until the world flipped to running
+      // (found by the Task 7.1 break-it pass — the UI disables its buttons during seeding, but the
+      // API surface must reject on its own).
+      const worldStatus = (await this.ctx.storage.get<WorldStatus>("worldStatus")) ?? "unseeded";
+      if (worldStatus !== "running") return jsonResponse({ error: "world_not_ready", worldStatus }, 409);
+
       const fault = (await this.ctx.storage.get<FaultState>("fault")) ?? null;
       if (fault !== null) return jsonResponse({ error: "scenario_active" }, 409);
 

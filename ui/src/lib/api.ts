@@ -72,6 +72,7 @@ export function getTrace(traceId: string): Promise<TraceView> {
 export type ChaosResult =
   | { kind: "ok"; fault: FaultState }
   | { kind: "scenario_active" }
+  | { kind: "world_not_ready" }
   | { kind: "cooldown"; retryAfterMs: number }
   | { kind: "error"; status: number; message: string };
 
@@ -79,7 +80,11 @@ async function postChaos(path: string): Promise<ChaosResult> {
   const res = await fetch(path, { method: "POST" });
   const body = await parseBody(res);
   if (res.status === 200) return { kind: "ok", fault: (body as ChaosFaultBody).fault };
-  if (res.status === 409) return { kind: "scenario_active" };
+  // Both are 409s from SimulatorDO — disambiguated by the error string (a click can race the
+  // world into seeding after the disabled-button check passed).
+  if (res.status === 409) {
+    return (body as ChaosErrorBody)?.error === "world_not_ready" ? { kind: "world_not_ready" } : { kind: "scenario_active" };
+  }
   if (res.status === 429) {
     return { kind: "cooldown", retryAfterMs: (body as ChaosErrorBody)?.retryAfterMs ?? 30_000 };
   }
