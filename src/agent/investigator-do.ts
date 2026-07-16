@@ -352,7 +352,16 @@ export class InvestigatorDO extends DurableObject<Env> {
     const system = buildInvestigatorSystemPrompt({ incidentId, statement: meta.statement, openedAtMs: meta.openedAtMs });
     const llm = this.llmFactory(this.env);
     const callStartMs = this.now();
+    // Captured ONCE before the loop: `runLoop`'s counters are attempt-local (they restart at zero
+    // every resume), so persisted totals must be prior + attempt-cumulative. These must be the
+    // frozen priors, not the evolving `meta` inside onStep — stepCtx values are themselves
+    // cumulative within the attempt, and summing against a per-step-reassigned `meta` would
+    // compound. Without this, a SECOND eviction re-granted attempt 1's entire step/token spend
+    // (only elapsedMs accumulated correctly).
     const priorElapsedMs = meta.elapsedMs;
+    const priorIterations = meta.iterations;
+    const priorTokensIn = meta.tokensIn;
+    const priorTokensOut = meta.tokensOut;
 
     const caps: LoopCaps = {
       maxSteps: Math.max(0, MAX_STEPS - meta.iterations),
@@ -397,9 +406,9 @@ export class InvestigatorDO extends DurableObject<Env> {
       meta = {
         ...meta,
         nextStepNo: dbStepNo + 1,
-        iterations: stepCtx.iterations,
-        tokensIn: stepCtx.usage.in,
-        tokensOut: stepCtx.usage.out,
+        iterations: priorIterations + stepCtx.iterations,
+        tokensIn: priorTokensIn + stepCtx.usage.in,
+        tokensOut: priorTokensOut + stepCtx.usage.out,
         elapsedMs: priorElapsedMs + (this.now() - callStartMs),
       };
       if (!cancelled) {

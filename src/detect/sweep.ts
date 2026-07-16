@@ -107,7 +107,8 @@ function parseInvestigationRateState(raw: string | undefined, nowMs: number): In
 
 /**
  * Fixed-window (not sliding) <= 10/hour guard on starting new investigations, persisted in `meta`
- * under `investigation_count_hour`. Returns `true` (and consumes one slot) iff under budget.
+ * under `investigation_count_hour`. Read here (window-folded); consumed in `startInvestigation`
+ * only after a successful `/start`.
  *
  * **Known limitation (accepted)**: a plain read-then-write, not a SQL-level atomic increment. It
  * is correct as long as two sweep runs never interleave — Cloudflare does not overlap a Worker's
@@ -118,37 +119,79 @@ function parseInvestigationRateState(raw: string | undefined, nowMs: number): In
  * a one-tick start delay), never a correctness break — so no locking/CAS is layered on for this
  * project.
  */
-async function tryConsumeInvestigationBudget(db: D1Database, nowMs: number): Promise<boolean> {
+async function readInvestigationRateState(db: D1Database, nowMs: number): Promise<InvestigationRateState> {
   const row = await db.prepare(`SELECT value FROM meta WHERE key = ?`).bind(INVESTIGATION_BUDGET_META_KEY).first<{ value: string }>();
-  let state = parseInvestigationRateState(row?.value, nowMs);
+  const state = parseInvestigationRateState(row?.value, nowMs);
   if (nowMs - state.windowStartMs >= INVESTIGATION_RATE_WINDOW_MS) {
-    state = { windowStartMs: nowMs, count: 0 };
+    return { windowStartMs: nowMs, count: 0 };
   }
-  if (state.count >= INVESTIGATION_RATE_LIMIT) return false;
-
-  state.count += 1;
-  await db
-    .prepare(`REPLACE INTO meta (key, value) VALUES (?, ?)`)
-    .bind(INVESTIGATION_BUDGET_META_KEY, JSON.stringify(state))
-    .run();
-  return true;
+  return state;
 }
 
-/** Best-effort notification of `env.INVESTIGATOR`'s singleton stub — fire-and-forget: `/start`
- * returns as soon as `InvestigatorDO` has durably recorded the investigation and armed its alarm
- * (Task 4.2), well before the loop itself runs, so this call is fast regardless of how long the
- * investigation ends up taking. A thrown fetch (DO unreachable) is caught and logged, never
- * allowed to fail the sweep. */
-async function notifyInvestigator(env: Env, incidentId: string, anomalies: readonly Anomaly[]): Promise<void> {
-  const statement = anomalies.map((a) => a.statement).join(" | ");
+/** Notifies `env.INVESTIGATOR`'s singleton stub and reports whether the investigation actually
+ * STARTED: `/start` 409s (`investigation_active`) while another investigation holds the DO — up
+ * to its 4-minute wall budget — and treating that as "notified" silently orphaned the incident
+ * (the budget slot burned, the timeline stayed empty, and no later sweep retried; the ordinary
+ * restore-A-then-inject-B demo flow hit this). A thrown fetch (DO unreachable) is the same
+ * outcome as a rejection: not started. Never allowed to fail the sweep. */
+async function notifyInvestigator(env: Env, incidentId: string, statement: string): Promise<boolean> {
   try {
-    await investigatorStub(env).fetch("http://investigator/start", {
+    const res = await investigatorStub(env).fetch("http://investigator/start", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ incidentId, statement }),
     });
+    if (!res.ok) {
+      console.warn(`sweep: INVESTIGATOR /start rejected for incident ${incidentId} (HTTP ${res.status})`);
+      return false;
+    }
+    return true;
   } catch (err) {
     console.error(`sweep: failed to notify INVESTIGATOR for incident ${incidentId}`, err);
+    return false;
+  }
+}
+
+type StartOutcome = "started" | "budget" | "busy";
+
+/** The one place an investigation is started: budget peeked FIRST (never start over budget), the
+ * slot consumed only AFTER `/start` succeeds — a 409-busy or unreachable DO no longer burns one of
+ * the 10 hourly slots for an investigation that never ran. Peek-then-consume shares
+ * `tryConsume`-style read-modify-write semantics and the same accepted cron-vs-cron race (see the
+ * fixed-window doc above); sweeps are single-flight in practice. */
+async function startInvestigation(env: Env, incidentId: string, statement: string, nowMs: number): Promise<StartOutcome> {
+  const state = await readInvestigationRateState(env.DB, nowMs);
+  if (state.count >= INVESTIGATION_RATE_LIMIT) return "budget";
+  const started = await notifyInvestigator(env, incidentId, statement);
+  if (!started) return "busy";
+  state.count += 1;
+  await env.DB
+    .prepare(`REPLACE INTO meta (key, value) VALUES (?, ?)`)
+    .bind(INVESTIGATION_BUDGET_META_KEY, JSON.stringify(state))
+    .run();
+  return "started";
+}
+
+/** The visible why-is-this-timeline-empty note for a deferred start (budget exhausted or
+ * investigator busy) — written ONCE, on the incident's creation tick; the retry subtask stays
+ * silent until it succeeds. Best-effort: a failure to write the note must not fail the sweep. */
+async function recordDeferredNote(db: D1Database, incidentId: string, outcome: Exclude<StartOutcome, "started">, nowMs: number): Promise<void> {
+  const note =
+    outcome === "budget"
+      ? "Investigation deferred — the hourly investigation budget (10/hour) is exhausted. The incident is recorded; the sweep retries automatically once the budget window resets."
+      : "Investigation deferred — the investigator is busy with another incident. The incident is recorded; the sweep retries automatically once the investigator is free.";
+  try {
+    await insertInvestigationStep(db, {
+      incidentId,
+      stepNo: 0,
+      kind: "note",
+      contentJson: JSON.stringify({ note }),
+      tsMs: nowMs,
+      tokensIn: 0,
+      tokensOut: 0,
+    });
+  } catch (err) {
+    console.error(`sweep: failed to record deferred note for incident ${incidentId}`, err);
   }
 }
 
@@ -188,30 +231,14 @@ async function runDetection(env: Env, nowMs: number): Promise<void> {
 
   const { id, created } = await openIncident(env.DB, anomalies, nowMs);
   if (created) {
-    const allowed = await tryConsumeInvestigationBudget(env.DB, nowMs);
-    if (allowed) {
-      await notifyInvestigator(env, id, anomalies);
-    } else {
-      // Budget kill-switch (Task 7.1): the incident still opens and is visible, but no investigator
-      // runs this hour. Record a `note` step so the incident detail timeline shows WHY it has no
-      // investigation ("deferred — budget") rather than sitting silently empty. Best-effort: a
-      // failure to write the note must not fail the sweep.
-      console.warn(`sweep: investigation budget exhausted this hour, not starting investigator for incident ${id}`);
-      try {
-        await insertInvestigationStep(env.DB, {
-          incidentId: id,
-          stepNo: 0,
-          kind: "note",
-          contentJson: JSON.stringify({
-            note: "Investigation deferred — the hourly investigation budget (10/hour) is exhausted. The incident is recorded; an investigation will run once the budget window resets.",
-          }),
-          tsMs: nowMs,
-          tokensIn: 0,
-          tokensOut: 0,
-        });
-      } catch (err) {
-        console.error(`sweep: failed to record budget-deferred note for incident ${id}`, err);
-      }
+    const statement = anomalies.map((a) => a.statement).join(" | ");
+    const outcome = await startInvestigation(env, id, statement, nowMs);
+    if (outcome !== "started") {
+      // Deferred start (budget kill-switch — Task 7.1 — or investigator busy): the incident still
+      // opens and is visible, with a note explaining WHY its timeline is empty; the
+      // `retryDeferredInvestigations` subtask picks it up on later sweeps.
+      console.warn(`sweep: investigation deferred (${outcome}) for incident ${id}`);
+      await recordDeferredNote(env.DB, id, outcome, nowMs);
     }
   } else {
     await appendFingerprints(env.DB, id, anomalies, nowMs);
@@ -261,6 +288,51 @@ async function maybeRecomputeBaselines(env: Env, nowMs: number): Promise<void> {
  * actually fired" timestamp); every test calls this with an explicit `nowMs` for determinism. Never
  * throws — see the file doc comment for the five subtasks and their individual try/catch isolation.
  */
+/** How old an `open` incident must be before the retry subtask attempts its start — excludes the
+ * incident created THIS tick (it already got its attempt in `runDetection`). */
+const RETRY_START_MIN_AGE_MS = 30_000;
+
+/** Rebuilds the `/start` statement from a persisted `trigger_json` — the sweep-written
+ * `{statements, anomalies}` shape (`incidents.ts`'s `buildTrigger`); returns null for anything
+ * else (a shape with no statements has nothing to brief the investigator with). */
+function statementFromTrigger(triggerJson: string): string | null {
+  try {
+    const trigger = JSON.parse(triggerJson) as { statements?: unknown };
+    if (Array.isArray(trigger.statements)) {
+      const statements = trigger.statements.filter((s): s is string => typeof s === "string");
+      if (statements.length > 0) return statements.join(" | ");
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Subtask: start deferred investigations. An incident that couldn't start when it opened (budget
+ * exhausted, or the investigator busy with an earlier incident's up-to-4-minute run) previously
+ * stayed `open` with an empty timeline FOREVER — nothing ever retried. `status = 'open'` is the
+ * reliable "never started" marker (`InvestigatorDO`'s `/start` flips it to `investigating`
+ * synchronously before returning 200), and a successful late start behaves exactly like an
+ * on-time one. Budget-gated per attempt; a `budget` outcome stops the pass (no slot for anyone). */
+async function retryDeferredInvestigations(env: Env, nowMs: number): Promise<void> {
+  const { results } = await env.DB
+    .prepare(`SELECT id, trigger_json FROM incidents WHERE status = 'open' AND opened_at <= ? ORDER BY opened_at ASC`)
+    .bind(nowMs - RETRY_START_MIN_AGE_MS)
+    .all<{ id: string; trigger_json: string }>();
+  for (const row of results ?? []) {
+    const statement = statementFromTrigger(row.trigger_json);
+    if (statement === null) continue; // un-briefable trigger shape (e.g. hand-seeded) — leave it
+    const outcome = await startInvestigation(env, row.id, statement, nowMs);
+    if (outcome === "started") {
+      console.log(`sweep: deferred investigation started for incident ${row.id}`);
+    } else if (outcome === "budget") {
+      return; // no slots left this window — later incidents can't start either
+    }
+    // "busy": the investigator is still occupied — silent (the creation-tick note already
+    // explains the empty timeline); next sweep retries.
+  }
+}
+
 export async function runSweep(env: Env, nowMs: number = Date.now()): Promise<void> {
   let worldRunning = false;
   try {
@@ -274,6 +346,12 @@ export async function runSweep(env: Env, nowMs: number = Date.now()): Promise<vo
     await runDetection(env, nowMs);
   } catch (err) {
     console.error("sweep: detection subtask failed", err);
+  }
+
+  try {
+    await retryDeferredInvestigations(env, nowMs);
+  } catch (err) {
+    console.error("sweep: deferred-investigation retry subtask failed", err);
   }
 
   try {

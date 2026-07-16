@@ -26,11 +26,10 @@
  *    everything that reaches the system prompt was read by the SERVER from its own database while
  *    the client-held history stays untrusted plain text, same as ever.
  *  - Two cost guardrails, both backed by the `meta` key/value table: a global `chat_turns_hour`
- *    counter (<= 60/hour; the fixed-window pattern from `detect/sweep.ts`'s
- *    `tryConsumeInvestigationBudget`, with its documented accepted race — **TEMPORARILY DISABLED
- *    as of 2026-07-16 by operator request**: the enforcement block in `tryEnterChatTurn` is
- *    commented out, so until it is restored the concurrency lease and per-turn caps below are the
- *    only spend controls on this endpoint) and <= 2 concurrent SSE
+ *    counter (<= 60/hour; the fixed-window pattern from `detect/sweep.ts`'s investigation budget,
+ *    with its documented accepted race — briefly disabled on 2026-07-16, restored the same day:
+ *    an unauthenticated endpoint must keep a cumulative hourly ceiling, not just per-turn caps;
+ *    raise CHAT_TURNS_LIMIT rather than removing the gate if demo use trips it) and <= 2 concurrent SSE
  *    slots held as expiring LEASES (`chat_sse_lease:<uuid>` rows; atomic count-gated acquisition —
  *    see `tryAcquireConcurrentSSESlot` for both the atomicity and the self-heal rationale). A
  *    lease is acquired right before a turn's stream opens and ALWAYS released in a `finally`

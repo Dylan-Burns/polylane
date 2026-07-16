@@ -40,6 +40,7 @@
  */
 
 import type { Report, ReportEvidenceEntry, ReportTimelineEntry } from "../agent/report-schema";
+import type { Anomaly } from "../detect/rules";
 import type { Deploy, LogLine, MetricPoint, Span, TraceSummary, TraceView } from "../telemetry/types";
 
 // All inserts below use INSERT OR IGNORE on deterministic ids/PKs: the final backfill chunk can
@@ -76,7 +77,10 @@ export interface SeedStory {
   openedAtMs: number;
   reportedAtMs: number;
   resolvedAtMs: number;
-  trigger: { statement: string; fingerprints: string[]; detected_at_ms: number };
+  /** The CANONICAL live shape (`incidents.ts`'s `buildTrigger`: `{statements, anomalies}`) — the
+   * metrics-tile route and the UI trigger line parse only this dialect, so the seeded incident
+   * must speak it too (Task 5.2's byte-for-byte schema-fidelity contract). */
+  trigger: { statements: string[]; anomalies: Anomaly[] };
   /** RAW (pre-embed) report — what `submit_report` would have carried, and what the `report`-kind
    * step's `content` holds. Passes `agent/report-schema.ts`'s `validateReport` unchanged. */
   report: Report;
@@ -249,11 +253,40 @@ export function buildSeedStory(nowMs: number): SeedStory {
     evidence: report.evidence.map((entry) => (entry.trace_id === null ? entry : { ...entry, embedded: embeddedTrace })),
   };
 
+  // The same {statements, anomalies} dialect `buildTrigger` persists for live incidents — the
+  // metric-tile route (`tileAnomalies`) and the UI's trigger line read no other shape.
+  const anomalies: Anomaly[] = [
+    {
+      fingerprint: "payments:errors",
+      service: "payments",
+      metricClass: "errors",
+      rule: "sustained",
+      value: 0.241,
+      baseline: 0.003,
+      statement: "payments error_rate 24.1% vs baseline 0.3% (sustained 3 consecutive minutes)",
+    },
+    {
+      fingerprint: "payments:latency",
+      service: "payments",
+      metricClass: "latency",
+      rule: "sustained",
+      value: 578,
+      baseline: 92,
+      statement: "payments p95 578ms vs baseline 92ms (sustained 3 consecutive minutes)",
+    },
+    {
+      fingerprint: "checkout:errors",
+      service: "checkout",
+      metricClass: "errors",
+      rule: "sustained",
+      value: 0.061,
+      baseline: 0.002,
+      statement: "checkout error_rate 6.1% vs baseline 0.2% (sustained 3 consecutive minutes)",
+    },
+  ];
   const trigger = {
-    statement:
-      "payments error rate 24.1% (baseline 0.3%), p95 latency 578ms (baseline 92ms); sustained 3 consecutive minutes",
-    fingerprints: ["payments:errors", "payments:latency", "checkout:errors"],
-    detected_at_ms: openedAtMs,
+    statements: anomalies.map((a) => a.statement),
+    anomalies,
   };
 
   // --- Tool call/result steps: real `agent/tools.ts` tool names, schema-shaped input, and
@@ -431,12 +464,12 @@ export async function insertSeededIncident(db: D1Database, nowMs: number): Promi
     )
     .run();
 
-  const fingerprintStatements = story.trigger.fingerprints.map((fingerprint) =>
+  const fingerprintStatements = story.trigger.anomalies.map((anomaly) =>
     db
       .prepare(
         `INSERT OR IGNORE INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES (?, ?, ?, 1)`,
       )
-      .bind(story.incidentId, fingerprint, story.openedAtMs),
+      .bind(story.incidentId, anomaly.fingerprint, story.openedAtMs),
   );
 
   const stepStatements = story.steps.map((step, i) =>
@@ -449,4 +482,34 @@ export async function insertSeededIncident(db: D1Database, nowMs: number): Promi
   );
 
   await db.batch([...fingerprintStatements, ...stepStatements]);
+
+  // --- Narrative-consistent rollups: the backfill writes only HEALTHY minutes (identityEffects),
+  // so without this the metric-evidence tiles on the one incident every first-time visitor opens
+  // would chart flat baseline data directly under a report narrating a 24.1% error spike — worse
+  // than no tiles at all. Elevate the already-backfilled rollup rows across the story's fault
+  // window ("degrading … for roughly six minutes before rollback"): payments errors + p95, and
+  // the checkout error cascade, exactly the three trigger anomalies. UPDATEs on existing rows —
+  // the row count, and therefore the write budget, is unchanged; the elevated window also makes
+  // the agent's own query_metrics/chat answers coherent with the seeded story. Baselines are
+  // trailing-24h MEDIANS (median/MAD are robust), so six elevated minutes out of 24h cannot
+  // meaningfully move them, and detection anchors on the newest minute — 3h-old data never trips.
+  const onsetMs = story.deployMs + 30_000;
+  const faultFromMinute = Math.floor(onsetMs / 60_000) * 60_000;
+  const faultToMinute = faultFromMinute + 6 * 60_000;
+  await db.batch([
+    db
+      .prepare(
+        `UPDATE rollups
+         SET error_count = CAST(ROUND(count * 0.241) AS INTEGER), p95_ms = 578, p99_ms = MAX(p99_ms, 840)
+         WHERE service = 'payments' AND minute_ts >= ? AND minute_ts < ?`,
+      )
+      .bind(faultFromMinute, faultToMinute),
+    db
+      .prepare(
+        `UPDATE rollups
+         SET error_count = CAST(ROUND(count * 0.061) AS INTEGER)
+         WHERE service = 'checkout' AND minute_ts >= ? AND minute_ts < ?`,
+      )
+      .bind(faultFromMinute, faultToMinute),
+  ]);
 }

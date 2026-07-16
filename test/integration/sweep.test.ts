@@ -9,7 +9,7 @@ import { seedForWindow } from "../../src/sim/backfill";
 import { generateWindow, rollupFromStats } from "../../src/sim/generator";
 import { mulberry32 } from "../../src/sim/rng";
 import { effectsFor, identityEffects, type FaultState } from "../../src/sim/scenarios";
-import { openIncident } from "../../src/telemetry/incidents";
+import { openIncident, setStatus } from "../../src/telemetry/incidents";
 import { insertRollups } from "../../src/telemetry/queries";
 import type { RollupRow } from "../../src/telemetry/types";
 
@@ -70,16 +70,28 @@ interface RecordedStart {
 
 /** A mock INVESTIGATOR `DurableObjectNamespace`: `idFromName`/`get` are the only two methods
  * `sweep.ts` calls, so only those are implemented for real — every `/start` POST is recorded and
- * answered like the real Task-1.4-era stub (501), matching `sweep.ts`'s "any response counts as
- * notified" contract. */
-function makeMockInvestigator(recorded: RecordedStart[]): DurableObjectNamespace {
+ * answered per the REAL DO's contract: 200 + the synchronous `open → investigating` status flip
+ * (`InvestigatorDO.handleStart` does both before returning), which is what the sweep's deferred
+ * retry keys on. `rejectFirst` makes the first call answer 409 `investigation_active` instead —
+ * the "busy with another incident" case; `alwaysReject` holds that state forever (an investigator
+ * occupied for the whole test, so incidents legitimately stay `open`). */
+function makeMockInvestigator(
+  recorded: RecordedStart[],
+  opts: { rejectFirst?: boolean; alwaysReject?: boolean } = {},
+): DurableObjectNamespace {
+  let calls = 0;
   return {
     idFromName: (name: string) => name as unknown as DurableObjectId,
     get: () => ({
       fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
         const body = JSON.parse((init?.body as string | undefined) ?? "{}") as RecordedStart;
         recorded.push(body);
-        return new Response("Not Implemented", { status: 501 });
+        calls += 1;
+        if (opts.alwaysReject === true || (opts.rejectFirst === true && calls === 1)) {
+          return Response.json({ error: "investigation_active" }, { status: 409 });
+        }
+        await setStatus(env.DB, body.incidentId, "investigating");
+        return Response.json({ ok: true });
       },
     }),
   } as unknown as DurableObjectNamespace;
@@ -142,7 +154,9 @@ describe("runSweep: bad-deploy end-to-end", () => {
         .all<{ id: string; status: string; severity: string }>();
       expect(afterFirst.results).toHaveLength(1);
       const incident = afterFirst.results?.[0] as { id: string; status: string; severity: string };
-      expect(incident.status).toBe("open");
+      // `investigating`, not `open`: a successful /start flips the status synchronously (the mock
+      // mirrors the real DO's contract) — which is also what tells the retry subtask it started.
+      expect(incident.status).toBe("investigating");
       expect(incident.severity).toBe("critical");
 
       const fpRows = await env.DB
@@ -257,6 +271,58 @@ describe("runSweep: investigation budget kill-switch (Task 7.1)", () => {
       .first<{ content_json: string }>();
     expect(note).not.toBeNull();
     expect(JSON.parse(note!.content_json).note).toMatch(/deferred/i);
+  }, 30_000);
+});
+
+describe("runSweep: deferred-start retry (investigator busy)", () => {
+  it("a 409'd /start burns no budget, leaves a visible busy note, and the NEXT sweep retries and starts it", async () => {
+    await insertHealthyHistory(env.DB, ANCHOR, DAY_MIN);
+    await computeBaselines(env.DB, ANCHOR);
+    const fault: FaultState = { scenario: "bad-deploy", startedMs: ANCHOR };
+    for (let m = 0; m < 6; m++) {
+      await insertRollups(env.DB, faultMinute(ANCHOR + m * MIN, fault));
+    }
+    const simStub = env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
+    await runInDurableObject(simStub, async (_instance, state) => {
+      await state.storage.put("worldStatus", "running");
+    });
+
+    const started: RecordedStart[] = [];
+    const testEnv = makeTestEnv(makeMockInvestigator(started, { rejectFirst: true }));
+
+    // Sweep 1: incident opens, /start is attempted once and 409s (investigator busy elsewhere).
+    await runSweep(testEnv, ANCHOR + 4 * MIN);
+    const incident = await env.DB.prepare("SELECT id, status FROM incidents").first<{ id: string; status: string }>();
+    expect(incident?.status).toBe("open"); // never started — the real DO's 200 path flips this
+    expect(started).toHaveLength(1);
+
+    // The rejection burned NO hourly budget slot (consumed only after a successful start)…
+    const budgetAfterReject = await env.DB
+      .prepare("SELECT value FROM meta WHERE key = 'investigation_count_hour'")
+      .first<{ value: string }>();
+    expect(budgetAfterReject).toBeNull();
+
+    // …and the timeline says WHY it's empty.
+    const note = await env.DB
+      .prepare("SELECT content_json FROM investigation_steps WHERE incident_id = ? AND kind = 'note'")
+      .bind(incident?.id)
+      .first<{ content_json: string }>();
+    expect(JSON.parse(note!.content_json).note).toMatch(/busy/i);
+
+    // Sweep 2 (next tick): the retry subtask finds the still-open incident and starts it for real.
+    await runSweep(testEnv, ANCHOR + 5 * MIN);
+    expect(started).toHaveLength(2);
+    expect(started[1]?.incidentId).toBe(incident?.id);
+    const after = await env.DB.prepare("SELECT status FROM incidents WHERE id = ?").bind(incident?.id).first<{ status: string }>();
+    expect(after?.status).toBe("investigating");
+    const budgetAfterStart = await env.DB
+      .prepare("SELECT value FROM meta WHERE key = 'investigation_count_hour'")
+      .first<{ value: string }>();
+    expect(JSON.parse(budgetAfterStart!.value).count).toBe(1); // exactly one slot, consumed on success
+
+    // Sweep 3: nothing left to retry — no third /start.
+    await runSweep(testEnv, ANCHOR + 6 * MIN);
+    expect(started).toHaveLength(2);
   }, 30_000);
 });
 
@@ -429,9 +495,11 @@ describe("runSweep: batch spanning two concurrently-open incidents (review FIX 1
 
     // Six sweeps, one per minute -- well past the 5-minute healthy streak that (pre-fix) would
     // have auto-resolved whichever incident the batch did NOT fold onto (its last health stamp
-    // would have stayed frozen at its open time, T0-3min).
+    // would have stayed frozen at its open time, T0-3min). The investigator stays busy for the
+    // whole test (alwaysReject) so both incidents legitimately remain `open` — this test is about
+    // health refresh and fingerprint attribution, not investigation startup.
     const started: RecordedStart[] = [];
-    const testEnv = makeTestEnv(makeMockInvestigator(started));
+    const testEnv = makeTestEnv(makeMockInvestigator(started, { alwaysReject: true }));
     for (let m = 1; m <= 6; m++) {
       await runSweep(testEnv, T0 + m * MIN);
     }
@@ -473,7 +541,9 @@ describe("runSweep: batch spanning two concurrently-open incidents (review FIX 1
       expect(healthRow?.value).toBe(lastSweepMs);
     }
 
-    // And no new incident/investigation was spawned by any of the six covered sweeps.
-    expect(started).toHaveLength(0);
+    // The deferred-start retry kept attempting BOTH open incidents each sweep (every attempt
+    // 409'd — the investigator stayed busy), but no third incident ever appeared in the attempts
+    // and none of them succeeded (statuses asserted `open` above).
+    expect(new Set(started.map((s) => s.incidentId))).toEqual(new Set([incidentA.id, incidentB.id]));
   }, 30_000);
 });

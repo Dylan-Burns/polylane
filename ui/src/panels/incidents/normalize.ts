@@ -124,11 +124,19 @@ export function extractFailureReason(report: unknown): string | undefined {
   return undefined;
 }
 
-/** The detection trigger's human-readable statement (`detect/rules.ts`'s trigger shape:
- * `{statement, fingerprints, detected_at_ms}`) — used as the incident feed's summary line fallback
- * before a report exists. */
+/** The detection trigger's human-readable statement(s) — used as the incident feed's summary line
+ * fallback before a report exists. Two persisted shapes reach the UI (same set chat-prompt.ts's
+ * `triggerStatements` reads): the sweep's `buildTrigger` writes `{statements: string[], anomalies}`
+ * for every live incident, and the seeded demo incident writes a singular `{statement}`. Missing
+ * the array shape meant every live pre-report incident showed the generic placeholder instead of
+ * the detector's own words. */
 export function extractTriggerStatement(trigger: unknown): string | undefined {
-  return isRecord(trigger) && typeof trigger.statement === "string" ? trigger.statement : undefined;
+  if (!isRecord(trigger)) return undefined;
+  if (Array.isArray(trigger.statements)) {
+    const statements = trigger.statements.filter((s): s is string => typeof s === "string");
+    if (statements.length > 0) return statements.join(" | ");
+  }
+  return typeof trigger.statement === "string" ? trigger.statement : undefined;
 }
 
 /** The feed/detail summary line: the submitted report's own summary once one exists, else the
