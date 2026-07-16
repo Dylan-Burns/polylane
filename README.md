@@ -212,16 +212,18 @@ the red herring in order to rule it out). The rubric lives in `scripts/grade.ts`
 unit-tested against real production reports (`test/unit/grade.test.ts`). Latest run
 against production:
 
-**4/4 scenarios root-caused correctly** (gate: ≥ 3/4) — run 2026-07-16 against
-production, after the deploy-id honesty fix (the agent can no longer see scenario
-names in the deploy feed):
+**4/4 scenarios root-caused correctly** (gate: ≥ 3/4) — final v1.0.0 run,
+2026-07-16 against production, with the deploy-id honesty fix in place (the
+agent can no longer see scenario names in the deploy feed) and every report
+re-graded under the causal-override rubric (correlation language can't launder
+actual blame):
 
 | Scenario | Verdict | Fault→incident | Tool calls | Tokens in / out | Investigation wall | Notes |
 |---|---|---|---|---|---|---|
-| bad-deploy | ✅ PASS | 118s | 7 | 16 / 5491 | 47s | root cause correct |
-| dependency-outage | ✅ PASS | 117s | 4 | 10 / 3576 | 37s | root cause correct |
-| latency-creep | ✅ PASS | 296s | 8 | 34 / 5296 | 148s | root cause correct |
-| traffic-spike | ✅ PASS | 115s | 5 | 12 / 4963 | 61s | root cause correct |
+| bad-deploy | ✅ PASS | 165s | 7 | 16 / 6370 | 58s | root cause correct |
+| dependency-outage | ✅ PASS | 117s | 5 | 12 / 3754 | 45s | root cause correct |
+| latency-creep | ✅ PASS | 235s | 7 | 32 / 5588 | 64s | root cause correct |
+| traffic-spike | ✅ PASS | 119s | 6 | 30 / 5613 | 78s | root cause correct |
 
 ("Tokens in" counts only *uncached* input — nearly everything else is a prompt-cache
 read; see the caching table above.)
