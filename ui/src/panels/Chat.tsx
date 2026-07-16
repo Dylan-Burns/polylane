@@ -20,6 +20,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { Markdown } from "../components/Markdown";
 import { streamChat, type ChatRequestTurn } from "../lib/api";
 import type { ChatSSEEvent } from "../lib/types";
 
@@ -185,9 +186,13 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         </div>
       )}
       {message.content.length > 0 && (
-        <div className="whitespace-pre-wrap rounded-2xl rounded-bl-sm border border-hairline bg-panel px-4 py-2.5 text-sm leading-relaxed text-ink">
-          {message.content}
-          {message.pending && <span className="ml-0.5 inline-block h-[1em] w-0.5 translate-y-0.5 animate-pulse bg-signal" aria-hidden="true" />}
+        <div className="rounded-2xl rounded-bl-sm border border-hairline bg-panel px-4 py-2.5 text-sm leading-relaxed text-ink">
+          {/* Assistant turns are markdown (the watchdog answers with headings/bold/inline code) —
+              user turns above stay literal `whitespace-pre-wrap` text since that's the human's raw
+              input. Mid-stream, unclosed syntax (a dangling `**`) renders literally until its
+              closing token arrives, so partial turns degrade to plain text rather than breaking. */}
+          <Markdown>{message.content}</Markdown>
+          {message.pending && <span className="mt-1 inline-block h-[1em] w-0.5 animate-pulse bg-signal" aria-hidden="true" />}
         </div>
       )}
       {message.budgetReached && (
