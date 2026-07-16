@@ -20,22 +20,33 @@ a fault, watch detection escalate to an agent investigation, read the verdict.
 
 **5-minute demo script:**
 
-1. Open the URL. The **System** panel shows six services (green) and the last
-   incident already sitting in the feed — a seeded, resolved bad-deploy from a few
-   hours ago, so a first-time visitor immediately sees what a finished
+1. Open the URL. The **System** panel shows six services (green) — toggle
+   **Galaxy | Grid** for the live particle topology, where cluster size tracks each
+   service's request rate and errors circulate as red particles. The analytics row
+   above tracks incident volume, median time-to-diagnose/-resolve, and live
+   traffic. The last incident already sits in the feed — a seeded, resolved
+   bad-deploy, so a first-time visitor immediately sees what a finished
    investigation looks like.
 2. In the **Chaos** panel, click **Bad deploy** ("Start here"). A `payments`
-   deploy exhausts its database connection pool.
+   deploy exhausts its database connection pool. The deploy lands in the
+   **Deploys** rail seconds later — alongside a red-herring catalog deploy the
+   agent will have to rule out.
 3. Within ~2 minutes the detector opens a **critical** incident (payments latency +
    errors, cascading into checkout and gateway). The panel shows a "watchdog
-   scanning…" state, then the incident appears.
-4. Open the incident. The timeline advances live as the agent calls tools
-   (`query_metrics`, `find_traces`, `get_trace`, `list_deploys`, `get_incidents`).
-   When it finishes, the report renders: summary, root cause, blast radius,
-   confidence, suggested action, and clickable evidence chips (trace trees / log
-   lines).
-5. Click **Restore**. Health greens out and the incident auto-resolves within a
-   few minutes.
+   scanning…" state, then the incident appears; the culprit deploy in the rail is
+   flagged **suspected cause** once the report names it.
+4. Open the incident. Metric evidence tiles chart each triggering anomaly against
+   its baseline (the detection math made visible), and the timeline advances live
+   as the agent calls tools (`query_metrics`, `find_traces`, `get_trace`,
+   `list_deploys`, `get_incidents`). When it finishes, the report renders: summary,
+   root cause, blast radius, confidence, suggested action, and clickable evidence
+   chips (trace trees / log lines). Ask a follow-up in the **Dig deeper** thread at
+   the bottom — a chat scoped to this incident's evidence.
+5. Click **Approve** on the report's suggested action. The agent only ever
+   *suggests* — this human approval gate is what executes the rollback, and the
+   approval is recorded on the investigation timeline. Health greens out and the
+   incident auto-resolves within a few minutes. (The Chaos panel's **Restore**
+   does the same without the paper trail.)
 
 The **Chat** panel answers questions about the observed world ("what happened
 recently?") using the same read tools, streaming with visible tool activity.
@@ -71,6 +82,10 @@ recently?") using the same read tools, streaming with visible tool activity.
   an eviction.
 - The **UI** is a Vite React SPA served from `ui/dist` via Workers assets;
   `run_worker_first: ["/api/*"]` keeps the JSON API in front of the SPA fallback.
+  Its drill-down endpoints (`/api/analytics`, `/api/deploys`,
+  `/api/incidents/:id/metrics`) derive everything they show from the same rollups
+  and baselines the detector alerted on — the dashboard is the detection math made
+  visible, not a second opinion.
 
 ## The agent
 
@@ -159,6 +174,16 @@ fully viewable after the raw telemetry ages out.
 - **Compound faults are disabled on purpose.** One scenario active at a time; other
   chaos buttons disable while a fault runs. This turns the weakest demo path into a
   documented scope decision.
+- **The agent suggests; a human executes.** Every tool the loop holds is a read
+  over telemetry — by construction it cannot mutate the world. The one mutating
+  action (rolling back the fault) sits behind `POST /api/incidents/:id/remediate`,
+  an operator-click approval gate that re-validates at click time: closed or
+  unreported incidents are refused, as is any fault that started *after* the
+  incident opened (a stale approval must never kill someone else's newer fault).
+- **Incident chat context is server-loaded.** "Dig deeper" scopes chat to an
+  incident, but the client only ever names an id — the trigger, report, and steps
+  are loaded from D1 into the system prompt server-side, so a crafted request
+  can't smuggle fabricated incident "history" for the model to role-play against.
 - **Durable Objects over Cloudflare Workflows.** The investigation loop is
   short-lived (1–3 min) and the DO gives streaming state persistence for free;
   hand-rolled control flow is easier to defend line-by-line than a Workflows DAG.
