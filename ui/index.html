@@ -7,16 +7,21 @@
       name="description"
       content="Watchtower — a production-watchdog agent that notices anomalies in a live service graph and investigates them like an SRE."
     />
-    <!-- Space Grotesk (display), IBM Plex Sans (body), IBM Plex Mono (data/timestamps/trace ids) —
-         see ui/src/index.css's token comment for why this pairing. Falls back to system font
-         stacks with zero layout shift risk when offline; the deployed site fetches these live. -->
+    <!-- Instrument Sans (display + body) and JetBrains Mono (wordmark/data/timestamps/trace ids) —
+         the polylane.com brand pairing; see ui/src/index.css's token comment. Falls back to system
+         font stacks with zero layout shift risk when offline; the deployed site fetches these live. -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
       rel="stylesheet"
     />
     <title>Watchtower</title>
+    <!-- Theme is applied before first paint (polylane.com-style light/dark toggle — tokens flip via
+         html[data-theme] in index.css). Inline so a dark-mode user never sees a light flash. -->
+    <script>
+      document.documentElement.dataset.theme = localStorage.getItem("wt-theme") === "dark" ? "dark" : "light";
+    </script>
   </head>
   <body>
     <div id="root"></div>

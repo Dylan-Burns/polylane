@@ -97,7 +97,7 @@ function ScenarioCard({
         disabled={disabled}
         title={disabledReason ?? undefined}
         onClick={() => onTrigger(id)}
-        className="mt-1 rounded-lg border border-signal/40 bg-signal/10 px-3 py-1.5 font-sans text-xs font-medium text-signal-glow transition-colors hover:bg-signal/20 disabled:cursor-not-allowed disabled:border-hairline disabled:bg-transparent disabled:text-ink-faint disabled:hover:bg-transparent"
+        className="mt-1 rounded-full border border-hairline bg-panel px-3.5 py-1.5 font-sans text-xs font-medium text-ink transition-colors hover:border-hairline-bright hover:bg-panel-raised disabled:cursor-not-allowed disabled:border-hairline disabled:bg-transparent disabled:text-ink-faint disabled:hover:bg-transparent"
       >
         {pending ? "Starting…" : "Trigger"}
       </button>
@@ -170,7 +170,7 @@ export function ChaosPanel({ worldStatus, onActionSettled }: { worldStatus: Worl
           disabled={!hasFault || restorePending}
           title={!hasFault ? "No active scenario to restore." : undefined}
           onClick={handleRestore}
-          className="rounded-lg border border-hairline bg-panel-raised px-3 py-2 font-sans text-xs font-medium text-ink transition-colors hover:border-hairline-bright disabled:cursor-not-allowed disabled:text-ink-faint disabled:hover:border-hairline"
+          className="rounded-full border border-hairline bg-panel-raised px-3 py-2 font-sans text-xs font-medium text-ink transition-colors hover:border-hairline-bright disabled:cursor-not-allowed disabled:text-ink-faint disabled:hover:border-hairline"
         >
           {restorePending ? "Restoring…" : "Restore"}
         </button>
@@ -193,7 +193,7 @@ export function ChaosPanel({ worldStatus, onActionSettled }: { worldStatus: Worl
             <button
               type="button"
               onClick={() => setConfirmingReset(false)}
-              className="rounded-lg border border-hairline px-3 py-2 font-sans text-xs text-ink-dim hover:border-hairline-bright"
+              className="rounded-full border border-hairline px-3 py-2 font-sans text-xs text-ink-dim hover:border-hairline-bright"
             >
               Cancel
             </button>

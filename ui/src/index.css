@@ -1,53 +1,92 @@
 @import "tailwindcss";
 
 /*
- * Design tokens (frontend-design pass, Task 5.2). Registered via Tailwind v4's CSS-first `@theme`
- * so every token below is also a utility class (`bg-void`, `text-signal`, `font-display`, ...).
+ * Design tokens. Registered via Tailwind v4's CSS-first `@theme` so every token below is also a
+ * utility class (`bg-void`, `text-signal`, `font-display`, ...).
  *
- * Palette — "a watchtower scanning a dark field": a cold, blue-black night rather than a flat
- * #000, one deliberate "signal" blue (the beacon sweep — used for interactive/live elements only,
- * never for health), and a separate, never-overlapping red/amber/green vocabulary reserved
- * entirely for service health so the two systems can never be misread as one another.
+ * Palette — the polylane.com brand language, measured off the live site: a light near-white page
+ * (#fafafa) with pure-white panels, warm-free neutral grays for ink, and hairline borders at
+ * roughly rgba(0,0,0,0.12). Polylane's single interactive accent is near-black (its primary
+ * buttons are solid black pills), so "signal" — used for interactive/live elements only, never
+ * for health — maps to near-black here. Service health keeps its own never-overlapping
+ * red/amber/green vocabulary (darkened for light-background contrast) so the two systems can
+ * never be misread as one another. Token *names* are unchanged — every component styles itself
+ * against these roles, which is what made this rebrand a one-file palette swap.
  *
- * Type — three faces, one family relationship: Space Grotesk (display: panel titles, the incident
- * summary, big numbers) used sparingly at large sizes; IBM Plex Sans (body: prose, descriptions);
- * IBM Plex Mono (utility: timestamps, trace ids, tool args/output, token counts — Plex Mono shares
- * Plex Sans' design DNA, so data-dense readouts feel like part of the same instrument, not a
- * bolted-on monospace). Fetched from Google Fonts in index.html with full system-font fallback
- * stacks below, so the page still reads intentionally with zero network (as it must for this
- * task's offline local verification).
+ * Type — the polylane.com pairing: Instrument Sans for both display (panel titles, the incident
+ * summary, big numbers — medium/semibold, tight tracking) and body, with JetBrains Mono as the
+ * utility face (wordmark, timestamps, trace ids, tool args/output, token counts) exactly as
+ * polylane.com uses it for its own wordmark, labels, and code. Fetched from Google Fonts in
+ * index.html with full system-font fallback stacks below, so the page still reads intentionally
+ * with zero network (as it must for this task's offline local verification).
  */
 @theme {
-  --color-void: #0a0d12;
-  --color-panel: #12161d;
-  --color-panel-raised: #191f28;
-  --color-hairline: #232a37;
-  --color-hairline-bright: #303a4a;
+  --color-void: #fafafa;
+  --color-panel: #ffffff;
+  --color-panel-raised: #f5f5f5;
+  --color-hairline: #e4e4e4;
+  --color-hairline-bright: #d4d4d4;
 
-  --color-ink: #e7ecf3;
-  --color-ink-dim: #8792a3;
-  --color-ink-faint: #57606f;
+  --color-ink: #0a0a0a;
+  --color-ink-dim: #525252;
+  --color-ink-faint: #a3a3a3;
 
-  --color-signal: #4c8dff;
-  --color-signal-dim: #2c5cc7;
-  --color-signal-glow: #8ab4ff;
+  --color-signal: #0a0a0a;
+  --color-signal-dim: #404040;
+  --color-signal-glow: #171717;
 
-  --color-status-red: #ef4a5a;
-  --color-status-amber: #e8a33d;
-  --color-status-green: #35d68f;
-  --color-status-gray: #5b6472;
+  --color-status-red: #dc2626;
+  --color-status-amber: #b45309;
+  --color-status-green: #15803d;
+  --color-status-gray: #737373;
 
-  --font-display: "Space Grotesk", -apple-system, "Segoe UI", sans-serif;
-  --font-sans: "IBM Plex Sans", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --font-display: "Instrument Sans", -apple-system, "Segoe UI", sans-serif;
+  --font-sans: "Instrument Sans", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+/*
+ * Dark theme — polylane.com's dark mode, measured off the live site: neutral near-black surfaces
+ * (never blue-tinted), brighter status steps for the dark surface, and "signal" flipping to
+ * near-white (their dark-mode primary button is a white pill with black text — the exact inverse
+ * of light mode). Tailwind v4's @theme emits each token as a CSS custom property on :root, so
+ * overriding the same properties under html[data-theme="dark"] re-themes every utility class —
+ * including opacity modifiers like bg-signal/10, which resolve through color-mix at runtime.
+ * The attribute is stamped before first paint by an inline script in index.html and toggled by
+ * the header's ThemeToggle (App.tsx), persisted as localStorage "wt-theme".
+ */
+:root[data-theme="dark"] {
+  --color-void: #0a0a0a;
+  --color-panel: #141414;
+  --color-panel-raised: #1f1f1f;
+  --color-hairline: #272727;
+  --color-hairline-bright: #3a3a3a;
+
+  --color-ink: #ededed;
+  --color-ink-dim: #a3a3a3;
+  --color-ink-faint: #676767;
+
+  --color-signal: #fafafa;
+  --color-signal-dim: #d4d4d4;
+  --color-signal-glow: #ffffff;
+
+  --color-status-red: #f26b6b;
+  --color-status-amber: #e5a441;
+  --color-status-green: #3ecf8e;
+  --color-status-gray: #8a8a8a;
 }
 
 html,
 body {
   background-color: var(--color-void);
   color: var(--color-ink);
-  color-scheme: dark;
+  color-scheme: light;
   font-family: var(--font-sans);
+}
+
+html[data-theme="dark"],
+html[data-theme="dark"] body {
+  color-scheme: dark;
 }
 
 #root {

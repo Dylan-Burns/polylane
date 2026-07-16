@@ -35,12 +35,14 @@ export function normalizeToolResult(content: unknown): NormalizedToolResult {
   return { name, output: rec.output, isError: rec.is_error === true };
 }
 
-/** `{text}` (most notes) or `{update}` (live mid-loop status notes — `agent/loop.ts`'s
- * `record("note", { update })`). */
+/** `{text}` (most notes), `{update}` (live mid-loop status notes — `agent/loop.ts`'s
+ * `record("note", { update })`), or `{note}` (the sweep's budget-deferred note and
+ * `api/remediate.ts`'s operator-approval note). */
 export function normalizeNote(content: unknown): string {
   const rec = isRecord(content) ? content : {};
   if (typeof rec.text === "string") return rec.text;
   if (typeof rec.update === "string") return rec.update;
+  if (typeof rec.note === "string") return rec.note;
   return prettyJson(content);
 }
 

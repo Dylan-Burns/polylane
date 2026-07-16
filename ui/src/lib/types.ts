@@ -15,9 +15,9 @@
  */
 
 import type { FaultState, ScenarioId } from "../../../src/sim/scenarios";
-import type { IncidentView, LogLine, Span, TraceView } from "../../../src/telemetry/types";
+import type { Deploy, IncidentView, LogLine, Span, TraceView } from "../../../src/telemetry/types";
 
-export type { FaultState, IncidentView, LogLine, ScenarioId, Span, TraceView };
+export type { Deploy, FaultState, IncidentView, LogLine, ScenarioId, Span, TraceView };
 
 // --- /api/state (mirrors src/telemetry/state.ts's exported interfaces) --------------------------
 
@@ -84,6 +84,41 @@ export interface IncidentDetailResponse {
 export interface IncidentListResponse {
   incidents: IncidentView[];
   total: number;
+}
+
+// --- /api/analytics (mirrors src/telemetry/state.ts's AnalyticsResponse) ------------------------
+
+export interface AnalyticsResponse {
+  incidents24h: number;
+  openNow: number;
+  timeToReportP50Ms: number | null;
+  timeToResolveP50Ms: number | null;
+  reqPerMin: number | null;
+  errorRatePct: number | null;
+}
+
+// --- /api/deploys (the Deploy rows come straight from src/telemetry/types.ts) -------------------
+
+export interface DeployListResponse {
+  deploys: Deploy[];
+}
+
+// --- /api/incidents/:id/metrics (mirrors src/api/routes.ts's IncidentMetricsResponse) -----------
+
+export interface IncidentMetricTile {
+  service: string;
+  metricClass: "req_rate" | "error_rate" | "p95";
+  unit: "per_min" | "pct" | "ms";
+  points: { minute_ts: number; value: number }[];
+  peak: number;
+  baseline: number;
+  ratio: number | null;
+}
+
+export interface IncidentMetricsResponse {
+  windowFromMs: number;
+  windowToMs: number;
+  tiles: IncidentMetricTile[];
 }
 
 // --- Report (mirrors src/agent/report-schema.ts's Report + friends) ------------------------------

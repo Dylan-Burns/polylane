@@ -11,12 +11,15 @@
 
 import { readSSEStream } from "./sse";
 import type {
+  AnalyticsResponse,
   ChaosErrorBody,
   ChaosFaultBody,
   ChatSSEEvent,
+  DeployListResponse,
   FaultState,
   IncidentDetailResponse,
   IncidentListResponse,
+  IncidentMetricsResponse,
   ScenarioId,
   StateResponse,
   TraceView,
@@ -65,6 +68,46 @@ export function getIncidentDetail(id: string): Promise<IncidentDetailResponse> {
 
 export function getTrace(traceId: string): Promise<TraceView> {
   return getJson<TraceView>(`/api/traces/${encodeURIComponent(traceId)}`);
+}
+
+export function getAnalytics(): Promise<AnalyticsResponse> {
+  return getJson<AnalyticsResponse>("/api/analytics");
+}
+
+export function getDeploys(): Promise<DeployListResponse> {
+  return getJson<DeployListResponse>("/api/deploys");
+}
+
+export function getIncidentMetrics(id: string): Promise<IncidentMetricsResponse> {
+  return getJson<IncidentMetricsResponse>(`/api/incidents/${encodeURIComponent(id)}/metrics`);
+}
+
+// --- Remediation ---------------------------------------------------------------------------------
+
+/** Like `ChaosResult`, a 409 here is an ordinary UI-surfaced outcome (the incident has no report
+ * yet, is already closed, or there's no active fault to roll back), never an exception — the
+ * server's specific `error` string is the toast copy, so it rides along as `message`. The
+ * `cooldown` arm is purely defensive today: the remediate endpoint relays SimulatorDO's non-2xx
+ * responses verbatim and `/restore` currently has no cooldown, so no live path produces a 429 —
+ * kept so a future DO-side cooldown surfaces as a proper toast instead of a generic error. */
+export type RemediateResult =
+  | { kind: "ok" }
+  | { kind: "rejected"; message: string }
+  | { kind: "cooldown"; retryAfterMs: number }
+  | { kind: "error"; status: number; message: string };
+
+export async function remediateIncident(id: string): Promise<RemediateResult> {
+  const res = await fetch(`/api/incidents/${encodeURIComponent(id)}/remediate`, { method: "POST" });
+  const body = await parseBody(res);
+  if (res.status === 200) return { kind: "ok" };
+  if (res.status === 409) {
+    return { kind: "rejected", message: (body as ChaosErrorBody)?.error ?? "remediation was rejected" };
+  }
+  if (res.status === 429) {
+    return { kind: "cooldown", retryAfterMs: (body as ChaosErrorBody)?.retryAfterMs ?? 30_000 };
+  }
+  const message = (body as ChaosErrorBody)?.error ?? `HTTP ${res.status}`;
+  return { kind: "error", status: res.status, message };
 }
 
 // --- Chaos actions ---------------------------------------------------------------------------
@@ -138,11 +181,21 @@ export interface ChatRequestTurn {
  * body read) — an `AbortError` is rethrown rather than turned into a user-facing error event, since
  * an abort means nobody local is listening anymore either.
  */
-export async function streamChat(messages: ChatRequestTurn[], onEvent: (event: ChatSSEEvent) => void, signal?: AbortSignal): Promise<void> {
+export async function streamChat(
+  messages: ChatRequestTurn[],
+  onEvent: (event: ChatSSEEvent) => void,
+  signal?: AbortSignal,
+  opts?: {
+    /** Scopes the turn to one incident ("Dig deeper" in the incident modal): the server loads the
+     * incident's report/steps itself and injects them into the system prompt — the client only
+     * ever names the id, never supplies the context, preserving chat's untrusted-history boundary. */
+    incidentId?: string;
+  },
+): Promise<void> {
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ messages }),
+    body: JSON.stringify(opts?.incidentId !== undefined ? { messages, incidentId: opts.incidentId } : { messages }),
     signal,
   });
 

@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { prettyJson } from "../../lib/format";
 import { CONFIDENCE_META } from "../../lib/status";
 import type { Report, ReportEvidenceEntry, ReportTimelineEntry } from "../../lib/types";
@@ -48,14 +49,27 @@ function EvidenceChip({ entry, onOpen }: { entry: ReportEvidenceEntry; onOpen: (
     <button
       type="button"
       onClick={() => onOpen(entry)}
-      className="flex flex-col gap-1 rounded-lg border border-hairline bg-panel px-3 py-2 text-left text-xs transition-colors hover:border-signal/50 hover:bg-signal/5"
+      className="flex flex-col gap-1 rounded-lg border border-hairline bg-panel px-3 py-2 text-left text-xs transition-colors hover:border-hairline-bright hover:bg-panel-raised"
     >
       {inner}
     </button>
   );
 }
 
-export function ReportView({ report, onOpenEvidence }: { report: Report; onOpenEvidence: (entry: ReportEvidenceEntry) => void }) {
+/** `action` is the suggested-action section's optional call-to-action slot — the remediation
+ * approval button (`Detail.tsx`'s `RemediateAction`) renders there so "what the agent suggests"
+ * and "the one click that executes it" read as a single unit, exactly polylane.com's
+ * suggestion→autofix pairing. This component stays presentation-only; the caller owns when an
+ * action is offered at all. */
+export function ReportView({
+  report,
+  onOpenEvidence,
+  action,
+}: {
+  report: Report;
+  onOpenEvidence: (entry: ReportEvidenceEntry) => void;
+  action?: ReactNode;
+}) {
   const confidence = CONFIDENCE_META[report.confidence.level];
 
   return (
@@ -115,6 +129,7 @@ export function ReportView({ report, onOpenEvidence }: { report: Report; onOpenE
       <section className="rounded-lg border border-signal/30 bg-signal/5 px-4 py-3">
         <h4 className="font-mono text-[11px] uppercase tracking-wide text-signal-glow">Suggested action</h4>
         <p className="mt-1 text-sm text-ink">{report.suggested_action}</p>
+        {action}
       </section>
 
       <p className="text-[11px] text-ink-faint">{report.confidence.why}</p>

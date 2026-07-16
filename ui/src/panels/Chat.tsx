@@ -20,6 +20,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { Markdown } from "../components/Markdown";
 import { streamChat, type ChatRequestTurn } from "../lib/api";
 import type { ChatSSEEvent } from "../lib/types";
 
@@ -167,7 +168,7 @@ function ActivityTrail({ activity, live }: { activity: ActivityEntry[]; live: bo
 function MessageBubble({ message }: { message: ChatMessage }) {
   if (message.role === "user") {
     return (
-      <div className="ml-auto max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-signal/30 bg-signal/10 px-4 py-2.5 text-sm leading-relaxed text-ink sm:max-w-[75%]">
+      <div className="ml-auto max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-hairline bg-panel-raised px-4 py-2.5 text-sm leading-relaxed text-ink sm:max-w-[75%]">
         {message.content}
       </div>
     );
@@ -185,9 +186,13 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         </div>
       )}
       {message.content.length > 0 && (
-        <div className="whitespace-pre-wrap rounded-2xl rounded-bl-sm border border-hairline bg-panel px-4 py-2.5 text-sm leading-relaxed text-ink">
-          {message.content}
-          {message.pending && <span className="ml-0.5 inline-block h-[1em] w-0.5 translate-y-0.5 animate-pulse bg-signal" aria-hidden="true" />}
+        <div className="rounded-2xl rounded-bl-sm border border-hairline bg-panel px-4 py-2.5 text-sm leading-relaxed text-ink">
+          {/* Assistant turns are markdown (the watchdog answers with headings/bold/inline code) —
+              user turns above stay literal `whitespace-pre-wrap` text since that's the human's raw
+              input. Mid-stream, unclosed syntax (a dangling `**`) renders literally until its
+              closing token arrives, so partial turns degrade to plain text rather than breaking. */}
+          <Markdown>{message.content}</Markdown>
+          {message.pending && <span className="mt-1 inline-block h-[1em] w-0.5 animate-pulse bg-signal" aria-hidden="true" />}
         </div>
       )}
       {message.budgetReached && (
@@ -216,7 +221,7 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
             key={prompt}
             type="button"
             onClick={() => onPick(prompt)}
-            className="rounded-lg border border-hairline bg-panel-raised px-3 py-2 text-left font-sans text-xs text-ink-dim transition-colors hover:border-signal/40 hover:text-ink"
+            className="rounded-full border border-hairline bg-panel px-3.5 py-2 text-left font-sans text-xs text-ink-dim transition-colors hover:border-hairline-bright hover:text-ink"
           >
             {prompt}
           </button>
@@ -268,7 +273,7 @@ function Composer({
         rows={2}
         placeholder={disabled ? "Waiting for a reply…" : "Ask about the live world… (Enter to send, Shift+Enter for a new line)"}
         aria-label="Message"
-        className="w-full resize-none rounded-lg border border-hairline bg-panel-raised px-3 py-2 font-sans text-sm text-ink placeholder:text-ink-faint focus:border-signal/50 disabled:cursor-not-allowed disabled:opacity-60"
+        className="w-full resize-none rounded-xl border border-hairline bg-panel-raised px-3 py-2 font-sans text-sm text-ink placeholder:text-ink-faint focus:border-hairline-bright disabled:cursor-not-allowed disabled:opacity-60"
       />
       <div className="flex items-center justify-between gap-2">
         <span
@@ -281,7 +286,7 @@ function Composer({
         <button
           type="submit"
           disabled={!canSend}
-          className="rounded-lg border border-signal/40 bg-signal/10 px-3 py-1.5 font-sans text-xs font-medium text-signal-glow transition-colors hover:bg-signal/20 disabled:cursor-not-allowed disabled:border-hairline disabled:bg-transparent disabled:text-ink-faint disabled:hover:bg-transparent"
+          className="rounded-full bg-signal px-4 py-1.5 font-sans text-xs font-medium text-void transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:border disabled:border-hairline disabled:bg-transparent disabled:text-ink-faint disabled:opacity-100"
         >
           {disabled ? "Sending…" : "Send"}
         </button>

@@ -116,7 +116,7 @@ export function TraceDrawer({ entry, onClose }: { entry: ReportEvidenceEntry | n
             type="button"
             onClick={onClose}
             aria-label="Close trace drawer"
-            className="shrink-0 rounded-md border border-hairline px-2 py-1 text-xs text-ink-dim hover:border-hairline-bright"
+            className="shrink-0 rounded-full border border-hairline px-2 py-1 text-xs text-ink-dim hover:border-hairline-bright"
           >
             Close
           </button>
@@ -135,7 +135,7 @@ export function TraceDrawer({ entry, onClose }: { entry: ReportEvidenceEntry | n
             )}
             <section>
               <h4 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">Span tree</h4>
-              <div className="mt-2 rounded-lg border border-hairline bg-void/40 p-2">
+              <div className="mt-2 rounded-lg border border-hairline bg-panel-raised p-2">
                 {roots.length === 0 ? (
                   <p className="p-1 text-xs text-ink-dim">No spans.</p>
                 ) : (

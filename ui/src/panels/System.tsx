@@ -7,12 +7,13 @@
  * hardcoded, so this stays correct if the topology ever changes.
  */
 
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { SCENARIOS } from "../../../src/sim/scenarios";
 import { Sparkline } from "../components/Sparkline";
 import { relativeTime } from "../lib/format";
 import { HEALTH_COLOR, HEALTH_LABEL } from "../lib/status";
 import type { IncidentView, OpsHealth, SparklinePoint, StateResponse, TopologyServiceNode, WorldStatusView } from "../lib/types";
+import { GalaxyView, type GalaxyServiceStat } from "./system/Galaxy";
 
 interface NodePos {
   x: number;
@@ -130,7 +131,7 @@ function NodeCard({
   return (
     <foreignObject x={pos.x} y={pos.y} width={pos.w} height={pos.h}>
       <div
-        className="flex h-full flex-col gap-1.5 rounded-xl border bg-panel px-3 py-2 shadow-lg shadow-black/30"
+        className="flex h-full flex-col gap-1.5 rounded-xl border bg-panel px-3 py-2 shadow-lg shadow-black/10"
         style={{ borderColor: status === "green" ? "var(--color-hairline)" : HEALTH_COLOR[status] }}
       >
         <div className="flex items-center justify-between gap-2">
@@ -239,10 +240,98 @@ export function WorldStatusBanner({ worldStatus }: { worldStatus: WorldStatusVie
   );
 }
 
+/** The pre-Galaxy card topology, kept as the "Grid" segment of the view toggle — the same
+ * Galaxy/Graph/Table pattern polylane.com's Topology panel uses. */
+function TopologyGrid({ state, latestMinuteTs }: { state: StateResponse; latestMinuteTs: number }) {
+  const { edges } = state.topology;
+  return (
+    <div className="overflow-x-auto">
+      <svg
+        viewBox={`0 0 ${VIEWBOX_W} ${VIEWBOX_H}`}
+        width="100%"
+        style={{ minWidth: 680 }}
+        role="img"
+        aria-label="Service topology graph"
+      >
+        <defs>
+          <marker id="topology-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--color-hairline-bright)" />
+          </marker>
+        </defs>
+        <g fill="none" stroke="var(--color-hairline-bright)" strokeWidth={1.5}>
+          {edges.map(([from, to]) => {
+            const fromPos = NODE_POSITIONS[from];
+            const toPos = NODE_POSITIONS[to];
+            if (!fromPos || !toPos) return null;
+            return <path key={`${from}->${to}`} d={edgePath(fromPos, toPos)} markerEnd="url(#topology-arrow)" />;
+          })}
+        </g>
+        {state.topology.services.map((node) => (
+          <NodeCard key={node.name} node={node} health={state.health} sparklines={state.sparklines} latestMinuteTs={latestMinuteTs} />
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+type TopologyViewMode = "galaxy" | "grid";
+
+const VIEW_MODE_KEY = "wt-system-view";
+
+function initialViewMode(): TopologyViewMode {
+  return localStorage.getItem(VIEW_MODE_KEY) === "grid" ? "grid" : "galaxy";
+}
+
+/** The Galaxy|Grid segmented control — the same soft pill track as the header's Dashboard|Chat
+ * tabs, sized down to toolbar scale. */
+function ViewToggle({ mode, onChange }: { mode: TopologyViewMode; onChange: (mode: TopologyViewMode) => void }) {
+  return (
+    <div className="flex items-center gap-0.5 rounded-full bg-panel-raised p-0.5" role="tablist" aria-label="Topology view">
+      {(["galaxy", "grid"] as const).map((m) => (
+        <button
+          key={m}
+          type="button"
+          role="tab"
+          aria-selected={mode === m}
+          onClick={() => onChange(m)}
+          className={`rounded-full px-2.5 py-1 font-sans text-[11px] font-medium capitalize transition-colors ${
+            mode === m ? "border border-hairline bg-panel text-ink shadow-sm" : "text-ink-dim hover:text-ink"
+          }`}
+        >
+          {m}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Last-known rate/err/p95 per service, for the Galaxy's clusters, tooltip, and rail. */
+function galaxyStats(state: StateResponse, latestMinuteTs: number): Record<string, GalaxyServiceStat> {
+  const stats: Record<string, GalaxyServiceStat> = {};
+  for (const node of state.topology.services) {
+    const slots = alignSlots(state.sparklines[node.name], latestMinuteTs);
+    stats[node.name] = {
+      rate: lastKnown(slots.map((p) => (p ? p.count : null))),
+      errPct: lastKnown(slots.map((p) => (p ? p.error_rate * 100 : null))),
+      p95: lastKnown(slots.map((p) => (p ? p.p95 : null))),
+    };
+  }
+  return stats;
+}
+
 export function SystemView({ state, incidents }: { state: StateResponse; incidents: IncidentView[] }) {
   const scanning = isScanning(state.worldStatus, incidents);
   const latestMinuteTs = latestMinuteFromSparklines(state.sparklines);
-  const { edges } = state.topology;
+  const [viewMode, setViewMode] = useState<TopologyViewMode>(initialViewMode);
+
+  function changeViewMode(mode: TopologyViewMode) {
+    setViewMode(mode);
+    localStorage.setItem(VIEW_MODE_KEY, mode);
+  }
+
+  const stats = galaxyStats(state, latestMinuteTs);
+  const internal = state.topology.services.filter((s) => !s.external);
+  const totalRate = internal.reduce((sum, s) => sum + (stats[s.name]?.rate ?? 0), 0);
 
   return (
     <section className="flex flex-col gap-4 rounded-2xl border border-hairline bg-panel/40 p-5">
@@ -253,32 +342,20 @@ export function SystemView({ state, incidents }: { state: StateResponse; inciden
 
       {scanning && <ScanningIndicator worldStatus={state.worldStatus} />}
 
-      <div className="overflow-x-auto">
-        <svg
-          viewBox={`0 0 ${VIEWBOX_W} ${VIEWBOX_H}`}
-          width="100%"
-          style={{ minWidth: 680 }}
-          role="img"
-          aria-label="Service topology graph"
-        >
-          <defs>
-            <marker id="topology-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-              <path d="M0,0 L10,5 L0,10 z" fill="var(--color-hairline-bright)" />
-            </marker>
-          </defs>
-          <g fill="none" stroke="var(--color-hairline-bright)" strokeWidth={1.5}>
-            {edges.map(([from, to]) => {
-              const fromPos = NODE_POSITIONS[from];
-              const toPos = NODE_POSITIONS[to];
-              if (!fromPos || !toPos) return null;
-              return <path key={`${from}->${to}`} d={edgePath(fromPos, toPos)} markerEnd="url(#topology-arrow)" />;
-            })}
-          </g>
-          {state.topology.services.map((node) => (
-            <NodeCard key={node.name} node={node} health={state.health} sparklines={state.sparklines} latestMinuteTs={latestMinuteTs} />
-          ))}
-        </svg>
+      {/* Toolbar row, following polylane.com's Topology panel: the resource tally on the left,
+          the view switcher on the right. */}
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-mono text-[11px] text-ink-faint">
+          {internal.length} services · {totalRate.toFixed(0)} req/min
+        </span>
+        <ViewToggle mode={viewMode} onChange={changeViewMode} />
       </div>
+
+      {viewMode === "galaxy" ? (
+        <GalaxyView services={state.topology.services} edges={state.topology.edges} health={state.health} stats={stats} />
+      ) : (
+        <TopologyGrid state={state} latestMinuteTs={latestMinuteTs} />
+      )}
 
       <Legend />
     </section>

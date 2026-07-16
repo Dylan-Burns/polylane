@@ -13,7 +13,7 @@ interface PillProps {
 export function Pill({ color, children, pulse, className = "" }: PillProps) {
   return (
     <span
-      className={`inline-flex items-center gap-1.5 rounded-full border border-hairline bg-panel-raised px-2.5 py-1 font-mono text-[11px] uppercase tracking-wide text-ink-dim ${className}`}
+      className={`inline-flex items-center gap-1.5 rounded-full border border-hairline bg-panel px-2.5 py-1 font-sans text-xs font-medium capitalize text-ink-dim ${className}`}
     >
       <span
         className={`h-1.5 w-1.5 rounded-full ${pulse ? "animate-scan-pulse" : ""}`}

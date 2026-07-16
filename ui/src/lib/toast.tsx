@@ -29,7 +29,7 @@ export function useToast(): ToastContextValue {
 const TOAST_LIFETIME_MS = 5000;
 
 const TONE_CLASSES: Record<ToastTone, string> = {
-  info: "border-signal/40 bg-panel-raised text-ink",
+  info: "border-hairline-bright bg-panel text-ink",
   warning: "border-status-amber/50 bg-panel-raised text-status-amber",
   error: "border-status-red/50 bg-panel-raised text-status-red",
 };
@@ -57,7 +57,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           <div
             key={t.id}
             role="status"
-            className={`animate-step-in pointer-events-auto w-full max-w-sm rounded-lg border px-4 py-3 font-sans text-sm shadow-lg shadow-black/40 ${TONE_CLASSES[t.tone]}`}
+            className={`animate-step-in pointer-events-auto w-full max-w-sm rounded-lg border px-4 py-3 font-sans text-sm shadow-lg shadow-black/10 ${TONE_CLASSES[t.tone]}`}
           >
             {t.message}
           </div>

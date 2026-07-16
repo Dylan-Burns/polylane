@@ -6,11 +6,14 @@
  */
 
 import { useEffect, useState } from "react";
-import { getIncidentDetail } from "../../lib/api";
+import { getIncidentDetail, remediateIncident } from "../../lib/api";
 import { clockTime, relativeTime } from "../../lib/format";
 import { usePoll } from "../../lib/poll";
 import { INCIDENT_STATUS_META } from "../../lib/status";
+import { useToast } from "../../lib/toast";
 import type { IncidentDetailResponse, ReportEvidenceEntry } from "../../lib/types";
+import { DigDeeper } from "./DigDeeper";
+import { MetricTiles } from "./MetricTiles";
 import { extractFailureReason, extractTriggerStatement, isFullReport } from "./normalize";
 import { ReportView } from "./Report";
 import { Timeline } from "./Timeline";
@@ -27,14 +30,78 @@ function Timestamp({ label, ms }: { label: string; ms: number | null }) {
   );
 }
 
-function DetailBody({ detail }: { detail: IncidentDetailResponse }) {
+/** The one-click approval for the report's suggested action (spec-wise: the agent only ever
+ * SUGGESTS; this button is the human approving it — see `src/api/remediate.ts`). Offered only
+ * while the incident is `reported`: before that there's no report to act on, and after resolve
+ * there's nothing left to fix. Every rejection the server can produce (no active fault, already
+ * closed, cooldown) is an expected outcome surfaced as a toast, mirroring the chaos panel's
+ * result-toast convention. `onApplied` lets the modal force an immediate detail re-poll so the
+ * remediation note lands in the timeline without waiting a full poll cycle. */
+function RemediateAction({ incidentId, onApplied }: { incidentId: string; onApplied: () => void }) {
+  const toast = useToast();
+  const [pending, setPending] = useState(false);
+  const [applied, setApplied] = useState(false);
+
+  async function approve() {
+    setPending(true);
+    let result: Awaited<ReturnType<typeof remediateIncident>>;
+    try {
+      // remediateIncident maps every HTTP status to a result, but the fetch itself can still
+      // reject (network drop) — without the finally the button would wedge on "Applying…".
+      result = await remediateIncident(incidentId);
+    } catch {
+      result = { kind: "error", status: 0, message: "couldn't reach Watchtower" };
+    } finally {
+      setPending(false);
+    }
+    switch (result.kind) {
+      case "ok":
+        setApplied(true);
+        toast.push("info", "Remediation applied — rolled back; watching for recovery.");
+        onApplied();
+        return;
+      case "rejected":
+        toast.push("warning", result.message);
+        break;
+      case "cooldown":
+        toast.push("warning", `Remediation is on a cooldown — try again in ${Math.ceil(result.retryAfterMs / 1000)}s.`);
+        break;
+      case "error":
+        toast.push("error", `Remediation didn't go through (${result.message}).`);
+        break;
+    }
+  }
+
+  if (applied) {
+    return <p className="mt-2.5 font-mono text-[11px] text-status-green">✓ Remediation applied — recovery usually shows within a couple of minutes.</p>;
+  }
+
+  return (
+    <div className="mt-2.5 flex flex-wrap items-center gap-2.5">
+      <button
+        type="button"
+        disabled={pending}
+        onClick={() => void approve()}
+        className="rounded-full bg-signal px-3.5 py-1.5 font-sans text-xs font-medium text-void transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {pending ? "Applying…" : "Approve & apply"}
+      </button>
+      <span className="text-[11px] text-ink-faint">Rolls back the offending change. The watchdog keeps watching either way.</span>
+    </div>
+  );
+}
+
+function DetailBody({ detail, onRemediated }: { detail: IncidentDetailResponse; onRemediated: () => void }) {
   const [evidenceEntry, setEvidenceEntry] = useState<ReportEvidenceEntry | null>(null);
   const { incident, steps } = detail;
   const investigating = incident.status === "investigating";
+  const live = incident.status !== "resolved" && incident.status !== "failed";
   const failureReason = extractFailureReason(incident.report);
 
   return (
     <>
+      <MetricTiles incidentId={incident.id} live={live} />
+
       <Timeline steps={steps} openedAtMs={incident.opened_at} investigating={investigating} />
 
       {incident.status === "failed" && failureReason && (
@@ -46,9 +113,15 @@ function DetailBody({ detail }: { detail: IncidentDetailResponse }) {
 
       {isFullReport(incident.report) && (
         <div className="mt-6 border-t border-hairline pt-5">
-          <ReportView report={incident.report} onOpenEvidence={setEvidenceEntry} />
+          <ReportView
+            report={incident.report}
+            onOpenEvidence={setEvidenceEntry}
+            action={incident.status === "reported" ? <RemediateAction incidentId={incident.id} onApplied={onRemediated} /> : undefined}
+          />
         </div>
       )}
+
+      <DigDeeper incidentId={incident.id} />
 
       <TraceDrawer entry={evidenceEntry} onClose={() => setEvidenceEntry(null)} />
     </>
@@ -62,7 +135,7 @@ export function IncidentDetailModal({ incidentId, onClose }: { incidentId: strin
   // the cron sweep minutes later with no new step row, and an open modal must show that heal live.
   const [knownStatus, setKnownStatus] = useState<string | null>(null);
   const interval = knownStatus === "resolved" || knownStatus === "failed" ? null : LIVE_POLL_MS;
-  const { data, error } = usePoll(() => getIncidentDetail(incidentId), interval);
+  const { data, error, refresh } = usePoll(() => getIncidentDetail(incidentId), interval);
 
   useEffect(() => {
     if (data) setKnownStatus(data.incident.status);
@@ -127,7 +200,7 @@ export function IncidentDetailModal({ incidentId, onClose }: { incidentId: strin
             type="button"
             onClick={onClose}
             aria-label="Close incident detail"
-            className="shrink-0 rounded-md border border-hairline px-2.5 py-1.5 text-xs text-ink-dim hover:border-hairline-bright"
+            className="shrink-0 rounded-full border border-hairline px-2.5 py-1.5 text-xs text-ink-dim hover:border-hairline-bright"
           >
             Close
           </button>
@@ -138,7 +211,7 @@ export function IncidentDetailModal({ incidentId, onClose }: { incidentId: strin
             <p className="text-sm text-status-red">Couldn't load this incident. It may have been reset — try closing and reopening it.</p>
           )}
           {data === undefined && error === undefined && <p className="text-sm text-ink-dim">Loading incident…</p>}
-          {data && <DetailBody detail={data} />}
+          {data && <DetailBody detail={data} onRemediated={refresh} />}
         </div>
       </div>
     </div>

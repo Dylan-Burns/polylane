@@ -33,7 +33,7 @@ function RawDisclosure({ value }: { value: unknown }) {
   return (
     <details className="mt-1 text-[11px]">
       <summary className="cursor-pointer select-none text-ink-faint hover:text-ink-dim">show full result</summary>
-      <pre className="mt-1 max-h-64 overflow-auto rounded-md bg-void/60 p-2 font-mono text-[11px] leading-relaxed text-ink-dim">
+      <pre className="mt-1 max-h-64 overflow-auto rounded-md bg-panel-raised p-2 font-mono text-[11px] leading-relaxed text-ink-dim">
         {prettyJson(value)}
       </pre>
     </details>
@@ -48,7 +48,7 @@ function StepBody({ step }: { step: StepView }) {
         <div>
           <p className="font-mono text-xs text-signal-glow">→ {name}</p>
           {input !== undefined && (
-            <pre className="mt-1 max-h-40 overflow-auto rounded-md bg-void/60 p-2 font-mono text-[11px] leading-relaxed text-ink-dim">
+            <pre className="mt-1 max-h-40 overflow-auto rounded-md bg-panel-raised p-2 font-mono text-[11px] leading-relaxed text-ink-dim">
               {prettyJson(input)}
             </pre>
           )}
