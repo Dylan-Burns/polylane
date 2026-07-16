@@ -15,8 +15,10 @@
  * over `summary + root_cause.hypothesis + root_cause.mechanism`. `mustNotBlame` matches over the
  * root_cause fields ONLY — a correct report may legitimately mention the red-herring catalog
  * deploy or an impacted service by name while ruling it out; what it must not do is *attribute
- * the cause* to it.
+ * the cause* to it. The rubric itself lives in `grade.ts` (unit-tested with real report fixtures).
  */
+
+import { gradeReport, SCENARIOS, type ScenarioId } from "./grade";
 
 interface WorldStatusView {
   worldStatus: "unseeded" | "seeding" | "running" | "resetting";
@@ -50,26 +52,6 @@ interface StepView {
   tokens_in: number;
   tokens_out: number;
 }
-
-const SCENARIOS = ["bad-deploy", "dependency-outage", "latency-creep", "traffic-spike"] as const;
-type ScenarioId = (typeof SCENARIOS)[number];
-
-interface Grade {
-  /** ANY-of within a group, ALL groups required, over summary + root_cause. */
-  must: string[][];
-  /** None of these may appear in root_cause.hypothesis/mechanism (cause attribution). */
-  mustNotBlame?: string[];
-}
-
-const GRADES: Record<ScenarioId, Grade> = {
-  "bad-deploy": { must: [["deploy", "v2.4.1"], ["payments"], ["pool", "latency", "connection"]] },
-  "dependency-outage": { must: [["email"], ["notifications"]], mustNotBlame: ["checkout"] },
-  "latency-creep": {
-    must: [["payments-db", "database"], ["latency", "slow", "p95", "creep", "degrad"]],
-    mustNotBlame: ["deploy"],
-  },
-  "traffic-spike": { must: [["traffic", "load", "spike", "volume"]], mustNotBlame: ["bug", "deploy"] },
-};
 
 /** Per-scenario ceiling from inject to `reported` (plan: 12 min). */
 const REPORTED_TIMEOUT_MS = 12 * 60_000;
@@ -138,50 +120,6 @@ interface ScenarioResult {
   steps: number | null;
   tokensIn: number | null;
   tokensOut: number | null;
-}
-
-/** Words that, near a `mustNotBlame` term, mark the mention as EXCULPATORY ("checkout remains
- * healthy", "not a payments deploy", "the traffic spike is not a bug") rather than an accusation.
- * A correct report routinely names other services to rule them out — a bare substring match
- * mis-scores those as blame (observed on dependency-outage, where the report says "checkout/gateway
- * remain healthy since the email send is fire-and-forget"). A term counts as "blamed" only if at
- * least one of its occurrences has NO exoneration marker within `EXONERATION_WINDOW` chars. */
-const EXONERATION_MARKERS = [
-  "not ", "n't", "no change", "unaffected", "healthy", "remain", "fine", "isolated", "unrelated",
-  "ruled out", "rule out", "best-effort", "fire-and-forget", "non-blocking", "downstream", "cascade",
-  "symptom", "rather than", "instead of", "red herring", "coincident", "unchanged",
-];
-const EXONERATION_WINDOW = 80;
-
-/** True if EVERY occurrence of `term` in `text` sits near an exoneration marker (i.e. the term is
- * only ever mentioned to rule it out, never blamed). */
-function onlyExculpatory(text: string, term: string): boolean {
-  let idx = text.indexOf(term);
-  if (idx === -1) return false; // not present at all — caller handles that separately
-  while (idx !== -1) {
-    const lo = Math.max(0, idx - EXONERATION_WINDOW);
-    const hi = Math.min(text.length, idx + term.length + EXONERATION_WINDOW);
-    const window = text.slice(lo, hi);
-    if (!EXONERATION_MARKERS.some((m) => window.includes(m))) return false; // a blame-context occurrence
-    idx = text.indexOf(term, idx + term.length);
-  }
-  return true;
-}
-
-function gradeReport(scenario: ScenarioId, report: NonNullable<IncidentView["report"]>): { pass: boolean; detail: string } {
-  const grade = GRADES[scenario];
-  const rootCause = `${report.root_cause?.hypothesis ?? ""} ${report.root_cause?.mechanism ?? ""}`.toLowerCase();
-  const haystack = `${report.summary ?? ""} ${rootCause}`.toLowerCase();
-
-  const missing = grade.must.filter((group) => !group.some((kw) => haystack.includes(kw)));
-  // A term is "blamed" only if it appears AND is not purely exculpatory (see onlyExculpatory).
-  const blamed = (grade.mustNotBlame ?? []).filter((kw) => rootCause.includes(kw) && !onlyExculpatory(rootCause, kw));
-
-  if (missing.length === 0 && blamed.length === 0) return { pass: true, detail: "root cause correct" };
-  const parts: string[] = [];
-  if (missing.length > 0) parts.push(`missing: ${missing.map((g) => g.join("|")).join(" AND ")}`);
-  if (blamed.length > 0) parts.push(`blames: ${blamed.join(", ")}`);
-  return { pass: false, detail: parts.join("; ") };
 }
 
 async function runScenario(base: string, scenario: ScenarioId): Promise<ScenarioResult> {

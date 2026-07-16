@@ -13,7 +13,8 @@ polylane ("Watchtower") is an AI incident investigator on Cloudflare Workers: a 
 - `pnpm typecheck` — `tsc --noEmit`
 - `pnpm dev` — wrangler dev + UI dev server concurrently
 - `pnpm deploy` — builds `ui/dist` then `wrangler deploy` (bare `wrangler deploy` serves a stale/missing UI)
-- Migrations: `wrangler d1 migrations apply watchtower` (files in `migrations/`)
+- `pnpm eval [--base https://…]` — drive all four fault scenarios against a deployed URL, grade root-cause accuracy, write `docs/eval-latest.md`
+- Migrations: `wrangler d1 migrations apply watchtower` (files in `migrations/`; add `--remote` for the deployed DB)
 
 ## Architecture
 
