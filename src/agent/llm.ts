@@ -42,6 +42,26 @@ export interface LLM {
  * never more. */
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+/** One structured line per completed model call, visible in `wrangler tail` — this is where the
+ * Task 4.3 prompt-caching gate is *observed*: on every investigation step ≥ 2,
+ * `cache_read_input_tokens` must be > 0 (a 0 means the system prompt isn't byte-stable and the
+ * whole conversation is being re-billed at full input price each iteration). Lives in the network
+ * adapters (not `loop.ts`) because usage is a property of a real API call — the scripted doubles
+ * have nothing truthful to log. */
+function logUsage(source: string, response: Message): void {
+  const u = response.usage;
+  console.log(
+    `llm:${source}`,
+    JSON.stringify({
+      input_tokens: u.input_tokens,
+      output_tokens: u.output_tokens,
+      cache_read_input_tokens: u.cache_read_input_tokens ?? 0,
+      cache_creation_input_tokens: u.cache_creation_input_tokens ?? 0,
+      stop_reason: response.stop_reason,
+    }),
+  );
+}
+
 /**
  * The real Anthropic-backed `LLM`. The SDK does the retrying (`maxRetries: 3`) — no hand-rolled
  * backoff (Global Constraints). `thinking`/`output_config`/`cache_control`/`tool_choice` are NOT
@@ -53,9 +73,11 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 export function realLLM(env: Pick<Env, "ANTHROPIC_API_KEY">): LLM {
   const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY, maxRetries: 3, timeout: DEFAULT_TIMEOUT_MS });
   return {
-    create(params, timeoutMs) {
+    async create(params, timeoutMs) {
       const timeout = timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : Math.max(0, Math.min(DEFAULT_TIMEOUT_MS, timeoutMs));
-      return client.messages.create(params, { timeout });
+      const response = await client.messages.create(params, { timeout });
+      logUsage("investigator", response);
+      return response;
     },
   };
 }
@@ -114,7 +136,9 @@ export function streamingLLM(env: Pick<Env, "ANTHROPIC_API_KEY">, hooks: StreamH
           onThinking();
         });
       }
-      return await stream.finalMessage();
+      const response = await stream.finalMessage();
+      logUsage("chat", response);
+      return response;
     },
   };
 }
