@@ -181,13 +181,29 @@ fully viewable after the raw telemetry ages out.
 
 `pnpm eval` drives the deployed system through all four fault scenarios (restore →
 inject → poll to `reported` → grade → restore → wait resolved) and grades each report
-with required-mention keyword groups over `root_cause + summary`. Latest run against
-production:
+with required-mention keyword groups over `root_cause + summary`, plus "must-not-blame"
+terms over `root_cause` with exoneration-aware matching (a correct report *should* name
+the red herring in order to rule it out). The rubric lives in `scripts/grade.ts` and is
+unit-tested against real production reports (`test/unit/grade.test.ts`). Latest run
+against production:
 
-<!-- EVAL_TABLE -->
-_(table pasted from `docs/eval-latest.md` after the current eval run completes)_
+**4/4 scenarios root-caused correctly** (gate: ≥ 3/4) — run 2026-07-16 against
+production, after the deploy-id honesty fix (the agent can no longer see scenario
+names in the deploy feed):
 
-Gate: ≥ 3/4 scenarios root-caused correctly.
+| Scenario | Verdict | Fault→incident | Tool calls | Tokens in / out | Investigation wall | Notes |
+|---|---|---|---|---|---|---|
+| bad-deploy | ✅ PASS | 118s | 7 | 16 / 5491 | 47s | root cause correct |
+| dependency-outage | ✅ PASS | 117s | 4 | 10 / 3576 | 37s | root cause correct |
+| latency-creep | ✅ PASS | 296s | 8 | 34 / 5296 | 148s | root cause correct |
+| traffic-spike | ✅ PASS | 115s | 5 | 12 / 4963 | 61s | root cause correct |
+
+("Tokens in" counts only *uncached* input — nearly everything else is a prompt-cache
+read; see the caching table above.)
+
+(`latency-creep` detects slower by design — it's the slow-burn drift scenario, caught
+by the sustained rule rather than a hard trip. The full run log is
+`docs/eval-latest.md`; re-run any time with `pnpm eval`.)
 
 ## Running it yourself
 

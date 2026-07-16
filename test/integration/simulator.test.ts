@@ -92,6 +92,25 @@ describe("SimulatorDO tick", () => {
 });
 
 describe("SimulatorDO fault/restore", () => {
+  it("rejects /fault with 409 world_not_ready unless the world is running (break-it: chaos during seeding)", async () => {
+    const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("test-fault-not-ready"));
+
+    // A reset clears `fault` and the backfill outlives the 30s chaos cooldown, so neither of the
+    // other /fault gates catches a mid-seed inject — the worldStatus gate has to.
+    for (const worldStatus of ["unseeded", "seeding", "resetting"] as const) {
+      await runInDurableObject(stub, async (_instance, state) => {
+        await state.storage.put("worldStatus", worldStatus);
+      });
+      const res = await stub.fetch("http://simulator/fault", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scenario: "bad-deploy" }),
+      });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: "world_not_ready", worldStatus });
+    }
+  });
+
   it("fault set 200 -> effects visible in next tick; second fault while active -> 409; restore -> 200 and effects clear", async () => {
     const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("test-fault-1"));
 

@@ -473,7 +473,10 @@ async function runGetTrace(input: unknown, ctx: ExecuteToolCtx): Promise<object>
 async function runListDeploys(input: unknown, ctx: ExecuteToolCtx): Promise<object> {
   const rec = asRecord(input);
   const { fromMs, toMs } = parseWindow(optionalWindow(rec), ctx.nowMs);
-  const deploys = await listDeploys(ctx.db, { fromMs, toMs });
+  // `id` is stripped: deploy ids embed the originating scenario name (`deploy-traffic-spike-…` —
+  // they're idempotent-dedupe keys, see sim/scenarios.ts) and would leak the injected fault
+  // straight through the simulation honesty boundary. The agent cites deploys as service@version.
+  const deploys = (await listDeploys(ctx.db, { fromMs, toMs })).map(({ id: _id, ...deploy }) => deploy);
   return { deploys, count: deploys.length };
 }
 

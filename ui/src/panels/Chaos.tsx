@@ -35,6 +35,8 @@ function describeChaosOutcome(result: ChaosResult, actionLabel: string): { tone:
       return { tone: "info", message: `${actionLabel} — the topology will update within a few seconds.` };
     case "scenario_active":
       return { tone: "warning", message: "A scenario is already running — restore it before starting another." };
+    case "world_not_ready":
+      return { tone: "warning", message: "The world isn't running yet — wait for seeding to finish, then try again." };
     case "cooldown":
       return {
         tone: "warning",
