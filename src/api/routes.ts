@@ -18,9 +18,9 @@
  */
 
 import { Hono } from "hono";
-import { getBaselines } from "../detect/baselines";
+import { getBaselines, median } from "../detect/baselines";
 import type { Env } from "../env";
-import { simulatorStub } from "../sim/simulator-do";
+import { fetchWorldStatus as fetchWorldStatusFromDO } from "../sim/simulator-do";
 import { getIncidents, getTrace, listDeploys, listInvestigationSteps, queryMetrics, searchLogs, type StepView } from "../telemetry/read";
 import { buildTopology, getAnalytics, getOpsHealth, serviceHealth, sparklineSeries, type StateResponse, type WorldStatusView } from "../telemetry/state";
 import type { IncidentView, MetricPoint } from "../telemetry/types";
@@ -110,16 +110,18 @@ const TILE_UNITS: Record<TileMetricClass, IncidentMetricTile["unit"]> = {
  * handler's baseline comment). Three points is the least a median can call a trend. */
 const TILE_BASELINE_MIN_PRE_POINTS = 3;
 
-/** Plain odd/even median (same convention as `detect/baselines.ts`'s median — re-derived here
- * rather than imported because that module's version is un-exported and MAD-coupled). */
-function median(values: number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  const lower = sorted[mid - 1];
-  const upper = sorted[mid];
-  if (sorted.length % 2 === 0 && lower !== undefined && upper !== undefined) return (lower + upper) / 2;
-  return upper ?? 0;
-}
+/** Point budget per tile — the same MAX_METRIC_POINTS discipline the agent's tool layer applies
+ * to queryMetrics. A resolved incident's span is bounded only by rollup retention (a fault
+ * restored the next morning is a 12h+ window), so the handler widens `stepMin` until the series
+ * fits instead of shipping a point per minute of an arbitrarily long window. */
+const TILE_MAX_POINTS = 120;
+
+/** How far before `opened_at` the tile's headline `peak` may reach: the sustained rule needs two
+ * consecutive breaching minutes plus a cron tick before an incident opens, so the fault's genuine
+ * onset lives a few minutes early — but a burst deep in the 30-min pre-open context (a prior
+ * incident's tail, a benign blip too short to trip detection) must not own the "worst value". */
+const TILE_PEAK_ONSET_LEAD_MS = 3 * 60_000;
+
 
 /** Accepted `metricClass` spellings on a trigger anomaly, normalized to the tiles' metric names.
  * `detect/rules.ts`'s `Anomaly` — what `incidents.ts` actually persists in `trigger_json` — uses
@@ -218,18 +220,10 @@ function aggregateToServiceMinutes(points: readonly MetricPoint[]): ServiceMinut
     }));
 }
 
-/** Fetches `SimulatorDO`'s `/status` for the singleton `idFromName('world')` instance and returns
- * its body verbatim (`WorldStatusView`) — `null` on any failure (network error, non-2xx, malformed
- * JSON) so `GET /api/state` can fall back rather than 500ing the whole response over a DO hiccup. */
-async function fetchWorldStatus(env: Env): Promise<WorldStatusView | null> {
-  try {
-    const res = await simulatorStub(env).fetch("http://simulator/status");
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
+/** `simulator-do.ts`'s shared status fetch, pinned to this module's view type. Null here means
+ * "couldn't learn the real world status" and `/api/state` fails OPEN (render the fallback below)
+ * — contrast the remediation gate, which fails closed on the same null. */
+const fetchWorldStatus = (env: Env) => fetchWorldStatusFromDO<WorldStatusView>(env);
 
 /** The one honest default for `GET /api/state` when `SimulatorDO` itself is unreachable — matches
  * `index.ts`'s pre-existing `/api/health` fallback ("unseeded") rather than inventing a new
@@ -301,19 +295,28 @@ routes.get("/incidents/:id/metrics", async (c) => {
   const fromMs = incident.opened_at - INCIDENT_METRICS_PRE_MS;
   const rawEndMs = incident.resolved_at ?? Math.min(nowMs, incident.opened_at + INCIDENT_METRICS_ACTIVE_CAP_MS);
   const toMs = Math.min(nowMs, rawEndMs + INCIDENT_METRICS_POST_MS);
+  // Bucket width that keeps every tile at or under TILE_MAX_POINTS points regardless of how long
+  // the incident ran (see the constant's comment — resolved spans are retention-bounded, not 1h).
+  const stepMin = Math.max(1, Math.ceil((toMs - fromMs) / 60_000 / TILE_MAX_POINTS));
 
-  // One `queryMetrics` fetch per *distinct* service — two tiles on one service (the common cascade
-  // shape: errors + latency on the same culprit) share the aggregation instead of re-querying.
-  const pointsByService = new Map<string, ServiceMinutePoint[]>();
+  const anomalies = tileAnomalies(incident.trigger);
+  // One `queryMetrics` fetch per *distinct* service, all in flight together — two tiles on one
+  // service (the common cascade shape: errors + latency on the same culprit) share the
+  // aggregation instead of re-querying, and a 3-service cascade pays one round-trip of latency,
+  // not three.
+  const services = [...new Set(anomalies.map((a) => a.service))];
+  const pointsByService = new Map<string, ServiceMinutePoint[]>(
+    await Promise.all(
+      services.map(
+        async (service) =>
+          [service, aggregateToServiceMinutes(await queryMetrics(c.env.DB, { service, fromMs, toMs, stepMin }))] as const,
+      ),
+    ),
+  );
+
   const tiles: IncidentMetricTile[] = [];
-  for (const anomaly of tileAnomalies(incident.trigger)) {
-    let servicePoints = pointsByService.get(anomaly.service);
-    if (servicePoints === undefined) {
-      servicePoints = aggregateToServiceMinutes(
-        await queryMetrics(c.env.DB, { service: anomaly.service, fromMs, toMs, stepMin: 1 }),
-      );
-      pointsByService.set(anomaly.service, servicePoints);
-    }
+  for (const anomaly of anomalies) {
+    const servicePoints = pointsByService.get(anomaly.service) ?? [];
 
     // error_rate tiles speak percent — points AND baseline both ×100, so every number on the tile
     // shares one axis; req_rate/p95 are already in their display units.
@@ -322,7 +325,12 @@ routes.get("/incidents/:id/metrics", async (c) => {
       value:
         anomaly.metricClass === "req_rate" ? p.count : anomaly.metricClass === "error_rate" ? p.error_rate * 100 : p.p95,
     }));
-    const peak = points.reduce((max, p) => Math.max(max, p.value), 0);
+    // The headline "worst value" reaches back only to onset-plausible minutes (see
+    // TILE_PEAK_ONSET_LEAD_MS) — the full pre-open context still charts, it just can't own peak.
+    const peak = points.reduce(
+      (max, p) => (p.minute_ts >= incident.opened_at - TILE_PEAK_ONSET_LEAD_MS ? Math.max(max, p.value) : max),
+      0,
+    );
 
     // Baseline at the SAME aggregation level as the points: the median of the window's pre-open
     // service-level minutes (the 30-min context the window exists to provide). The trigger
@@ -402,15 +410,12 @@ routes.get("/deploys", async (c) => {
       { from: c.req.query("from") ?? DEPLOYS_DEFAULT_FROM, to: c.req.query("to") },
       nowMs,
     );
-    // `id` is stripped for the same reason the agent's list_deploys tool strips it: deploy ids
-    // embed the originating scenario name (`deploy-traffic-spike-…` — idempotent-dedupe keys, see
-    // sim/scenarios.ts), and shipping them to the browser would spoil the simulation honesty
-    // boundary in devtools. The rail cites deploys as service@version, like the agent does.
-    const deploys = (await listDeploys(c.env.DB, { fromMs, toMs })).map(({ id: _id, ...deploy }) => deploy);
-    // listDeploys returns chronological ascending (a correlation timeline — the right order for
-    // the agent's onset analysis, see read.ts). The deploys rail wants recent-first, so reverse
-    // HERE, at the presentation seam, rather than changing the shared query function the agent's
-    // list_deploys tool also consumes.
+    // Rows arrive id-free from the query seam (see read.ts's listDeploys — deploy ids embed the
+    // injected scenario's name, and shipping them to the browser would spoil the honesty boundary
+    // in devtools). listDeploys returns chronological ascending (a correlation timeline — the
+    // right order for the agent's onset analysis); the deploys rail wants recent-first, so
+    // reverse HERE, at the presentation seam, rather than changing the shared query function.
+    const deploys = await listDeploys(c.env.DB, { fromMs, toMs });
     deploys.reverse();
     return c.json({ deploys });
   } catch (err) {

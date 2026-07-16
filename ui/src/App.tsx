@@ -3,6 +3,7 @@ import { Wordmark } from "./components/Wordmark";
 import { Pill } from "./components/Pill";
 import { getIncidents, getState } from "./lib/api";
 import { usePoll } from "./lib/poll";
+import { storageSet } from "./lib/storage";
 import { ToastProvider } from "./lib/toast";
 import type { StateResponse } from "./lib/types";
 import { AnalyticsRow } from "./panels/Analytics";
@@ -44,7 +45,7 @@ function ThemeToggle() {
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    localStorage.setItem("wt-theme", theme);
+    storageSet("wt-theme", theme);
   }, [theme]);
 
   return (

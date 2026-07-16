@@ -514,6 +514,26 @@ export async function insertInvestigationStep(db: D1Database, input: Investigati
     .run();
 }
 
+/** Appends a step AFTER whatever the timeline already holds, computing MAX(step_no)+1 inside the
+ * INSERT itself — one atomic statement (SQLite is single-writer), so two concurrent appends can't
+ * read the same MAX and silently lose one row the way a separate SELECT + `INSERT OR IGNORE` pair
+ * does. This is for out-of-band writers (operator remediation approval); the loop/DO/sweep keep
+ * `insertInvestigationStep` with caller-derived step numbers, whose OR IGNORE idempotency is what
+ * makes their resume-replays safe. A plain INSERT here: this path can't collide, so a thrown
+ * constraint error is better than a silent drop. */
+export async function appendInvestigationStep(
+  db: D1Database,
+  input: Omit<InvestigationStepInput, "stepNo">,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO investigation_steps (incident_id, step_no, kind, content_json, ts_ms, tokens_in, tokens_out)
+       SELECT ?, COALESCE((SELECT MAX(step_no) FROM investigation_steps WHERE incident_id = ?), 0) + 1, ?, ?, ?, ?, ?`,
+    )
+    .bind(input.incidentId, input.incidentId, input.kind, input.contentJson, input.tsMs, input.tokensIn, input.tokensOut)
+    .run();
+}
+
 // --- autoResolve ------------------------------------------------------------------------------
 
 /** `Number(...)` a stored health timestamp, treating anything that isn't a finite number (missing

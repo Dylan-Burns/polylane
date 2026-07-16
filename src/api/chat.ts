@@ -343,21 +343,17 @@ async function tryEnterChatTurn(db: D1Database, nowMs: number): Promise<ChatGate
   if (leaseKey === null) {
     return { ok: false, reason: "too many people are chatting right now — please try again in a moment" };
   }
-  // TEMPORARILY DISABLED (2026-07-16): the hourly chat-turn budget is switched off for now.
-  // Re-enable by uncommenting this block and un-skipping the "hourly limit" test in
-  // test/integration/chat.test.ts. The concurrency lease above and the per-turn loop caps
-  // (CHAT_CAPS) stay active — this only removes the 60-turns/hour ceiling.
-  // let allowed: boolean;
-  // try {
-  //   allowed = await tryConsumeChatTurnBudget(db, nowMs);
-  // } catch (err) {
-  //   await releaseConcurrentSSESlot(db, leaseKey);
-  //   throw err;
-  // }
-  // if (!allowed) {
-  //   await releaseConcurrentSSESlot(db, leaseKey);
-  //   return { ok: false, reason: "chat has hit its hourly limit — please try again later" };
-  // }
+  let allowed: boolean;
+  try {
+    allowed = await tryConsumeChatTurnBudget(db, nowMs);
+  } catch (err) {
+    await releaseConcurrentSSESlot(db, leaseKey);
+    throw err;
+  }
+  if (!allowed) {
+    await releaseConcurrentSSESlot(db, leaseKey);
+    return { ok: false, reason: "chat has hit its hourly limit — please try again later" };
+  }
   return { ok: true, leaseKey };
 }
 
@@ -620,12 +616,16 @@ export function createChatApp({ llmFactory = streamingLLM, nowFn = Date.now }: C
     // input, incident included, has been resolved.
     let incidentContext: string | undefined;
     if (validated.incidentId !== undefined) {
-      const { incidents } = await getIncidents(c.env.DB, { id: validated.incidentId });
+      // Both reads in flight together — this latency sits before the SSE stream can even open,
+      // so it's first-token time; the steps read for an unknown id is harmless (empty list).
+      const [{ incidents }, steps] = await Promise.all([
+        getIncidents(c.env.DB, { id: validated.incidentId }),
+        listInvestigationSteps(c.env.DB, validated.incidentId),
+      ]);
       const incident = incidents[0];
       if (incident === undefined) {
         return c.json({ error: "unknown incident id" }, 400);
       }
-      const steps = await listInvestigationSteps(c.env.DB, validated.incidentId);
       incidentContext = buildIncidentContext(incident, steps);
     }
 

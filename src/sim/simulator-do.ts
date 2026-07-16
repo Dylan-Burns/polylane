@@ -36,6 +36,23 @@ export function simulatorStub(env: Env): DurableObjectStub {
   return env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
 }
 
+/** Fetches the singleton SimulatorDO's `/status` and returns its body verbatim — `null` on ANY
+ * failure (network error, non-2xx, malformed JSON). Lives beside `simulatorStub` because the
+ * fetch-and-null contract is the DO's; what null MEANS stays with each caller: `/api/state`
+ * fails open (render something), the remediation gate fails closed (refuse to restore on a
+ * guess). Type is structural (`{ fault: { startedMs: number } | null } & Record<string, unknown>`
+ * via the caller's cast) — callers import `WorldStatusView` from telemetry/state themselves to
+ * avoid a sim → telemetry import cycle. */
+export async function fetchWorldStatus<T>(env: Env): Promise<T | null> {
+  try {
+    const res = await simulatorStub(env).fetch("http://simulator/status");
+    if (!res.ok) return null;
+    return await res.json<T>();
+  } catch {
+    return null;
+  }
+}
+
 /** Alarm cadence: drives both live ticking and (while seeding) one backfill chunk per firing. */
 const ALARM_INTERVAL_MS = 20_000;
 

@@ -21,10 +21,10 @@
 
 import type {
   BaselineMetric,
-  Deploy,
   IncidentView,
   LogLine,
   MetricPoint,
+  PublicDeploy,
   RollupRow,
   Span,
   TraceSummary,
@@ -715,12 +715,14 @@ export interface ListDeploysArgs {
 
 /** Deploy/change events within `[fromMs, toMs)`, chronological ascending (a timeline, for
  * correlating with a regression's onset). No caller-facing cap: `deploys` is low-volume by
- * design (spec §7), so this never needs shape-aware truncation. */
-export async function listDeploys(db: D1Database, args: ListDeploysArgs): Promise<Deploy[]> {
+ * design (spec §7), so this never needs shape-aware truncation. `id` is deliberately never
+ * selected — it embeds the injected scenario's name, and stripping it HERE (rather than in each
+ * consumer) is what makes the honesty boundary un-forgettable; see `PublicDeploy`. */
+export async function listDeploys(db: D1Database, args: ListDeploysArgs): Promise<PublicDeploy[]> {
   const { results } = await db
-    .prepare("SELECT id, service, version, ts_ms, note FROM deploys WHERE ts_ms >= ? AND ts_ms < ? ORDER BY ts_ms ASC")
+    .prepare("SELECT service, version, ts_ms, note FROM deploys WHERE ts_ms >= ? AND ts_ms < ? ORDER BY ts_ms ASC")
     .bind(args.fromMs, args.toMs)
-    .all<Deploy>();
+    .all<PublicDeploy>();
   return results ?? [];
 }
 

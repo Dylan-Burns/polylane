@@ -161,11 +161,9 @@ describe("POST /api/chat — SSE event sequence", () => {
     const leases = await env.DB.prepare(`SELECT COUNT(*) AS n FROM meta WHERE key GLOB 'chat_sse_lease:*'`).first<{ n: number }>();
     expect(leases?.n).toBe(0);
 
-    // While the hourly chat-turn budget is temporarily disabled (see src/api/chat.ts's
-    // tryEnterChatTurn), a completed turn records nothing. Restore this assertion to
-    // `toMatchObject({ count: 1 })` when re-enabling the budget.
+    // A completed turn consumed exactly one slot of the hourly budget.
     const turns = await env.DB.prepare(`SELECT value FROM meta WHERE key = 'chat_turns_hour'`).first<{ value: string }>();
-    expect(turns).toBeNull();
+    expect(JSON.parse(turns?.value ?? "{}")).toMatchObject({ count: 1 });
   });
 });
 
@@ -274,9 +272,7 @@ describe("POST /api/chat — over-cap guardrails", () => {
     expect(leases?.n).toBe(0);
   });
 
-  // Skipped while the hourly chat-turn budget is temporarily disabled — see the commented-out
-  // block in src/api/chat.ts's tryEnterChatTurn. Un-skip when re-enabling the budget.
-  it.skip("a pre-set chat_turns_hour count at the hourly limit -> a single graceful error event", async () => {
+  it("a pre-set chat_turns_hour count at the hourly limit -> a single graceful error event", async () => {
     const nowMs = Date.UTC(2026, 0, 5, 14, 0, 0);
     await env.DB.prepare(`REPLACE INTO meta (key, value) VALUES ('chat_turns_hour', ?)`)
       .bind(JSON.stringify({ windowStartMs: nowMs, count: 60 }))

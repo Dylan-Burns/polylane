@@ -36,8 +36,10 @@ export function baselineKey(service: string, operation: string, metric: Baseline
 }
 
 /** Standard median: the middle element for odd `n`, the mean of the two middle elements for even
- * `n`. `values` is never mutated (sorted on a copy). */
-function median(values: readonly number[]): number {
+ * `n`. `values` is never mutated (sorted on a copy). Exported as THE median for anything claiming
+ * to mirror the detector's math (the incident metric tiles do) — a second private copy could
+ * silently drift from what the alerts were computed with. */
+export function median(values: readonly number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const n = sorted.length;
   const mid = Math.floor(n / 2);

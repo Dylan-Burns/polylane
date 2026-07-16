@@ -745,14 +745,17 @@ describe("getTrace", () => {
 });
 
 describe("listDeploys", () => {
-  it("returns deploys within the window, chronological ascending", async () => {
+  it("returns deploys within the window, chronological ascending, without the internal id", async () => {
     const deploys = await listDeploys(env.DB, { fromMs: T0 - 15 * MIN, toMs: T0 + 30 * MIN });
-    expect(deploys.map((d) => d.id)).toEqual(["deploy-1", "deploy-2"]);
+    expect(deploys.map((d) => d.version)).toEqual(["v2.4.1", "v1.8.3"]);
+    // The id embeds the injected scenario's name — the query seam must never surface it
+    // (simulation honesty boundary; every consumer inherits this guarantee).
+    for (const d of deploys) expect((d as { id?: string }).id).toBeUndefined();
   });
 
   it("excludes deploys before fromMs (half-open window)", async () => {
     const deploys = await listDeploys(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN });
-    expect(deploys.map((d) => d.id)).toEqual(["deploy-2"]);
+    expect(deploys.map((d) => d.version)).toEqual(["v1.8.3"]);
   });
 });
 

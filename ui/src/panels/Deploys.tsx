@@ -12,6 +12,7 @@
  * how the "red-herring catalog deploy vs. actual culprit" detection story becomes visible.
  */
 
+import { useMemo } from "react";
 import { getDeploys } from "../lib/api";
 import { relativeTime } from "../lib/format";
 import { usePoll } from "../lib/poll";
@@ -32,32 +33,46 @@ type Correlation = { kind: "live"; incidentId: string } | { kind: "closed"; inci
  * flag today's unrelated re-deploy of the same version (adversarial-review finding). */
 const CORRELATION_LEAD_MS = 2 * 60 * 60_000;
 
+/** An incident paired with its report serialized ONCE — `correlate` runs per deploy per render,
+ * and re-stringifying every report for every row multiplied the same work ~16× per poll. Report-
+ * less incidents are dropped here since they can never match. */
+interface CorrelationEntry {
+  incident: IncidentView;
+  reportJson: string;
+}
+
+function prepareCorrelation(incidents: IncidentView[]): CorrelationEntry[] {
+  const entries: CorrelationEntry[] = [];
+  for (const incident of incidents) {
+    if (incident.report === null) continue;
+    try {
+      entries.push({ incident, reportJson: JSON.stringify(incident.report) });
+    } catch {
+      // Unserializable report — can never substring-match, same as report-less.
+    }
+  }
+  return entries;
+}
+
 /** First time-plausible incident whose report mentions this deploy (by version — the only handle
  * the agent ever sees; internal ids never cross the wire) — live incidents are checked before
  * closed ones so an ongoing incident always wins the stronger chip.
  * Deliberately a plain substring check over the report JSON, labeled as exactly that ("named
  * in"): the chip claims the report *names* this deploy, not that the deploy was the cause — a
  * report exonerating a red-herring deploy by name still legitimately lights it up. */
-function correlate(deploy: PublicDeploy, incidents: IncidentView[]): Correlation {
-  const mentions = (incident: IncidentView): boolean => {
+function correlate(deploy: PublicDeploy, entries: CorrelationEntry[]): Correlation {
+  const mentions = ({ incident, reportJson }: CorrelationEntry): boolean => {
     // Time-plausibility first: deploy shipped within the lead window before the incident opened,
     // or while the incident was still unresolved.
     const windowStart = incident.opened_at - CORRELATION_LEAD_MS;
     const windowEnd = incident.resolved_at ?? Number.POSITIVE_INFINITY;
     if (deploy.ts_ms < windowStart || deploy.ts_ms > windowEnd) return false;
-    if (incident.report === null) return false;
-    let json: string;
-    try {
-      json = JSON.stringify(incident.report);
-    } catch {
-      return false;
-    }
-    return json.includes(deploy.version);
+    return reportJson.includes(deploy.version);
   };
-  const live = incidents.find((i) => LIVE_STATUSES.has(i.status) && mentions(i));
-  if (live) return { kind: "live", incidentId: live.id };
-  const closed = incidents.find((i) => !LIVE_STATUSES.has(i.status) && mentions(i));
-  if (closed) return { kind: "closed", incidentId: closed.id };
+  const live = entries.find((e) => LIVE_STATUSES.has(e.incident.status) && mentions(e));
+  if (live) return { kind: "live", incidentId: live.incident.id };
+  const closed = entries.find((e) => !LIVE_STATUSES.has(e.incident.status) && mentions(e));
+  if (closed) return { kind: "closed", incidentId: closed.incident.id };
   return null;
 }
 
@@ -105,6 +120,8 @@ export function DeploysCard({ incidents, active }: { incidents: IncidentView[]; 
   const { data, error } = usePoll(getDeploys, active ? DEPLOYS_POLL_MS : null);
   const deploys = data?.deploys ?? [];
   const shown = deploys.slice(0, MAX_ROWS);
+  // Serialized once per incidents-poll, not per deploy row per render.
+  const correlationEntries = useMemo(() => prepareCorrelation(incidents), [incidents]);
 
   return (
     <section className="flex flex-col gap-3 rounded-2xl border border-hairline bg-panel/40 p-5">
@@ -119,8 +136,8 @@ export function DeploysCard({ incidents, active }: { incidents: IncidentView[]; 
       )}
 
       <ul className="flex flex-col gap-2">
-        {shown.map((d) => (
-          <DeployRow key={`${d.service}@${d.version}@${d.ts_ms}`} deploy={d} correlation={correlate(d, incidents)} />
+        {shown.map((d, i) => (
+          <DeployRow key={`${d.service}@${d.version}@${d.ts_ms}@${i}`} deploy={d} correlation={correlate(d, correlationEntries)} />
         ))}
       </ul>
 

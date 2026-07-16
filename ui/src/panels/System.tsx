@@ -12,6 +12,7 @@ import { SCENARIOS } from "../../../src/sim/scenarios";
 import { Sparkline } from "../components/Sparkline";
 import { relativeTime } from "../lib/format";
 import { HEALTH_COLOR, HEALTH_LABEL } from "../lib/status";
+import { storageGet, storageSet } from "../lib/storage";
 import type { IncidentView, OpsHealth, SparklinePoint, StateResponse, TopologyServiceNode, WorldStatusView } from "../lib/types";
 import { GalaxyView, type GalaxyServiceStat } from "./system/Galaxy";
 
@@ -279,7 +280,7 @@ type TopologyViewMode = "galaxy" | "grid";
 const VIEW_MODE_KEY = "wt-system-view";
 
 function initialViewMode(): TopologyViewMode {
-  return localStorage.getItem(VIEW_MODE_KEY) === "grid" ? "grid" : "galaxy";
+  return storageGet(VIEW_MODE_KEY) === "grid" ? "grid" : "galaxy";
 }
 
 /** The Galaxy|Grid segmented control — the same soft pill track as the header's Dashboard|Chat
@@ -326,7 +327,7 @@ export function SystemView({ state, incidents }: { state: StateResponse; inciden
 
   function changeViewMode(mode: TopologyViewMode) {
     setViewMode(mode);
-    localStorage.setItem(VIEW_MODE_KEY, mode);
+    storageSet(VIEW_MODE_KEY, mode);
   }
 
   const stats = galaxyStats(state, latestMinuteTs);

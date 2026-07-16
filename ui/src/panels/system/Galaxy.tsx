@@ -172,6 +172,10 @@ export function GalaxyView({ services, edges, health, stats }: GalaxyProps) {
   const flowsRef = useRef<Map<string, EdgeFlow>>(new Map());
   const propsRef = useRef<GalaxyProps>({ services, edges, health, stats });
   const hoveredRef = useRef<string | null>(null);
+  /** Set by the mount effect ONLY under reduced motion — the prop-driven effect below calls it so
+   * a static frame still repaints when health/stats change (the rAF loop, when running, reads
+   * live props every frame and needs no nudge). */
+  const staticRedrawRef = useRef<(() => void) | null>(null);
   const [tooltip, setTooltip] = useState<TooltipState | null>(null);
   const [hoveredRail, setHoveredRail] = useState<string | null>(null);
 
@@ -430,6 +434,7 @@ export function GalaxyView({ services, edges, health, stats }: GalaxyProps) {
     let themeObserver: MutationObserver | undefined;
     if (reducedMotion) {
       draw(performance.now());
+      staticRedrawRef.current = () => draw(performance.now());
       themeObserver = new MutationObserver(() => draw(performance.now()));
       themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
     } else {
@@ -440,13 +445,19 @@ export function GalaxyView({ services, edges, health, stats }: GalaxyProps) {
       cancelAnimationFrame(raf);
       resizeObserver.disconnect();
       themeObserver?.disconnect();
+      staticRedrawRef.current = null;
     };
     // The rAF loop reads live data through propsRef — mounting once is deliberate.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Static-frame redraws when data changes under reduced motion are handled by the observers
-  // above; for the common animated path the loop picks new props up on the next frame.
+  // Static-frame repaint on data change under reduced motion: the observers above only cover
+  // resize and theme flips, so without this a health transition (green → incident red) would stay
+  // invisible until one of those happened. No-op on the animated path (staticRedrawRef is null —
+  // the loop picks new props up on the next frame).
+  useEffect(() => {
+    staticRedrawRef.current?.();
+  }, [services, edges, health, stats]);
 
   function hitTest(clientX: number, clientY: number): TooltipState | null {
     const container = containerRef.current;
@@ -480,7 +491,17 @@ export function GalaxyView({ services, edges, health, stats }: GalaxyProps) {
       <div
         ref={containerRef}
         className="relative h-[380px] min-w-0 flex-1"
-        onPointerMove={(e) => setTooltip(hitTest(e.clientX, e.clientY))}
+        onPointerMove={(e) => {
+          const hit = hitTest(e.clientX, e.clientY);
+          // Functional update with an identity bail-out: pointer events arrive at ~60/s, and a
+          // fresh {name,x,y} per event would re-render the whole view (rail, aria recompute) even
+          // while hovering one cluster — or empty space — continuously.
+          setTooltip((prev) => {
+            if (prev === hit) return prev;
+            if (prev && hit && prev.name === hit.name && prev.x === hit.x && prev.y === hit.y) return prev;
+            return hit;
+          });
+        }}
         onPointerLeave={() => setTooltip(null)}
       >
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" role="img" aria-label={galaxyAriaLabel(services, health, stats)} />

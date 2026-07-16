@@ -66,26 +66,24 @@ function AreaChart({ tile }: { tile: IncidentMetricTile }) {
 
   const max = Math.max(...points.map((p) => p.value), 1e-9);
   const stepX = points.length > 1 ? W / (points.length - 1) : 0;
-  const xy = points.map((p, i) => {
-    const x = points.length > 1 ? i * stepX : W / 2;
-    const y = H - 2 - (p.value / max) * (H - 4);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  });
+  const xy = points.map((p, i) => ({
+    x: points.length > 1 ? i * stepX : W / 2,
+    y: H - 2 - (p.value / max) * (H - 4),
+  }));
 
-  if (points.length === 1) {
-    const [only] = xy;
-    const [cx = "50", cy = "16"] = (only ?? "").split(",");
+  if (points.length === 1 && xy[0]) {
     return (
       <svg viewBox={`0 0 ${W} ${H}`} className="h-10 w-full" preserveAspectRatio="none" aria-hidden="true">
-        <circle cx={cx} cy={cy} r="1.8" fill={color} />
+        <circle cx={xy[0].x} cy={xy[0].y} r="1.8" fill={color} />
       </svg>
     );
   }
 
+  const path = xy.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="h-10 w-full" preserveAspectRatio="none" aria-hidden="true">
-      <polygon points={`0,${H} ${xy.join(" ")} ${W},${H}`} fill={color} opacity="0.12" />
-      <polyline points={xy.join(" ")} fill="none" stroke={color} strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+      <polygon points={`0,${H} ${path} ${W},${H}`} fill={color} opacity="0.12" />
+      <polyline points={path} fill="none" stroke={color} strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
     </svg>
   );
 }

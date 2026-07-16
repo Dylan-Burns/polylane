@@ -20,7 +20,13 @@
     <!-- Theme is applied before first paint (polylane.com-style light/dark toggle — tokens flip via
          html[data-theme] in index.css). Inline so a dark-mode user never sees a light flash. -->
     <script>
-      document.documentElement.dataset.theme = localStorage.getItem("wt-theme") === "dark" ? "dark" : "light";
+      // try/catch: with cookies/site-data blocked, touching localStorage throws SecurityError —
+      // fall to the light default rather than dying before React boots.
+      try {
+        document.documentElement.dataset.theme = localStorage.getItem("wt-theme") === "dark" ? "dark" : "light";
+      } catch (e) {
+        document.documentElement.dataset.theme = "light";
+      }
     </script>
   </head>
   <body>

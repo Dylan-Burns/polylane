@@ -54,6 +54,14 @@ function applyEvent(message: ThreadMessage, event: ChatSSEEvent): ThreadMessage 
   }
 }
 
+/** Drop whole oldest user/assistant PAIRS until the list fits the thread cap — one truncation
+ * rule shared by the wire payload and the visible thread, so what's shown is what's sent. */
+function capTurns<T>(list: T[]): T[] {
+  let out = list;
+  while (out.length > MAX_THREAD_TURNS) out = out.slice(2);
+  return out;
+}
+
 function wirePayload(history: ThreadMessage[], newUserText: string): ChatRequestTurn[] {
   const turns: ChatRequestTurn[] = [];
   for (let i = 0; i + 1 < history.length; i += 2) {
@@ -64,9 +72,7 @@ function wirePayload(history: ThreadMessage[], newUserText: string): ChatRequest
     turns.push({ role: "user", content: user.content }, { role: "assistant", content: assistant.content });
   }
   turns.push({ role: "user", content: newUserText });
-  let out = turns;
-  while (out.length > MAX_THREAD_TURNS) out = out.slice(2);
-  return out;
+  return capTurns(turns);
 }
 
 function Bubble({ message }: { message: ThreadMessage }) {
@@ -116,11 +122,7 @@ export function DigDeeper({ incidentId }: { incidentId: string }) {
     const assistantMessage: ThreadMessage = { id: assistantId, role: "assistant", content: "", tools: [], pending: true };
     const payload = wirePayload(messages, text);
 
-    setMessages((prev) => {
-      let next = [...prev, userMessage, assistantMessage];
-      while (next.length > MAX_THREAD_TURNS) next = next.slice(2);
-      return next;
-    });
+    setMessages((prev) => capTurns([...prev, userMessage, assistantMessage]));
     setDraft("");
     setSending(true);
 

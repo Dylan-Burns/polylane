@@ -137,8 +137,10 @@ function compactStepContent(step: StepView): string {
     const label = typeof name === "string" ? name : "(unknown tool)";
     return `${label} ${(JSON.stringify(step.content) ?? "").slice(0, 120)}`;
   }
-  // note / error: prefer the message-ish string field the loop actually writes, fall back to JSON.
-  const rec = step.content as { message?: unknown; text?: unknown } | null;
+  // note / error: prefer the message-ish string field, fall back to JSON. The key set mirrors
+  // ui/.../normalize.ts's normalizeNote — every note writer must be readable here too: the loop
+  // writes {update}, remediate.ts writes {note}, sweep.ts's budget-deferral writes {note}.
+  const rec = step.content as { message?: unknown; text?: unknown; update?: unknown; note?: unknown } | null;
   const messageish =
     typeof step.content === "string"
       ? step.content
@@ -146,7 +148,11 @@ function compactStepContent(step: StepView): string {
         ? rec.message
         : typeof rec?.text === "string"
           ? rec.text
-          : (JSON.stringify(step.content) ?? "");
+          : typeof rec?.update === "string"
+            ? rec.update
+            : typeof rec?.note === "string"
+              ? rec.note
+              : (JSON.stringify(step.content) ?? "");
   return messageish.slice(0, 160);
 }
 

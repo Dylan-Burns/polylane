@@ -42,6 +42,12 @@ export interface Deploy {
   note: string;
 }
 
+/** A deploy as every reader sees it: `id` embeds the originating scenario name
+ * (`deploy-<scenario>-<svc>-<ver>` — an idempotent-dedupe key, see sim/scenarios.ts), so it exists
+ * only at insert time; `listDeploys` never selects it, keeping the simulation honesty boundary at
+ * the query seam instead of trusting each consumer (agent tool, UI endpoint) to re-strip it. */
+export type PublicDeploy = Omit<Deploy, "id">;
+
 /** The four metric classes baselines are computed over (spec §8 v2.1): `req_rate` maps to a
  * `MetricPoint`'s `count`, `error_rate`/`p95`/`p50` map to the like-named fields. `p50` exists to
  * back the latency rules' distribution-shift confirmation (p50 >= 2.0x its baseline), not as an

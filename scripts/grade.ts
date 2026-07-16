@@ -48,14 +48,24 @@ const EXONERATION_MARKERS = [
   "symptom", "rather than", "instead of", "red herring", "unchanged",
   // Corroboration/correlation, NOT causal attribution ("the surge is consistent with the deploy
   // timing"). Noting that a deploy coincided is exactly what an analyst should do; it is not
-  // blaming the deploy as the root cause. A report that actually blamed the deploy ("the deploy
-  // caused the surge") carries none of these markers and still fails.
+  // blaming the deploy as the root cause.
   "consistent with", "correlat", "coincid", "alongside", "at the same time", "around the same", "timing",
 ];
 const EXONERATION_WINDOW = 80;
 
-/** True if EVERY occurrence of `term` in `text` sits near an exoneration marker (i.e. the term is
- * only ever mentioned to rule it out, never blamed). */
+/** Causal-attribution phrases that DEFEAT an exoneration marker in the same window: blame and
+ * correlation vocabulary routinely co-occur ("the surge's timing proves the deploy caused the
+ * outage"), and without this override any correlation word within 80 chars would launder an
+ * explicit blame into a rule-out. Constrained by the real-report fixtures in
+ * test/unit/grade.test.ts: "because of" (not bare "because" — DEPENDENCY_OUTAGE_REAL uses an
+ * exculpatory "Because checkout... treats the send as non-blocking"), and no "drove"/"drive"
+ * (TRAFFIC_SPIKE_REAL's passing report says the surge "drove ~3-5x normal load"). */
+const CAUSAL_OVERRIDES = [
+  "caused", "root cause", "due to", "because of", "introduced", "triggered", "roll back", "rolled back", "blame",
+];
+
+/** True if EVERY occurrence of `term` in `text` sits near an exoneration marker with no causal
+ * phrase alongside it (i.e. the term is only ever mentioned to rule it out, never blamed). */
 function onlyExculpatory(text: string, term: string): boolean {
   let idx = text.indexOf(term);
   if (idx === -1) return false; // not present at all — caller handles that separately
@@ -63,7 +73,9 @@ function onlyExculpatory(text: string, term: string): boolean {
     const lo = Math.max(0, idx - EXONERATION_WINDOW);
     const hi = Math.min(text.length, idx + term.length + EXONERATION_WINDOW);
     const window = text.slice(lo, hi);
-    if (!EXONERATION_MARKERS.some((m) => window.includes(m))) return false; // a blame-context occurrence
+    const exonerated =
+      EXONERATION_MARKERS.some((m) => window.includes(m)) && !CAUSAL_OVERRIDES.some((c) => window.includes(c));
+    if (!exonerated) return false; // a blame-context occurrence
     idx = text.indexOf(term, idx + term.length);
   }
   return true;

@@ -24,24 +24,15 @@
 
 import { Hono } from "hono";
 import type { Env } from "../env";
-import { simulatorStub } from "../sim/simulator-do";
-import { insertInvestigationStep } from "../telemetry/incidents";
+import { fetchWorldStatus as fetchWorldStatusFromDO, simulatorStub } from "../sim/simulator-do";
+import { appendInvestigationStep } from "../telemetry/incidents";
 import { getIncidents } from "../telemetry/read";
 import type { WorldStatusView } from "../telemetry/state";
 
-/** Fetches `SimulatorDO`'s `/status` exactly like `api/routes.ts`'s `fetchWorldStatus` — body
- * verbatim, `null` on any failure (network error, non-2xx, malformed JSON). Here `null` folds into
- * the "no fault active" 409 below: if we can't PROVE a fault is active, we refuse to fire a
+/** `simulator-do.ts`'s shared status fetch, pinned to this module's view type. Here `null` folds
+ * into the "no fault active" 409 below: if we can't PROVE a fault is active, we refuse to fire a
  * world-mutating restore on a guess (fail closed, unlike `/api/state`'s render-something fallback). */
-async function fetchWorldStatus(env: Env): Promise<WorldStatusView | null> {
-  try {
-    const res = await simulatorStub(env).fetch("http://simulator/status");
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
+const fetchWorldStatus = (env: Env) => fetchWorldStatusFromDO<WorldStatusView>(env);
 
 /** Reads `suggested_action` defensively out of the report (`IncidentView.report` is `unknown` by
  * contract — the agent authored it, and `validateReport` guarantees shape at submit time but this
@@ -94,24 +85,17 @@ remediationRoutes.post("/:id/remediate", async (c) => {
     return new Response(body, { status: res.status, headers: { "content-type": "application/json" } });
   }
 
-  // The restore actually happened -- record the approval on the incident's own timeline. MAX+1
-  // (COALESCE'd to 0 for a step-less incident) appends after whatever the investigation wrote;
-  // insertInvestigationStep's INSERT OR IGNORE makes a raced duplicate step number a no-op rather
-  // than a thrown PK collision, consistent with the loop's own resumable writes.
-  const row = await c.env.DB
-    .prepare(`SELECT COALESCE((SELECT MAX(step_no) FROM investigation_steps WHERE incident_id = ?), 0) + 1 AS next_no`)
-    .bind(id)
-    .first<{ next_no: number }>();
-  const stepNo = row?.next_no ?? 1;
-
+  // The restore actually happened -- record the approval on the incident's own timeline.
+  // appendInvestigationStep computes MAX(step_no)+1 inside one atomic INSERT, so two concurrent
+  // approvals (two tabs, two operators) can't read the same MAX and silently lose the audit note
+  // the way a separate SELECT + INSERT OR IGNORE pair would.
   const suggestedAction = readSuggestedAction(incident.report);
   const message = `Remediation approved by operator: ${suggestedAction} — executed by restoring the injected fault (rollback).`;
-  await insertInvestigationStep(c.env.DB, {
+  await appendInvestigationStep(c.env.DB, {
     incidentId: id,
-    stepNo,
     kind: "note",
-    // `{note: ...}` is the shape the timeline's note renderer reads (`normalize.ts`'s
-    // `normalizeNote`); `kind` rides along for programmatic consumers.
+    // `{note: ...}` is the shape both step renderers read (`normalize.ts`'s `normalizeNote` and
+    // `chat-prompt.ts`'s `compactStepContent`); `kind` rides along for programmatic consumers.
     contentJson: JSON.stringify({ kind: "remediation", note: message }),
     tsMs: Date.now(),
     tokensIn: 0,

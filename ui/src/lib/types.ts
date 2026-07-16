@@ -15,9 +15,9 @@
  */
 
 import type { FaultState, ScenarioId } from "../../../src/sim/scenarios";
-import type { Deploy, IncidentView, LogLine, Span, TraceView } from "../../../src/telemetry/types";
+import type { IncidentView, LogLine, PublicDeploy, Span, TraceView } from "../../../src/telemetry/types";
 
-export type { Deploy, FaultState, IncidentView, LogLine, ScenarioId, Span, TraceView };
+export type { FaultState, IncidentView, LogLine, PublicDeploy, ScenarioId, Span, TraceView };
 
 // --- /api/state (mirrors src/telemetry/state.ts's exported interfaces) --------------------------
 
@@ -97,11 +97,8 @@ export interface AnalyticsResponse {
   errorRatePct: number | null;
 }
 
-// --- /api/deploys (src/telemetry/types.ts's Deploy rows MINUS `id`: the internal id embeds the
-// originating scenario name, so the endpoint strips it — same honesty boundary as the agent's
-// list_deploys tool) ------------------------------------------------------------------------------
-
-export type PublicDeploy = Omit<Deploy, "id">;
+// --- /api/deploys (id-free rows straight from the query seam — src/telemetry/read.ts's
+// listDeploys never selects the scenario-revealing internal id) ----------------------------------
 
 export interface DeployListResponse {
   deploys: PublicDeploy[];
