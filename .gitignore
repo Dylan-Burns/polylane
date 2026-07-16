@@ -18,3 +18,7 @@ dist/
 # Test / coverage
 coverage/
 .superpowers/
+
+# Claude Code local state (permissions, worktrees)
+.claude/
+.playwright-mcp/
