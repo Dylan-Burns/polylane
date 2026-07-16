@@ -49,7 +49,10 @@ interface JSONSchema {
   properties?: Record<string, JSONSchema>;
   items?: JSONSchema;
   required?: readonly string[];
-  enum?: readonly string[];
+  /** May include `null` — REQUIRED whenever the property's `type` union includes `"null"`: `enum`
+   * is an exhaustive value list, so a nullable type whose enum omits null is self-contradictory
+   * and the Anthropic strict validator 400s the whole request (observed live in Task 4.3). */
+  enum?: readonly (string | null)[];
   additionalProperties?: boolean;
 }
 
@@ -100,7 +103,7 @@ const SEARCH_LOGS_SCHEMA: JSONSchema = {
   type: "object",
   properties: {
     service: { type: ["string", "null"], description: "Restrict to log lines emitted by one service. Omit/null for all services." },
-    level: { type: ["string", "null"], enum: LOG_LEVELS, description: "Restrict to one log level. Omit/null for all levels." },
+    level: { type: ["string", "null"], enum: [...LOG_LEVELS, null], description: "Restrict to one log level. Omit/null for all levels." },
     contains: { type: ["string", "null"], description: "Literal (non-pattern) case-insensitive substring the log message must contain. Omit/null for no filter." },
     window: WINDOW_SCHEMA,
     limit: { type: ["integer", "null"], description: `Max rows to return, newest first. Clamped to [1, ${SEARCH_LOGS_MAX_LIMIT}]; defaults to ${SEARCH_LOGS_MAX_LIMIT}.` },

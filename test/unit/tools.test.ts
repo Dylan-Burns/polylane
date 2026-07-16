@@ -185,9 +185,31 @@ describe("TOOLS", () => {
     }
   });
 
+  it("every nullable-typed enum property also lists null in its enum (the Anthropic strict validator 400s on the contradiction)", () => {
+    // Live-observed failure (Task 4.3 go-live): `{type: ["string","null"], enum: ["info",...]}` is
+    // self-contradictory — `enum` is an exhaustive value list, so null passes `type` but can never
+    // pass `enum` — and the API rejects the whole request with
+    // `Invalid schema: Enum value 'info' does not match declared type '['string', 'null']'`.
+    type SchemaNode = {
+      type: string | readonly string[];
+      enum?: readonly (string | null)[];
+      properties?: Record<string, SchemaNode>;
+      items?: SchemaNode;
+    };
+    const walk = (schema: SchemaNode, path: string): void => {
+      const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+      if (schema.enum !== undefined && types.includes("null")) {
+        expect(schema.enum, `${path}: nullable type with enum must list null`).toContain(null);
+      }
+      for (const [key, child] of Object.entries(schema.properties ?? {})) walk(child, `${path}.${key}`);
+      if (schema.items) walk(schema.items, `${path}[]`);
+    };
+    for (const tool of [...TOOLS, SUBMIT_REPORT]) walk(tool.input_schema as SchemaNode, tool.name);
+  });
+
   it("uses enums for level and criteria, not free-form strings", () => {
     const searchLogs = TOOLS.find((t) => t.name === "search_logs") as ToolDef;
-    expect(searchLogs.input_schema.properties?.level?.enum).toEqual(["info", "warn", "error"]);
+    expect(searchLogs.input_schema.properties?.level?.enum).toEqual(["info", "warn", "error", null]);
 
     const findTraces = TOOLS.find((t) => t.name === "find_traces") as ToolDef;
     expect(findTraces.input_schema.properties?.criteria?.enum).toEqual(["errors", "slowest"]);
