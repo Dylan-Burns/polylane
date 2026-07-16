@@ -402,7 +402,11 @@ routes.get("/deploys", async (c) => {
       { from: c.req.query("from") ?? DEPLOYS_DEFAULT_FROM, to: c.req.query("to") },
       nowMs,
     );
-    const deploys = await listDeploys(c.env.DB, { fromMs, toMs });
+    // `id` is stripped for the same reason the agent's list_deploys tool strips it: deploy ids
+    // embed the originating scenario name (`deploy-traffic-spike-…` — idempotent-dedupe keys, see
+    // sim/scenarios.ts), and shipping them to the browser would spoil the simulation honesty
+    // boundary in devtools. The rail cites deploys as service@version, like the agent does.
+    const deploys = (await listDeploys(c.env.DB, { fromMs, toMs })).map(({ id: _id, ...deploy }) => deploy);
     // listDeploys returns chronological ascending (a correlation timeline — the right order for
     // the agent's onset analysis, see read.ts). The deploys rail wants recent-first, so reverse
     // HERE, at the presentation seam, rather than changing the shared query function the agent's

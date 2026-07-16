@@ -332,9 +332,12 @@ describe("GET /api/deploys", () => {
 
     const res = await SELF.fetch("https://example.com/api/deploys");
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { deploys: Deploy[] };
+    const body = (await res.json()) as { deploys: Array<Omit<Deploy, "id"> & { id?: string }> };
     // Reversed from listDeploys' chronological ascending -- the rail wants recent first.
-    expect(body.deploys.map((d) => d.id)).toEqual(["dep-new", "dep-old"]);
+    expect(body.deploys.map((d) => d.version)).toEqual(["v-dep-new", "v-dep-old"]);
+    // Internal ids embed the originating scenario name (deploy-<scenario>-…) — they must never
+    // reach the browser, same honesty boundary as the agent's list_deploys tool.
+    for (const d of body.deploys) expect(d.id).toBeUndefined();
   });
 
   it("honors an explicit narrow window", async () => {
@@ -344,8 +347,8 @@ describe("GET /api/deploys", () => {
 
     const res = await SELF.fetch("https://example.com/api/deploys?from=-1h");
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { deploys: Deploy[] };
-    expect(body.deploys.map((d) => d.id)).toEqual(["dep-in"]);
+    const body = (await res.json()) as { deploys: Array<Omit<Deploy, "id">> };
+    expect(body.deploys.map((d) => d.version)).toEqual(["v-dep-in"]);
   });
 
   it("400s an unparseable from bound", async () => {

@@ -15,7 +15,7 @@
 import { getDeploys } from "../lib/api";
 import { relativeTime } from "../lib/format";
 import { usePoll } from "../lib/poll";
-import type { Deploy, IncidentView } from "../lib/types";
+import type { IncidentView, PublicDeploy } from "../lib/types";
 
 const DEPLOYS_POLL_MS = 30_000;
 
@@ -32,12 +32,13 @@ type Correlation = { kind: "live"; incidentId: string } | { kind: "closed"; inci
  * flag today's unrelated re-deploy of the same version (adversarial-review finding). */
 const CORRELATION_LEAD_MS = 2 * 60 * 60_000;
 
-/** First time-plausible incident whose report mentions this deploy (by version, then id) — live
- * incidents are checked before closed ones so an ongoing incident always wins the stronger chip.
+/** First time-plausible incident whose report mentions this deploy (by version — the only handle
+ * the agent ever sees; internal ids never cross the wire) — live incidents are checked before
+ * closed ones so an ongoing incident always wins the stronger chip.
  * Deliberately a plain substring check over the report JSON, labeled as exactly that ("named
  * in"): the chip claims the report *names* this deploy, not that the deploy was the cause — a
  * report exonerating a red-herring deploy by name still legitimately lights it up. */
-function correlate(deploy: Deploy, incidents: IncidentView[]): Correlation {
+function correlate(deploy: PublicDeploy, incidents: IncidentView[]): Correlation {
   const mentions = (incident: IncidentView): boolean => {
     // Time-plausibility first: deploy shipped within the lead window before the incident opened,
     // or while the incident was still unresolved.
@@ -51,7 +52,7 @@ function correlate(deploy: Deploy, incidents: IncidentView[]): Correlation {
     } catch {
       return false;
     }
-    return json.includes(deploy.version) || json.includes(deploy.id);
+    return json.includes(deploy.version);
   };
   const live = incidents.find((i) => LIVE_STATUSES.has(i.status) && mentions(i));
   if (live) return { kind: "live", incidentId: live.id };
@@ -81,7 +82,7 @@ function CorrelationChip({ correlation }: { correlation: Correlation }) {
   );
 }
 
-function DeployRow({ deploy, correlation }: { deploy: Deploy; correlation: Correlation }) {
+function DeployRow({ deploy, correlation }: { deploy: PublicDeploy; correlation: Correlation }) {
   return (
     <li className="flex flex-col gap-1 rounded-lg border border-hairline bg-panel px-3 py-2">
       <div className="flex items-center justify-between gap-2">
@@ -119,7 +120,7 @@ export function DeploysCard({ incidents, active }: { incidents: IncidentView[]; 
 
       <ul className="flex flex-col gap-2">
         {shown.map((d) => (
-          <DeployRow key={d.id} deploy={d} correlation={correlate(d, incidents)} />
+          <DeployRow key={`${d.service}@${d.version}@${d.ts_ms}`} deploy={d} correlation={correlate(d, incidents)} />
         ))}
       </ul>
 

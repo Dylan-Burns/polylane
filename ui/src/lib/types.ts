@@ -97,10 +97,14 @@ export interface AnalyticsResponse {
   errorRatePct: number | null;
 }
 
-// --- /api/deploys (the Deploy rows come straight from src/telemetry/types.ts) -------------------
+// --- /api/deploys (src/telemetry/types.ts's Deploy rows MINUS `id`: the internal id embeds the
+// originating scenario name, so the endpoint strips it — same honesty boundary as the agent's
+// list_deploys tool) ------------------------------------------------------------------------------
+
+export type PublicDeploy = Omit<Deploy, "id">;
 
 export interface DeployListResponse {
-  deploys: Deploy[];
+  deploys: PublicDeploy[];
 }
 
 // --- /api/incidents/:id/metrics (mirrors src/api/routes.ts's IncidentMetricsResponse) -----------
