@@ -462,12 +462,16 @@ describe("executeTool", () => {
     expect(result.spans).toHaveLength(2);
   });
 
-  it("list_deploys round-trips within the window", async () => {
+  it("list_deploys round-trips within the window and never exposes the internal id", async () => {
     const result = (await executeTool("list_deploys", { window: { from: "-30m", to: null } }, CTX)) as {
-      deploys: Array<{ id: string }>;
+      deploys: Array<{ id?: string; service: string; version: string }>;
       count: number;
     };
-    expect(result.deploys.map((d) => d.id)).toEqual(["deploy-1"]);
+    expect(result.count).toBe(1);
+    expect(result.deploys.map((d) => `${d.service}@${d.version}`)).toEqual(["payments@v2.4.1"]);
+    // Deploy ids embed the scenario name (`deploy-<scenario>-…`) — exposing one would hand the
+    // agent the injected fault's name, defeating the simulation honesty boundary.
+    expect(result.deploys[0]).not.toHaveProperty("id");
   });
 
   it("get_incidents by id returns the single incident with report/trigger parsed", async () => {
