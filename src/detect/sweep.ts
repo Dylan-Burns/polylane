@@ -52,6 +52,7 @@ import {
   autoResolve,
   findOwnersByFingerprint,
   forceFailStuck,
+  insertInvestigationStep,
   openIncident,
 } from "../telemetry/incidents";
 import { latestRollupMinute, queryMetrics } from "../telemetry/read";
@@ -191,7 +192,26 @@ async function runDetection(env: Env, nowMs: number): Promise<void> {
     if (allowed) {
       await notifyInvestigator(env, id, anomalies);
     } else {
+      // Budget kill-switch (Task 7.1): the incident still opens and is visible, but no investigator
+      // runs this hour. Record a `note` step so the incident detail timeline shows WHY it has no
+      // investigation ("deferred — budget") rather than sitting silently empty. Best-effort: a
+      // failure to write the note must not fail the sweep.
       console.warn(`sweep: investigation budget exhausted this hour, not starting investigator for incident ${id}`);
+      try {
+        await insertInvestigationStep(env.DB, {
+          incidentId: id,
+          stepNo: 0,
+          kind: "note",
+          contentJson: JSON.stringify({
+            note: "Investigation deferred — the hourly investigation budget (10/hour) is exhausted. The incident is recorded; an investigation will run once the budget window resets.",
+          }),
+          tsMs: nowMs,
+          tokensIn: 0,
+          tokensOut: 0,
+        });
+      } catch (err) {
+        console.error(`sweep: failed to record budget-deferred note for incident ${id}`, err);
+      }
     }
   } else {
     await appendFingerprints(env.DB, id, anomalies, nowMs);

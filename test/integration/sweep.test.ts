@@ -226,6 +226,40 @@ describe("runSweep: rollup write-lag (production timing)", () => {
   }, 30_000);
 });
 
+describe("runSweep: investigation budget kill-switch (Task 7.1)", () => {
+  it("opens the incident but records a 'deferred — budget' note and fires no /start when the hourly budget is exhausted", async () => {
+    await insertHealthyHistory(env.DB, ANCHOR, DAY_MIN);
+    await computeBaselines(env.DB, ANCHOR);
+    const fault: FaultState = { scenario: "bad-deploy", startedMs: ANCHOR };
+    for (let m = 0; m < 4; m++) {
+      await insertRollups(env.DB, faultMinute(ANCHOR + m * MIN, fault));
+    }
+    const simStub = env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
+    await runInDurableObject(simStub, async (_instance, state) => {
+      await state.storage.put("worldStatus", "running");
+    });
+    // Pre-set the hourly counter to the limit so this tick's open is denied an investigation.
+    await env.DB
+      .prepare("REPLACE INTO meta (key, value) VALUES ('investigation_count_hour', ?)")
+      .bind(JSON.stringify({ windowStartMs: ANCHOR, count: 10 }))
+      .run();
+
+    const started: RecordedStart[] = [];
+    await runSweep(makeTestEnv(makeMockInvestigator(started)), ANCHOR + 4 * MIN);
+
+    const incident = await env.DB.prepare("SELECT id FROM incidents").first<{ id: string }>();
+    expect(incident).not.toBeNull(); // the incident still opens — not silently dropped
+    expect(started).toHaveLength(0); // but no investigation is started
+
+    const note = await env.DB
+      .prepare("SELECT content_json FROM investigation_steps WHERE incident_id = ? AND kind = 'note'")
+      .bind(incident?.id)
+      .first<{ content_json: string }>();
+    expect(note).not.toBeNull();
+    expect(JSON.parse(note!.content_json).note).toMatch(/deferred/i);
+  }, 30_000);
+});
+
 describe("runSweep: subtask isolation and the world-status gate", () => {
   it("skips every subtask (no incident, no baseline recompute) when the world is not 'running'", async () => {
     // No worldStatus written at all -> defaults to 'unseeded' in SimulatorDO's /status handler.
