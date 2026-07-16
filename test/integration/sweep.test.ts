@@ -169,6 +169,63 @@ describe("runSweep: bad-deploy end-to-end", () => {
   );
 });
 
+describe("runSweep: rollup write-lag (production timing)", () => {
+  // The production reality this reproduces: SimulatorDO's 20s-cadence tick writes a closed
+  // minute's rollups up to ~20s AFTER the minute boundary, while the cron fires at an arbitrary
+  // early offset (observed :03-:08). Wall-clock minute selection would therefore evaluate a
+  // minute whose rows haven't landed yet — an empty minute0, every single tick — which is
+  // exactly how live detection shipped blind while every fixture-seeded test stayed green.
+  it("detects on the newest minutes PRESENT in rollups when the wall-clock last-completed minute hasn't been rolled up yet", async () => {
+    await insertHealthyHistory(env.DB, ANCHOR, DAY_MIN);
+    await computeBaselines(env.DB, ANCHOR);
+
+    const fault: FaultState = { scenario: "bad-deploy", startedMs: ANCHOR };
+    for (let m = 0; m < 4; m++) {
+      await insertRollups(env.DB, faultMinute(ANCHOR + m * MIN, fault));
+    }
+
+    const simStub = env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
+    await runInDurableObject(simStub, async (_instance, state) => {
+      await state.storage.put("worldStatus", "running");
+    });
+    const started: RecordedStart[] = [];
+    const testEnv = makeTestEnv(makeMockInvestigator(started));
+
+    // Newest rollup minute is ANCHOR+3min; the cron fires 4s into ANCHOR+5min, so the wall-clock
+    // "last completed minute" (ANCHOR+4min) has no rows yet.
+    await runSweep(testEnv, ANCHOR + 5 * MIN + 4_000);
+
+    const incidents = await env.DB.prepare("SELECT count(*) AS n FROM incidents").first<{ n: number }>();
+    expect(incidents?.n).toBe(1);
+    expect(started).toHaveLength(1);
+  }, 30_000);
+
+  it("skips detection entirely when the newest rollup minute is older than the staleness guard (stalled simulator)", async () => {
+    await insertHealthyHistory(env.DB, ANCHOR, DAY_MIN);
+    await computeBaselines(env.DB, ANCHOR);
+
+    const fault: FaultState = { scenario: "bad-deploy", startedMs: ANCHOR };
+    for (let m = 0; m < 4; m++) {
+      await insertRollups(env.DB, faultMinute(ANCHOR + m * MIN, fault));
+    }
+
+    const simStub = env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
+    await runInDurableObject(simStub, async (_instance, state) => {
+      await state.storage.put("worldStatus", "running");
+    });
+    const started: RecordedStart[] = [];
+    const testEnv = makeTestEnv(makeMockInvestigator(started));
+
+    // Newest rollup minute (ANCHOR+3min) is 6min4s old at sweep time — beyond the 5-minute
+    // staleness guard, so detection must not fire on long-stale data.
+    await runSweep(testEnv, ANCHOR + 9 * MIN + 4_000);
+
+    const incidents = await env.DB.prepare("SELECT count(*) AS n FROM incidents").first<{ n: number }>();
+    expect(incidents?.n).toBe(0);
+    expect(started).toHaveLength(0);
+  }, 30_000);
+});
+
 describe("runSweep: subtask isolation and the world-status gate", () => {
   it("skips every subtask (no incident, no baseline recompute) when the world is not 'running'", async () => {
     // No worldStatus written at all -> defaults to 'unseeded' in SimulatorDO's /status handler.

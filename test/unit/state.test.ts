@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { baselineKey, type BaselineMap } from "../../src/detect/baselines";
 import { LAST_SWEEP_OK_META_KEY } from "../../src/detect/sweep";
 import { insertRollups } from "../../src/telemetry/queries";
+import { latestRollupMinute } from "../../src/telemetry/read";
 import { RETENTION_WATERMARK_META_KEY } from "../../src/telemetry/retention";
 import { buildTopology, getOpsHealth, serviceHealth, sparklineSeries } from "../../src/telemetry/state";
 import type { RollupRow } from "../../src/telemetry/types";
@@ -56,6 +57,18 @@ describe("buildTopology", () => {
   });
 });
 
+describe("latestRollupMinute", () => {
+  it("returns null on an empty rollups table and the max minute_ts otherwise", async () => {
+    expect(await latestRollupMinute(env.DB)).toBeNull();
+
+    await insertRollups(env.DB, [
+      { service: "checkout", operation: "POST /checkout", minute_ts: NOW - 3 * MIN, count: 10, error_count: 0, p50_ms: 40, p95_ms: 150, p99_ms: 250 },
+      { service: "gateway", operation: "GET /", minute_ts: NOW - 2 * MIN, count: 50, error_count: 0, p50_ms: 10, p95_ms: 30, p99_ms: 60 },
+    ]);
+    expect(await latestRollupMinute(env.DB)).toBe(NOW - 2 * MIN);
+  });
+});
+
 describe("serviceHealth", () => {
   it("red: a service appearing in an open/investigating/reported incident's fingerprints", async () => {
     await env.DB.batch([
@@ -81,6 +94,20 @@ describe("serviceHealth", () => {
     // evidence gate -- breaches the SUSTAINED threshold in this one minute alone (no incident open).
     await insertRollups(env.DB, [
       { service: "checkout", operation: "POST /checkout", minute_ts: lastCompletedMinuteStart, count: 100, error_count: 6, p50_ms: 40, p95_ms: 150, p99_ms: 250 },
+    ]);
+
+    const health = await serviceHealth(env.DB, baselines, NOW);
+    expect(health.checkout).toBe("amber");
+  });
+
+  it("amber (pre-incident) still shows when the newest rolled-up minute lags the wall clock (rollup write lag)", async () => {
+    const baselines: BaselineMap = new Map([[baselineKey("checkout", "POST /checkout", "error_rate"), { median: 0.01, mad: 0.005 }]]);
+    // The newest minute PRESENT is two minutes old by wall clock — the simulator's 20s-cadence
+    // tick hasn't yet written the wall-clock last-completed minute when a poll lands early in
+    // the minute. Health must anchor on the data, not the clock, or amber is permanently blind.
+    const laggedMinuteStart = Math.floor(NOW / MIN) * MIN - 2 * MIN;
+    await insertRollups(env.DB, [
+      { service: "checkout", operation: "POST /checkout", minute_ts: laggedMinuteStart, count: 100, error_count: 6, p50_ms: 40, p95_ms: 150, p99_ms: 250 },
     ]);
 
     const health = await serviceHealth(env.DB, baselines, NOW);

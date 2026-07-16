@@ -120,6 +120,21 @@ function metricValueFor(point: Pick<MetricPoint, "count" | "error_rate" | "p95" 
 }
 
 /**
+ * The newest `minute_ts` present in `rollups`, or `null` when the table is empty (fresh or
+ * mid-reset world). This is THE anchor for every "most recent completed minute" consumer
+ * (`detect/sweep.ts`'s detection window, `telemetry/state.ts`'s amber pre-incident mapping):
+ * SimulatorDO's 20s-cadence tick writes a closed minute's rollups up to ~20s AFTER the minute
+ * boundary, while the cron fires at an arbitrary offset within the minute (observed :03–:08), so
+ * wall-clock arithmetic (`floor(now/60s)−1`) routinely selects a minute whose rows haven't landed
+ * yet — an empty result, every single tick. Anchoring on the data itself is the only lag-proof
+ * choice; staleness policy (how old is too old to act on) stays with each consumer.
+ */
+export async function latestRollupMinute(db: D1Database): Promise<number | null> {
+  const row = await db.prepare(`SELECT max(minute_ts) AS max_ts FROM rollups`).first<{ max_ts: number | null }>();
+  return row?.max_ts ?? null;
+}
+
+/**
  * Timeseries of `rollups`, optionally filtered by `service`/`operation`, bucketed into
  * `stepMin`-minute windows and overlaid with the `baselines` table (median/MAD + a delta ratio
  * per metric class, attached only where a baseline row actually exists — see `MetricPoint`).

@@ -9,8 +9,10 @@
  *     every other subtask is skipped this tick (spec §6: "the detector no-ops unless the world
  *     status ... is running" — mid-reset/backfill telemetry is incomplete or about to be wiped, so
  *     detecting, auto-resolving, recomputing baselines, or pruning against it would all be wrong).
- *  2. **Evaluate + incident lifecycle open path**: pull the last two *completed* minutes'
- *     `MetricPoint`s (via `read.ts`'s `queryMetrics`, not the agent-facing tool layer) and the
+ *  2. **Evaluate + incident lifecycle open path**: pull the two newest minutes PRESENT in
+ *     `rollups` (anchored via `read.ts`'s `latestRollupMinute`, never wall-clock arithmetic — the
+ *     simulator's tick writes a closed minute's rows up to ~20s after the boundary, later than
+ *     this cron fires; see `runDetection`) as `MetricPoint`s (via `queryMetrics`) and the
  *     current `BaselineMap`, run `detect/rules.ts`'s `evaluate()`, and for a non-empty result call
  *     `incidents.ts`'s `openIncident` with the whole batch. `created: true` -> best-effort notify
  *     `env.INVESTIGATOR`'s `/start` (guarded by a `meta`-backed <= 10/hour counter — see
@@ -52,7 +54,7 @@ import {
   forceFailStuck,
   openIncident,
 } from "../telemetry/incidents";
-import { queryMetrics } from "../telemetry/read";
+import { latestRollupMinute, queryMetrics } from "../telemetry/read";
 import { sweepRetention } from "../telemetry/retention";
 
 const BASELINE_RECOMPUTE_INTERVAL_MIN = 15;
@@ -149,11 +151,30 @@ async function notifyInvestigator(env: Env, incidentId: string, anomalies: reado
   }
 }
 
-/** Subtask 2: evaluate the last two completed minutes and drive the incident open/append path. */
+/** How old the newest rollup minute may be before detection declines to run on it: normal
+ * freshest-data age at cron time is 63–123s (a closed minute's rollups land up to ~20s after the
+ * boundary; the cron fires at an arbitrary offset in the next minute), so 5 minutes tolerates a
+ * missed tick or two while refusing to evaluate a long-stalled world's ancient data as if it were
+ * current (statements say "since HH:MMZ" — firing them 20 minutes late would be dishonest noise). */
+const DETECTION_MAX_ROLLUP_AGE_MS = 5 * MINUTE_MS;
+
+/** Subtask 2: evaluate the two newest rolled-up minutes and drive the incident open/append path. */
 async function runDetection(env: Env, nowMs: number): Promise<void> {
-  const currentMinuteStart = Math.floor(nowMs / MINUTE_MS) * MINUTE_MS;
-  const minute0Start = currentMinuteStart - MINUTE_MS; // most recent *completed* minute
-  const minute1Start = currentMinuteStart - 2 * MINUTE_MS;
+  // Anchored on the newest minute PRESENT in `rollups` (see `latestRollupMinute`'s doc comment),
+  // never on wall-clock arithmetic: the cron consistently fires BEFORE the simulator's tick has
+  // written the wall-clock last-completed minute, so a wall-clock minute0 is empty every single
+  // sweep — the production-blindness bug this replaced (all rules no-op on an empty minute; live
+  // detection never fired at all while every fixture-seeded test stayed green).
+  const latestMinute = await latestRollupMinute(env.DB);
+  if (latestMinute === null) return; // no telemetry at all — nothing to evaluate
+  if (nowMs - latestMinute > DETECTION_MAX_ROLLUP_AGE_MS) {
+    console.warn(
+      `sweep: newest rollup minute is ${Math.round((nowMs - latestMinute) / 1000)}s old; skipping detection (stalled simulator?)`,
+    );
+    return;
+  }
+  const minute0Start = latestMinute;
+  const minute1Start = latestMinute - MINUTE_MS;
 
   const [minute0, minute1, baselines] = await Promise.all([
     queryMetrics(env.DB, { fromMs: minute0Start, toMs: minute0Start + MINUTE_MS, stepMin: 1 }),
