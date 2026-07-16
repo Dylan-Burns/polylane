@@ -44,14 +44,19 @@ import type { BaselineMetric, MetricPoint } from "../telemetry/types";
 // real by `read.ts`'s row caps.
 
 interface JSONSchema {
-  type: string | readonly string[];
+  /** Optional so a nullable *enum* can be expressed as `{enum: [...values, null]}` with NO `type`
+   * key. The Anthropic strict validator rejects any node that pairs `enum` with a multi-element
+   * `type` array (e.g. `{type: ["string","null"], enum: [...]}` — 400, whether or not null is in
+   * the enum; verified directly against the API in Task 4.3). Dropping `type` entirely is the one
+   * shape that keeps both the enum constraint and null as an allowed value. */
+  type?: string | readonly string[];
   description?: string;
   properties?: Record<string, JSONSchema>;
   items?: JSONSchema;
   required?: readonly string[];
-  /** May include `null` — REQUIRED whenever the property's `type` union includes `"null"`: `enum`
-   * is an exhaustive value list, so a nullable type whose enum omits null is self-contradictory
-   * and the Anthropic strict validator 400s the whole request (observed live in Task 4.3). */
+  /** May include `null`. Do NOT also set a multi-element `type` array on the same node — that
+   * combination is a hard 400 from the strict validator (see `type`'s doc comment). A scalar
+   * `type` (e.g. `"string"`) alongside `enum` is fine; a nullable enum omits `type` altogether. */
   enum?: readonly (string | null)[];
   additionalProperties?: boolean;
 }
@@ -68,14 +73,18 @@ const FIND_TRACES_CRITERIA = ["errors", "slowest"] as const;
 const BASELINE_METRICS = ["req_rate", "error_rate", "p95", "p50"] as const;
 const CONFIDENCE_LEVELS = ["low", "medium", "high"] as const;
 
-/** Shared window schema fragment — see `WindowInput` for exactly what each bound accepts. */
+/** Shared window schema fragment. Both the object and its bounds are REQUIRED and non-null (no
+ * `"null"` in any `type`): the Anthropic strict validator caps a request at 16 union-typed
+ * parameters, and this window is reused across five tools — leaving its three nodes nullable put
+ * the whole tool set at 18 unions and 400'd every investigation (Task 4.3). For the last-30-minutes
+ * default, the model passes `{"from": "-30m", "to": "now"}` (`parseWindow` resolves `"now"`). */
 const WINDOW_SCHEMA: JSONSchema = {
-  type: ["object", "null"],
+  type: "object",
   description:
-    'Time range to query, half-open [from, to). Each bound accepts an ISO-8601 timestamp or a relative offset from now ("-30m", "-2h", "-90s", "-1d"). Omit the whole object, or pass null, for the default window (last 30 minutes up to now); a bound left null falls back to its own default independently.',
+    'Time range to query, half-open [from, to). Each bound is an ISO-8601 timestamp, a relative offset from now ("-30m", "-2h", "-90s", "-1d"), or the literal "now". For the last 30 minutes, pass {"from": "-30m", "to": "now"}.',
   properties: {
-    from: { type: ["string", "null"], description: "Start of the window (older bound). Defaults to 30 minutes before now." },
-    to: { type: ["string", "null"], description: "End of the window (newer, exclusive bound). Defaults to now." },
+    from: { type: "string", description: 'Start of the window (older bound): an ISO-8601 timestamp, a relative offset like "-30m", or "now".' },
+    to: { type: "string", description: 'End of the window (newer, exclusive bound): an ISO-8601 timestamp, a relative offset, or "now".' },
   },
   required: ["from", "to"],
   additionalProperties: false,
@@ -103,7 +112,10 @@ const SEARCH_LOGS_SCHEMA: JSONSchema = {
   type: "object",
   properties: {
     service: { type: ["string", "null"], description: "Restrict to log lines emitted by one service. Omit/null for all services." },
-    level: { type: ["string", "null"], enum: [...LOG_LEVELS, null], description: "Restrict to one log level. Omit/null for all levels." },
+    // Nullable enum: `enum` carries null as an allowed value, and `type` is omitted entirely — a
+    // `type: ["string","null"]` union alongside `enum` is a hard 400 from the strict validator
+    // (see JSONSchema.type's doc comment; verified against the API in Task 4.3).
+    level: { enum: [...LOG_LEVELS, null], description: "Restrict to one log level (info, warn, error). Omit/null for all levels." },
     contains: { type: ["string", "null"], description: "Literal (non-pattern) case-insensitive substring the log message must contain. Omit/null for no filter." },
     window: WINDOW_SCHEMA,
     limit: { type: ["integer", "null"], description: `Max rows to return, newest first. Clamped to [1, ${SEARCH_LOGS_MAX_LIMIT}]; defaults to ${SEARCH_LOGS_MAX_LIMIT}.` },

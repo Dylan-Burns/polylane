@@ -5,10 +5,12 @@
  * `nowMs` (the investigation's/request's anchor time), matching `read.ts`'s own "no wall-clock
  * reads" discipline (Global Constraints: system-prompt timestamps are set once per investigation).
  *
- * Accepts, per bound, either an ISO-8601 timestamp (anything `Date.parse` resolves) or a
- * relative offset from `nowMs` in the form `-<N><unit>` where unit is one of `s`/`m`/`h`/`d`
- * (e.g. `"-30m"`, `"-2h"`, `"-90s"`, `"-1d"`) — always "N units before now", never a positive
- * or future offset. `from` defaults to `"-30m"`, `to` defaults to `nowMs` itself.
+ * Accepts, per bound, an ISO-8601 timestamp (anything `Date.parse` resolves), a relative offset
+ * from `nowMs` in the form `-<N><unit>` where unit is one of `s`/`m`/`h`/`d` (e.g. `"-30m"`,
+ * `"-2h"`, `"-90s"`, `"-1d"`) — always "N units before now", never a positive or future offset —
+ * or the literal `"now"` (resolves to `nowMs`). `null`/omitted bounds default (`from` -> `"-30m"`,
+ * `to` -> `nowMs`); the tool schemas don't expose that shape to the model (bounds are required
+ * non-null strings — see `tools.ts`), but `parseWindow` stays lenient for `routes.ts` and tests.
  */
 
 /** Thrown when a window bound is neither a valid ISO-8601 timestamp nor a recognized relative
@@ -52,6 +54,11 @@ function resolveTimeString(raw: string, nowMs: number, field: "from" | "to"): nu
   if (trimmed.length === 0) {
     throw new WindowError(`window.${field} must not be an empty string`);
   }
+
+  // "now" resolves to the anchor time — the value the tool schemas tell the model to pass for the
+  // `to` bound (the schemas make both bounds required non-null strings to stay under the strict
+  // validator's 16-union-parameter cap, so there is no "omit for now" shape at the wire level).
+  if (trimmed === "now") return nowMs;
 
   const relative = RELATIVE_PATTERN.exec(trimmed);
   if (relative) {

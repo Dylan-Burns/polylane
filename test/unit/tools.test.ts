@@ -41,6 +41,12 @@ describe("parseWindow", () => {
     expect(fromMs).toBe(NOW - expectedMs);
   });
 
+  it('resolves the literal "now" to the anchor time for either bound', () => {
+    const { fromMs, toMs } = parseWindow({ from: "-10m", to: "now" }, NOW);
+    expect(toMs).toBe(NOW);
+    expect(fromMs).toBe(NOW - 10 * MIN);
+  });
+
   it.each(["garbage", "", "  ", "-5x", "30m", "+30m", "not-a-date"])(
     "throws WindowError for garbage bound %j",
     (bad) => {
@@ -185,22 +191,27 @@ describe("TOOLS", () => {
     }
   });
 
-  it("every nullable-typed enum property also lists null in its enum (the Anthropic strict validator 400s on the contradiction)", () => {
-    // Live-observed failure (Task 4.3 go-live): `{type: ["string","null"], enum: ["info",...]}` is
-    // self-contradictory — `enum` is an exhaustive value list, so null passes `type` but can never
-    // pass `enum` — and the API rejects the whole request with
-    // `Invalid schema: Enum value 'info' does not match declared type '['string', 'null']'`.
+  it("no schema node combines a multi-type array with an enum (the Anthropic strict validator 400s on it)", () => {
+    // Live-observed failure (Task 4.3 go-live), then reproduced directly against the API: the
+    // strict validator rejects ANY node that has both a multi-element `type` array and an `enum`,
+    // regardless of whether the enum lists null —
+    //   {type:["string","null"], enum:["info","warn","error"]}       -> 400
+    //   {type:["string","null"], enum:["info","warn","error",null]}  -> 400  (adding null does NOT help)
+    //   {enum:["info","warn","error",null]}  (no `type` at all)       -> OK   (the fix we ship)
+    // The error message ("Enum value 'info' does not match declared type '['string','null']'") is
+    // misleading — the real rule is "enum ⇒ scalar type or no type", never a type union.
     type SchemaNode = {
-      type: string | readonly string[];
+      type?: string | readonly string[];
       enum?: readonly (string | null)[];
+      anyOf?: readonly SchemaNode[];
       properties?: Record<string, SchemaNode>;
       items?: SchemaNode;
     };
     const walk = (schema: SchemaNode, path: string): void => {
-      const types = Array.isArray(schema.type) ? schema.type : [schema.type];
-      if (schema.enum !== undefined && types.includes("null")) {
-        expect(schema.enum, `${path}: nullable type with enum must list null`).toContain(null);
+      if (schema.enum !== undefined && Array.isArray(schema.type) && schema.type.length > 1) {
+        expect.fail(`${path}: enum combined with a multi-type array ${JSON.stringify(schema.type)} is rejected by the strict validator`);
       }
+      for (const branch of schema.anyOf ?? []) walk(branch, `${path}|anyOf`);
       for (const [key, child] of Object.entries(schema.properties ?? {})) walk(child, `${path}.${key}`);
       if (schema.items) walk(schema.items, `${path}[]`);
     };
@@ -230,19 +241,28 @@ describe("TOOLS", () => {
 // nullable fields), properties/required/additionalProperties, items, enum.
 function validate(schema: ToolDef["input_schema"], value: unknown, path = "$"): string[] {
   const errors: string[] = [];
-  const types = Array.isArray(schema.type) ? schema.type : [schema.type];
 
   const actualType = value === null ? "null" : Array.isArray(value) ? "array" : typeof value === "number" ? "number" : typeof value;
-  const matchesType = types.some((t) => {
-    if (t === "integer") return typeof value === "number" && Number.isInteger(value);
-    return t === actualType;
-  });
-  if (!matchesType) {
-    errors.push(`${path}: expected type ${types.join("|")}, got ${actualType}`);
-    return errors; // type mismatch makes deeper checks meaningless
+  // `type` is optional: a nullable-enum node (`{enum: [...values, null]}`) omits it, letting the
+  // enum below be the only value constraint. Only type-check when a `type` is actually declared.
+  if (schema.type !== undefined) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    const matchesType = types.some((t) => {
+      if (t === "integer") return typeof value === "number" && Number.isInteger(value);
+      return t === actualType;
+    });
+    if (!matchesType) {
+      errors.push(`${path}: expected type ${types.join("|")}, got ${actualType}`);
+      return errors; // type mismatch makes deeper checks meaningless
+    }
   }
 
-  if (value === null) return errors;
+  if (value === null) {
+    if (schema.enum && !schema.enum.includes(null)) {
+      errors.push(`${path}: null not in enum [${schema.enum.join(", ")}]`);
+    }
+    return errors;
+  }
 
   if (schema.enum && typeof value === "string" && !schema.enum.includes(value)) {
     errors.push(`${path}: ${value} not in enum [${schema.enum.join(", ")}]`);
