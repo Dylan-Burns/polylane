@@ -106,17 +106,18 @@ function Dashboard() {
 
   return (
     <div className="min-h-screen bg-void text-ink">
-      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-hairline px-4 py-4 sm:px-6 lg:px-8">
-        <div className="flex flex-wrap items-center gap-3 sm:gap-6">
-          <Wordmark />
-          {/* Polylane's segmented-control pattern: a soft gray pill track, the active segment a
-              white pill lifted off it with a hairline and whisper of shadow. */}
-          <nav className="flex items-center gap-1 rounded-full bg-panel-raised p-1">
-            <NavTab label="Dashboard" active={view === "dashboard"} onClick={() => setView("dashboard")} />
-            <NavTab label="Chat" active={view === "chat"} onClick={() => setView("chat")} />
-          </nav>
-        </div>
-        <div className="flex items-center gap-2.5">
+      {/* One row on desktop (wordmark · nav · spacer · status). On phones the nav drops to its own
+          full-width row as an evenly-split segmented control — the previous wrap stranded the
+          status pill on a half-empty second line. */}
+      <header className="flex flex-wrap items-center gap-3 border-b border-hairline px-4 py-4 sm:px-6 lg:px-8">
+        <Wordmark />
+        {/* Polylane's segmented-control pattern: a soft gray pill track, the active segment a
+            white pill lifted off it with a hairline and whisper of shadow. */}
+        <nav className="order-last grid w-full grid-cols-2 rounded-full bg-panel-raised p-1 sm:order-none sm:ml-3 sm:flex sm:w-auto sm:items-center sm:gap-1">
+          <NavTab label="Dashboard" active={view === "dashboard"} onClick={() => setView("dashboard")} />
+          <NavTab label="Chat" active={view === "chat"} onClick={() => setView("chat")} />
+        </nav>
+        <div className="ml-auto flex items-center gap-2.5">
           <ThemeToggle />
           <WorldStatusPill state={state.data} error={state.error} />
         </div>
@@ -131,13 +132,19 @@ function Dashboard() {
 
           <AnalyticsRow active={onDashboard} />
 
+          {/* One grid, three children. On xl the Chaos/Deploys rail pins to column 2 and SPANS
+              both rows, so Incidents stacks directly under System in column 1 — previously
+              Incidents sat below the whole grid, leaving a dead zone the height of the rail's
+              overhang under System, and stretching every incident card to the page's full
+              width. On mobile, auto-placement keeps the demo's natural order: System → Chaos →
+              Deploys → Incidents. */}
           <div className="grid grid-cols-1 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
             {state.data ? (
               <SystemView state={state.data} incidents={incidents} />
             ) : (
               <LoadingCard label={state.error !== undefined ? "Couldn't reach Watchtower's API." : "Loading system view…"} />
             )}
-            <div className="flex flex-col gap-6">
+            <div className="flex flex-col gap-6 xl:col-start-2 xl:row-span-2 xl:row-start-1">
               {state.data ? (
                 <ChaosPanel worldStatus={state.data.worldStatus} onActionSettled={state.refresh} />
               ) : (
@@ -145,9 +152,10 @@ function Dashboard() {
               )}
               <DeploysCard incidents={incidents} active={onDashboard} />
             </div>
+            <div className="min-w-0 xl:col-start-1 xl:row-start-2">
+              <IncidentsPanel incidents={incidents} worldStatus={state.data?.worldStatus.worldStatus ?? "unseeded"} />
+            </div>
           </div>
-
-          <IncidentsPanel incidents={incidents} worldStatus={state.data?.worldStatus.worldStatus ?? "unseeded"} />
         </div>
 
         <div className={view === "chat" ? "flex flex-col" : "hidden"}>

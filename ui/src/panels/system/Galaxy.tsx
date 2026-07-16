@@ -406,16 +406,24 @@ export function GalaxyView({ services, edges, health, stats }: GalaxyProps) {
           ctx!.setLineDash([]);
         }
 
-        // Permanent labels — the relief that keeps identity off hue alone.
+        // Permanent labels — the relief that keeps identity off hue alone. The x is clamped so
+        // edge-anchored clusters (payments-db lives at the far right by design — CVD separation)
+        // keep their full label inside the canvas on narrow phones instead of clipping. The
+        // external ghost's label sits ABOVE its ring: it shares the bottom-row corridor with
+        // notifications, and on a phone-width canvas their below-labels must collide.
         ctx!.globalAlpha = clusterAlpha;
         ctx!.textAlign = "center";
         ctx!.fillStyle = chrome.ink;
         ctx!.font = '500 11px "JetBrains Mono", ui-monospace, monospace';
-        ctx!.fillText(node.name, anchor.x, anchor.y + anchor.r + 20);
+        const nameHalf = ctx!.measureText(node.name).width / 2;
+        const labelX = Math.min(Math.max(anchor.x, nameHalf + 4), w - nameHalf - 4);
+        const nameY = node.external ? anchor.y - anchor.r - 24 : anchor.y + anchor.r + 20;
+        const subY = node.external ? anchor.y - anchor.r - 12 : anchor.y + anchor.r + 32;
+        ctx!.fillText(node.name, labelX, nameY);
         ctx!.fillStyle = chrome.inkFaint;
         ctx!.font = '400 9px "JetBrains Mono", ui-monospace, monospace';
         const sub = node.external ? "external" : stat?.rate !== null && stat?.rate !== undefined ? `${stat.rate.toFixed(0)}/m` : "—";
-        ctx!.fillText(sub, anchor.x, anchor.y + anchor.r + 32);
+        ctx!.fillText(sub, labelX, subY);
       });
 
       ctx!.globalAlpha = 1;

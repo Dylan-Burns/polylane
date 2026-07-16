@@ -30,11 +30,13 @@ interface TileProps {
 function StatTile({ label, value, unit, sub, subTone }: TileProps) {
   const subColor = subTone === "red" ? "text-status-red" : subTone === "amber" ? "text-status-amber" : "text-ink-faint";
   return (
-    <div className="flex flex-col gap-1 rounded-xl border border-hairline bg-panel px-4 py-3">
+    <div className="flex flex-col gap-1 rounded-xl border border-hairline bg-panel px-4 py-3 lg:px-5 lg:py-4">
       <span className="font-mono text-[10px] uppercase tracking-wider text-ink-faint">{label}</span>
-      <span className="font-display text-2xl font-semibold tracking-tight text-ink">
+      {/* The number scales up with the tile: at desktop each card is ~340px wide, and a 2xl
+          numeral left three-quarters of it empty — the value IS the tile's content. */}
+      <span className="font-display text-2xl font-semibold tracking-tight text-ink lg:text-3xl">
         {value}
-        {unit !== undefined && <span className="ml-1 text-sm font-normal text-ink-dim">{unit}</span>}
+        {unit !== undefined && <span className="ml-1 text-sm font-normal text-ink-dim lg:text-base">{unit}</span>}
       </span>
       {sub !== undefined && <span className={`font-mono text-[11px] ${subColor}`}>{sub}</span>}
     </div>
