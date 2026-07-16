@@ -3,6 +3,7 @@ import { runSweep } from "./detect/sweep";
 import type { Env } from "./env";
 import { chaosRoutes, handleAdminReset } from "./api/chaos";
 import { chatRoutes } from "./api/chat";
+import { remediationRoutes } from "./api/remediate";
 import { routes } from "./api/routes";
 import { SimulatorDO } from "./sim/simulator-do";
 import { InvestigatorDO } from "./agent/investigator-do";
@@ -20,6 +21,10 @@ app.post("/api/admin/reset", handleAdminReset);
 
 // Hardened streaming chat (Task 6.1) — POST /api/chat, SSE. See src/api/chat.ts's doc comment.
 app.route("/api/chat", chatRoutes);
+
+// Remediation approval gate — POST /api/incidents/:id/remediate, the operator's one-click rollback
+// of the report's suggested_action. See src/api/remediate.ts's doc comment.
+app.route("/api/incidents", remediationRoutes);
 
 export { SimulatorDO };
 export { InvestigatorDO };

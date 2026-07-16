@@ -151,7 +151,7 @@ describe("POST /api/chat — SSE event sequence", () => {
     expect(events[0]).toEqual({ type: "thinking" }); // no `text`/`thinking` field on the wire
   });
 
-  it("releases the concurrent-SSE lease and records one chat turn after a normal completion", async () => {
+  it("releases the concurrent-SSE lease after a normal completion", async () => {
     const r1 = makeMessage({ content: [text("ok")], stop_reason: "end_turn" });
     const app = createChatApp({ llmFactory: (_env, hooks) => scriptedStreamingLLM([r1], hooks), nowFn: () => Date.now() });
 
@@ -161,8 +161,11 @@ describe("POST /api/chat — SSE event sequence", () => {
     const leases = await env.DB.prepare(`SELECT COUNT(*) AS n FROM meta WHERE key GLOB 'chat_sse_lease:*'`).first<{ n: number }>();
     expect(leases?.n).toBe(0);
 
+    // While the hourly chat-turn budget is temporarily disabled (see src/api/chat.ts's
+    // tryEnterChatTurn), a completed turn records nothing. Restore this assertion to
+    // `toMatchObject({ count: 1 })` when re-enabling the budget.
     const turns = await env.DB.prepare(`SELECT value FROM meta WHERE key = 'chat_turns_hour'`).first<{ value: string }>();
-    expect(JSON.parse(turns?.value ?? "{}")).toMatchObject({ count: 1 });
+    expect(turns).toBeNull();
   });
 });
 
@@ -271,7 +274,9 @@ describe("POST /api/chat — over-cap guardrails", () => {
     expect(leases?.n).toBe(0);
   });
 
-  it("a pre-set chat_turns_hour count at the hourly limit -> a single graceful error event", async () => {
+  // Skipped while the hourly chat-turn budget is temporarily disabled — see the commented-out
+  // block in src/api/chat.ts's tryEnterChatTurn. Un-skip when re-enabling the budget.
+  it.skip("a pre-set chat_turns_hour count at the hourly limit -> a single graceful error event", async () => {
     const nowMs = Date.UTC(2026, 0, 5, 14, 0, 0);
     await env.DB.prepare(`REPLACE INTO meta (key, value) VALUES ('chat_turns_hour', ?)`)
       .bind(JSON.stringify({ windowStartMs: nowMs, count: 60 }))
@@ -367,6 +372,107 @@ describe("POST /api/chat — validation at the HTTP layer", () => {
     expect(res.status).toBe(413);
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain("byte limit");
+  });
+});
+
+// ============================================================================================
+// "Dig deeper" incident scoping: the client sends ONLY an id; the handler loads all incident
+// context server-side (getIncidents + listInvestigationSteps) BEFORE the cap gate, and an
+// unknown id is a plain JSON 400 that never opens an SSE stream -- the same contract as a
+// validation failure. incidentId's own shape matrix is unit-tested in chat-validate.test.ts;
+// this describe covers the D1-backed resolution those unit tests can't reach.
+// ============================================================================================
+
+describe("POST /api/chat — incident-scoped turns (Dig deeper)", () => {
+  afterEach(async () => {
+    // Wipe the rows THIS describe seeds (steps first: they FK-reference incidents); the
+    // file-level afterEach already wipes meta.
+    await env.DB.exec(`DELETE FROM investigation_steps`);
+    await env.DB.exec(`DELETE FROM incidents`);
+  });
+
+  it("an unknown incidentId -> HTTP 400 plain JSON, never opening an SSE stream", async () => {
+    // An empty script, same trick as the over-cap test: if the unknown-id path leaked through to
+    // the loop anyway, the first llm.create would throw and fail this test loudly.
+    const app = createChatApp({ llmFactory: (_env, hooks) => scriptedStreamingLLM([], hooks), nowFn: () => Date.now() });
+    const ctx = createExecutionContext();
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...CLEAN_BODY, incidentId: "inc-does-not-exist" }),
+      },
+      env as unknown as Env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+
+    expect(res.status).toBe(400);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(res.headers.get("content-type")).not.toContain("text/event-stream");
+    expect(await res.json()).toEqual({ error: "unknown incident id" });
+
+    // Resolved BEFORE the cap gate: a rejected unknown-id request never touched an SSE slot.
+    const leases = await env.DB.prepare(`SELECT COUNT(*) AS n FROM meta WHERE key GLOB 'chat_sse_lease:*'`).first<{ n: number }>();
+    expect(leases?.n).toBe(0);
+  });
+
+  it("a known incidentId loads its context server-side, injects it into the system prompt, and the turn streams", async () => {
+    const nowMs = Date.UTC(2026, 0, 5, 14, 0, 0);
+    await env.DB.batch([
+      env.DB
+        .prepare(`INSERT INTO incidents (id, status, severity, opened_at, trigger_json, report_json) VALUES (?, 'reported', 'critical', ?, ?, ?)`)
+        .bind(
+          "inc-dig-1",
+          nowMs,
+          // The REAL persisted shape (telemetry/incidents.ts's buildTrigger) — pinning that
+          // production trigger statements actually reach the prompt, not just the defensive
+          // bare-array shape the unit tests also cover.
+          JSON.stringify({ statements: ["error_rate 12.0x baseline on checkout POST /checkout"], anomalies: [] }),
+          JSON.stringify({ summary: "checkout error-rate spike from the payments cascade" }),
+        ),
+      env.DB
+        .prepare(
+          `INSERT INTO investigation_steps (incident_id, step_no, kind, content_json, ts_ms, tokens_in, tokens_out)
+           VALUES (?, 1, 'note', ?, ?, 0, 0)`,
+        )
+        .bind("inc-dig-1", JSON.stringify({ text: "entering salvage: concluding with the evidence gathered so far" }), nowMs + 60_000),
+    ]);
+
+    // Wrap the scripted double to capture what pumpChatTurn actually sends as `system` — the one
+    // seam that proves the context injection end-to-end (an SSE-only assertion would pass even if
+    // the context never reached the model; adversarial-review finding).
+    let capturedSystem: unknown;
+    const r1 = makeMessage({ content: [text("That incident was a checkout error-rate spike.")], stop_reason: "end_turn" });
+    const app = createChatApp({
+      llmFactory: (_env, hooks) => {
+        const inner = scriptedStreamingLLM([r1], hooks);
+        return {
+          create(params, timeoutMs) {
+            capturedSystem = params.system;
+            return inner.create(params, timeoutMs);
+          },
+        };
+      },
+      nowFn: () => nowMs + 120_000,
+    });
+
+    const { res, events } = await postChat(app, { ...CLEAN_BODY, incidentId: "inc-dig-1" });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    expect(events.map((e) => e.type)).toEqual(["text_delta", "done"]);
+    expect(events[0]).toMatchObject({ type: "text_delta", text: "That incident was a checkout error-rate spike." });
+
+    const systemText = Array.isArray(capturedSystem)
+      ? (capturedSystem as { text?: string }[]).map((b) => b.text ?? "").join("\n")
+      : String(capturedSystem);
+    expect(systemText).toContain("Incident under discussion");
+    expect(systemText).toContain("id: inc-dig-1");
+    expect(systemText).toContain("trigger: error_rate 12.0x baseline on checkout POST /checkout");
+    expect(systemText).toContain("checkout error-rate spike from the payments cascade"); // the report
+    expect(systemText).toContain("entering salvage"); // the step timeline
   });
 });
 

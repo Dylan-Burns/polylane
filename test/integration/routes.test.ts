@@ -1,10 +1,12 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
+import type { IncidentMetricsResponse } from "../../src/api/routes";
 import { insertInvestigationStep } from "../../src/telemetry/incidents";
-import { insertLogs, insertSpans } from "../../src/telemetry/queries";
+import { insertDeploy, insertLogs, insertRollups, insertSpans } from "../../src/telemetry/queries";
 import type { StepView } from "../../src/telemetry/read";
-import type { IncidentView, LogLine, Span } from "../../src/telemetry/types";
+import type { AnalyticsResponse } from "../../src/telemetry/state";
+import type { Deploy, IncidentView, LogLine, Span } from "../../src/telemetry/types";
 
 /** Confirms the actual HTTP wiring in `src/api/routes.ts` (mounted at `/api` from `index.ts`) --
  * `serviceHealth`/`sparklineSeries`/`getOpsHealth`/`buildTopology` themselves are unit-tested in
@@ -254,5 +256,276 @@ describe("GET /api/health (moved into api/routes.ts)", () => {
     const res = await SELF.fetch("https://example.com/api/health");
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true });
+  });
+});
+
+describe("GET /api/analytics", () => {
+  async function seedIncident(
+    id: string,
+    status: IncidentView["status"],
+    openedAt: number,
+    reportedAt: number | null,
+    resolvedAt: number | null,
+  ): Promise<void> {
+    await env.DB
+      .prepare(
+        "INSERT INTO incidents (id, status, severity, opened_at, reported_at, resolved_at, trigger_json) VALUES (?, ?, 'warning', ?, ?, ?, '{}')",
+      )
+      .bind(id, status, openedAt, reportedAt, resolvedAt)
+      .run();
+  }
+
+  it("returns zero counts and null medians/traffic on an empty DB", async () => {
+    const res = await SELF.fetch("https://example.com/api/analytics");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      incidents24h: 0,
+      openNow: 0,
+      timeToReportP50Ms: null,
+      timeToResolveP50Ms: null,
+      reqPerMin: null,
+      errorRatePct: null,
+    });
+  });
+
+  it("computes counts, medians, and latest-minute traffic from seeded rows", async () => {
+    const now = Date.now();
+    // Three incidents inside the 24h count window; the 48h-old one falls outside it but still
+    // inside the 7d median window -- the two lookbacks are deliberately different.
+    await seedIncident("inc-a", "resolved", now - 2 * 3_600_000, now - 2 * 3_600_000 + 60_000, now - 2 * 3_600_000 + 300_000);
+    await seedIncident("inc-b", "reported", now - 3_600_000, now - 3_600_000 + 180_000, null);
+    await seedIncident("inc-c", "open", now - 30 * 60_000, null, null);
+    await seedIncident("inc-old", "resolved", now - 48 * 3_600_000, now - 48 * 3_600_000 + 500_000, now - 48 * 3_600_000 + 700_000);
+
+    // Two rollup minutes; only the newest one drives reqPerMin/errorRatePct (the older, busier
+    // minute proves the anchor is latestRollupMinute, not a sum over the window).
+    const minute = Math.floor(now / 60_000) * 60_000;
+    await insertRollups(env.DB, [
+      { service: "gateway", operation: "GET /", minute_ts: minute - 60_000, count: 500, error_count: 50, p50_ms: 10, p95_ms: 20, p99_ms: 30 },
+      { service: "gateway", operation: "GET /", minute_ts: minute, count: 60, error_count: 3, p50_ms: 10, p95_ms: 20, p99_ms: 30 },
+      { service: "checkout", operation: "POST /cart", minute_ts: minute, count: 40, error_count: 2, p50_ms: 10, p95_ms: 20, p99_ms: 30 },
+    ]);
+
+    const res = await SELF.fetch("https://example.com/api/analytics");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as AnalyticsResponse;
+
+    expect(body.incidents24h).toBe(3); // inc-old is outside the 24h window
+    expect(body.openNow).toBe(2); // inc-b (reported) + inc-c (open); both resolved ones excluded
+    expect(body.timeToReportP50Ms).toBe(180_000); // median of [60_000, 180_000, 500_000]
+    expect(body.timeToResolveP50Ms).toBe(500_000); // mean of the two middles of [300_000, 700_000]
+    expect(body.reqPerMin).toBe(100); // 60 + 40 at the newest minute only
+    expect(body.errorRatePct).toBe(5); // 100 * (3 + 2) / 100
+  });
+});
+
+describe("GET /api/deploys", () => {
+  async function seedDeploy(id: string, tsMs: number): Promise<void> {
+    await insertDeploy(env.DB, { id, service: "checkout", version: `v-${id}`, ts_ms: tsMs, note: `deploy ${id}` });
+  }
+
+  it("defaults to the last 24h and returns deploys newest-first", async () => {
+    const now = Date.now();
+    await seedDeploy("dep-old", now - 3 * 3_600_000);
+    await seedDeploy("dep-new", now - 3_600_000);
+    await seedDeploy("dep-ancient", now - 48 * 3_600_000); // outside the 24h default window
+
+    const res = await SELF.fetch("https://example.com/api/deploys");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { deploys: Deploy[] };
+    // Reversed from listDeploys' chronological ascending -- the rail wants recent first.
+    expect(body.deploys.map((d) => d.id)).toEqual(["dep-new", "dep-old"]);
+  });
+
+  it("honors an explicit narrow window", async () => {
+    const now = Date.now();
+    await seedDeploy("dep-in", now - 30 * 60_000);
+    await seedDeploy("dep-out", now - 2 * 3_600_000);
+
+    const res = await SELF.fetch("https://example.com/api/deploys?from=-1h");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { deploys: Deploy[] };
+    expect(body.deploys.map((d) => d.id)).toEqual(["dep-in"]);
+  });
+
+  it("400s an unparseable from bound", async () => {
+    const res = await SELF.fetch("https://example.com/api/deploys?from=last-tuesday");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("neither an ISO-8601 timestamp nor a relative offset");
+  });
+});
+
+describe("GET /api/incidents/:id/metrics", () => {
+  // Minute-aligned and far in the past, so the window math is fully data-driven (toMs comes from
+  // resolved_at + the 10-min tail, never clamped by the route's Date.now()).
+  const openedAt = 60_000_000;
+  const resolvedAt = openedAt + 600_000;
+
+  async function seedIncidentWithTrigger(id: string, triggerJson: string, resolved: number | null = resolvedAt): Promise<void> {
+    await env.DB
+      .prepare(
+        "INSERT INTO incidents (id, status, severity, opened_at, resolved_at, trigger_json) VALUES (?, 'resolved', 'critical', ?, ?, ?)",
+      )
+      .bind(id, openedAt, resolved, triggerJson)
+      .run();
+  }
+
+  it("builds one tile per distinct (service, metricClass) with weighted service-level points", async () => {
+    const trigger = {
+      statements: ["payments error_rate spiked", "payments p95 spiked"],
+      anomalies: [
+        { fingerprint: "payments:errors", service: "payments", metricClass: "error_rate", rule: "hard", value: 0.5, baseline: 0.003, statement: "payments error_rate spiked" },
+        { fingerprint: "payments:latency", service: "payments", metricClass: "p95", rule: "sustained", value: 400, baseline: 92, statement: "payments p95 spiked" },
+        // Same (service, metricClass) as the first entry -- deduped, so still exactly 2 tiles.
+        { fingerprint: "payments:errors", service: "payments", metricClass: "error_rate", rule: "sustained", value: 0.4, baseline: 0.004, statement: "dup" },
+      ],
+    };
+    await seedIncidentWithTrigger("inc-metrics", JSON.stringify(trigger));
+
+    const m1 = openedAt;
+    const m2 = openedAt + 60_000;
+    await insertRollups(env.DB, [
+      // m1: two payments operations -> exercises the count-weighted service-level aggregation.
+      // (Counts/errors chosen binary-exact: 8/64 = 0.125 so the weighted math has no float fuzz.)
+      { service: "payments", operation: "charge", minute_ts: m1, count: 64, error_count: 8, p50_ms: 50, p95_ms: 100, p99_ms: 150 },
+      { service: "payments", operation: "refund", minute_ts: m1, count: 64, error_count: 0, p50_ms: 100, p95_ms: 300, p99_ms: 400 },
+      // m2: the peak minute for both metrics.
+      { service: "payments", operation: "charge", minute_ts: m2, count: 50, error_count: 25, p50_ms: 200, p95_ms: 400, p99_ms: 500 },
+      // Before windowFromMs (opened_at - 30m) -> excluded despite its huge values.
+      { service: "payments", operation: "charge", minute_ts: openedAt - 31 * 60_000, count: 999, error_count: 999, p50_ms: 1, p95_ms: 9_999, p99_ms: 9_999 },
+      // Inside the window but a different service -> never aggregated into payments tiles.
+      { service: "checkout", operation: "POST /cart", minute_ts: m1, count: 80, error_count: 80, p50_ms: 1, p95_ms: 8_888, p99_ms: 9_000 },
+    ]);
+
+    const res = await SELF.fetch("https://example.com/api/incidents/inc-metrics/metrics");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as IncidentMetricsResponse;
+
+    expect(body.windowFromMs).toBe(openedAt - 30 * 60_000);
+    expect(body.windowToMs).toBe(resolvedAt + 10 * 60_000);
+    expect(body.tiles).toHaveLength(2);
+
+    const [errorTile, p95Tile] = body.tiles;
+    expect(errorTile?.service).toBe("payments");
+    expect(errorTile?.metricClass).toBe("error_rate");
+    expect(errorTile?.unit).toBe("pct");
+    expect(errorTile?.points).toEqual([
+      { minute_ts: m1, value: 6.25 }, // (8 + 0) errors / 128 reqs = 0.0625 -> 6.25%
+      { minute_ts: m2, value: 50 }, // 25 / 50 -> 50%
+    ]);
+    expect(errorTile?.peak).toBe(50);
+    expect(errorTile?.baseline).toBeCloseTo(0.3); // 0.003 converted to the same percent unit
+    expect(errorTile?.ratio).toBeCloseTo(50 / 0.3);
+
+    expect(p95Tile?.metricClass).toBe("p95");
+    expect(p95Tile?.unit).toBe("ms");
+    expect(p95Tile?.points).toEqual([
+      { minute_ts: m1, value: 200 }, // (100*64 + 300*64) / 128 count-weighted
+      { minute_ts: m2, value: 400 },
+    ]);
+    expect(p95Tile?.peak).toBe(400);
+    expect(p95Tile?.baseline).toBe(92);
+    expect(p95Tile?.ratio).toBeCloseTo(400 / 92);
+  });
+
+  it("derives the baseline from the window's pre-open service-level median once >= 3 pre-open minutes exist", async () => {
+    // One p95 anomaly whose per-operation baseline (92) deliberately differs from the service-level
+    // pre-open median -- proving the tile no longer mixes aggregation levels (the '×N' chip divides
+    // a service-level peak by a service-level baseline).
+    const trigger = {
+      statements: ["payments p95 spiked"],
+      anomalies: [{ fingerprint: "payments:latency", service: "payments", metricClass: "p95", rule: "hard", value: 400, baseline: 92, statement: "payments p95 spiked" }],
+    };
+    await seedIncidentWithTrigger("inc-preopen", JSON.stringify(trigger));
+
+    // Three pre-open minutes with two operations each: service-level p95 = count-weighted mean =
+    // (100 + 300) / 2 = 200 per minute -> pre-open median 200 (vs the per-op 92 fallback).
+    const preMinutes = [openedAt - 3 * 60_000, openedAt - 2 * 60_000, openedAt - 60_000];
+    const rows = preMinutes.flatMap((m) => [
+      { service: "payments", operation: "charge", minute_ts: m, count: 10, error_count: 0, p50_ms: 50, p95_ms: 100, p99_ms: 150 },
+      { service: "payments", operation: "refund", minute_ts: m, count: 10, error_count: 0, p50_ms: 80, p95_ms: 300, p99_ms: 400 },
+    ]);
+    // The in-incident peak minute.
+    rows.push({ service: "payments", operation: "charge", minute_ts: openedAt, count: 20, error_count: 0, p50_ms: 300, p95_ms: 800, p99_ms: 900 });
+    await insertRollups(env.DB, rows);
+
+    const res = await SELF.fetch("https://example.com/api/incidents/inc-preopen/metrics");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as IncidentMetricsResponse;
+    const tile = body.tiles[0];
+    expect(tile?.peak).toBe(800);
+    expect(tile?.baseline).toBe(200); // the series' own pre-open median, NOT the per-op 92
+    expect(tile?.ratio).toBeCloseTo(800 / 200);
+  });
+
+  it("accepts a bare-array trigger, returns empty points with peak 0 when no rollups exist, and does not shadow /incidents/:id", async () => {
+    await seedIncidentWithTrigger("inc-bare", JSON.stringify([{ service: "payments", metricClass: "p95", baseline: 92 }]), null);
+
+    const res = await SELF.fetch("https://example.com/api/incidents/inc-bare/metrics");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as IncidentMetricsResponse;
+    expect(body.tiles).toEqual([
+      { service: "payments", metricClass: "p95", unit: "ms", points: [], peak: 0, baseline: 92, ratio: 0 },
+    ]);
+
+    // Registration-order check (the /metrics route is registered before /incidents/:id): the more
+    // specific sub-path must not swallow -- or be swallowed by -- the detail route.
+    const detailRes = await SELF.fetch("https://example.com/api/incidents/inc-bare");
+    expect(detailRes.status).toBe(200);
+    const detail = (await detailRes.json()) as { incident: IncidentView };
+    expect(detail.incident.id).toBe("inc-bare");
+  });
+
+  it("maps detect-domain metricClass names (errors/latency/traffic) onto tile metrics and caps at 3 tiles", async () => {
+    // The shape incidents.ts actually persists: detect/rules.ts Anomaly entries under .anomalies.
+    const trigger = {
+      statements: ["s1", "s2", "s3", "s4"],
+      anomalies: [
+        { fingerprint: "payments:errors", service: "payments", metricClass: "errors", rule: "hard", value: 0.3, baseline: 0.003, statement: "s1" },
+        { fingerprint: "payments:latency", service: "payments", metricClass: "latency", rule: "hard", value: 400, baseline: 92, statement: "s2" },
+        { fingerprint: "gateway:traffic", service: "gateway", metricClass: "traffic", rule: "sustained", value: 90, baseline: 30, statement: "s3" },
+        // A 4th distinct (service, metricClass) -> dropped by the 3-tile cap.
+        { fingerprint: "checkout:errors", service: "checkout", metricClass: "errors", rule: "sustained", value: 0.1, baseline: 0.002, statement: "s4" },
+      ],
+    };
+    await seedIncidentWithTrigger("inc-domain", JSON.stringify(trigger));
+
+    const res = await SELF.fetch("https://example.com/api/incidents/inc-domain/metrics");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as IncidentMetricsResponse;
+    expect(body.tiles.map((t) => [t.service, t.metricClass, t.unit])).toEqual([
+      ["payments", "error_rate", "pct"],
+      ["payments", "p95", "ms"],
+      ["gateway", "req_rate", "per_min"],
+    ]);
+    expect(body.tiles[0]?.baseline).toBeCloseTo(0.3); // error_rate baseline in percent
+    expect(body.tiles[2]?.baseline).toBe(30); // req_rate baseline untouched
+  });
+
+  it("returns 200 with empty tiles for malformed or junk-entry triggers, never a 500", async () => {
+    await seedIncidentWithTrigger("inc-malformed", JSON.stringify("not an anomaly list"));
+    await seedIncidentWithTrigger(
+      "inc-junk-entries",
+      JSON.stringify([
+        null,
+        { service: 42, metricClass: "p95", baseline: 1 }, // non-string service
+        { service: "payments", metricClass: "bogus", baseline: 1 }, // unknown metricClass
+        { service: "payments", metricClass: "p95", baseline: "92" }, // non-numeric baseline
+      ]),
+    );
+
+    for (const id of ["inc-malformed", "inc-junk-entries"]) {
+      const res = await SELF.fetch(`https://example.com/api/incidents/${id}/metrics`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as IncidentMetricsResponse;
+      expect(body.tiles).toEqual([]);
+    }
+  });
+
+  it("404s an unknown incident id", async () => {
+    const res = await SELF.fetch("https://example.com/api/incidents/does-not-exist/metrics");
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "not_found" });
   });
 });

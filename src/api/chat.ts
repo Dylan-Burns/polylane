@@ -19,10 +19,18 @@
  *    user/assistant alternation, too many turns, and an over-long latest message are all rejected
  *    with 400 before a single token is spent.
  *  - The system prompt (`chat-prompt.ts`) is assembled server-side only; nothing in the validated
- *    history can add to, remove from, or override it.
+ *    history can add to, remove from, or override it. The "Dig deeper" incident scoping keeps that
+ *    boundary intact: the client may name ONE incident, but only by a strictly shape-checked id —
+ *    the incident's actual context (status, trigger, report, investigation steps) is loaded from
+ *    D1 right here in the handler and rendered by `chat-prompt.ts`'s `buildIncidentContext`, so
+ *    everything that reaches the system prompt was read by the SERVER from its own database while
+ *    the client-held history stays untrusted plain text, same as ever.
  *  - Two cost guardrails, both backed by the `meta` key/value table: a global `chat_turns_hour`
  *    counter (<= 60/hour; the fixed-window pattern from `detect/sweep.ts`'s
- *    `tryConsumeInvestigationBudget`, with its documented accepted race) and <= 2 concurrent SSE
+ *    `tryConsumeInvestigationBudget`, with its documented accepted race — **TEMPORARILY DISABLED
+ *    as of 2026-07-16 by operator request**: the enforcement block in `tryEnterChatTurn` is
+ *    commented out, so until it is restored the concurrency lease and per-turn caps below are the
+ *    only spend controls on this endpoint) and <= 2 concurrent SSE
  *    slots held as expiring LEASES (`chat_sse_lease:<uuid>` rows; atomic count-gated acquisition —
  *    see `tryAcquireConcurrentSSESlot` for both the atomicity and the self-heal rationale). A
  *    lease is acquired right before a turn's stream opens and ALWAYS released in a `finally`
@@ -51,10 +59,11 @@ import { Hono } from "hono";
 import { streamSSE, type SSEStreamingApi } from "hono/streaming";
 import type { MessageParam } from "@anthropic-ai/sdk/resources/messages";
 import type { Env } from "../env";
-import { buildChatSystemPrompt } from "../agent/chat-prompt";
+import { buildChatSystemPrompt, buildIncidentContext } from "../agent/chat-prompt";
 import { streamingLLM, type LLM, type StreamHooks } from "../agent/llm";
 import { runLoop, type LoopCaps, type StepRecord } from "../agent/loop";
 import { executeTool, TOOLS } from "../agent/tools";
+import { getIncidents, listInvestigationSteps } from "../telemetry/read";
 
 // --- validateChatBody ------------------------------------------------------------------------
 
@@ -70,7 +79,12 @@ export interface ChatTurn {
 // the task brief's own contract) rather than the generic `number` the interface sketch implies:
 // Hono's `c.json(body, status)` overload requires a `ContentfulStatusCode` literal/union, and
 // every real call site here only ever produces 400 anyway, so the narrower type costs nothing.
-export type ValidateChatBodyResult = { ok: true; messages: ChatTurn[] } | { ok: false; status: 400; error: string };
+// `incidentId` (the optional "Dig deeper" scope) rides along on the success arm: it is the ONLY
+// incident-related value the client is ever allowed to supply — everything about the incident
+// itself is loaded server-side in the handler (see the file doc comment's security story).
+export type ValidateChatBodyResult =
+  | { ok: true; messages: ChatTurn[]; incidentId?: string }
+  | { ok: false; status: 400; error: string };
 
 /** Serialized-body cap (Global Constraints / spec §9): 32KB, checked BEFORE any structural
  * validation — an oversized body is rejected on size alone, without ever inspecting its shape. */
@@ -83,6 +97,17 @@ export const CHAT_MAX_BODY_BYTES = 32 * 1024;
  * actually graded against. */
 export const CHAT_MAX_TURNS = 20;
 
+/** Shape guard on the optional `incidentId` ("Dig deeper" scoping): 1..64 chars from an alphabet
+ * that covers real incident ids with room to spare (`incidents.ts` mints `inc-<uuid>` — 40 chars
+ * of `[a-f0-9-]`). Deliberately strict for an unauthenticated endpoint: this is the single
+ * client-controlled value
+ * that reaches a D1 query parameter during the server-side context load, so anything that isn't
+ * obviously id-shaped (path fragments, spaces, quotes) is rejected on shape alone, before any
+ * lookup. The queries are parameterized regardless — this guard is defense-in-depth plus a cheap
+ * early 400, not the injection boundary itself. */
+const INCIDENT_ID_MAX_CHARS = 64;
+const INCIDENT_ID_PATTERN = /^[A-Za-z0-9:_-]+$/;
+
 /** Per-message cap on the LATEST (last) message only — spec §9: "message <= 2k chars". Earlier
  * turns in the history are already bounded transitively by `CHAT_MAX_BODY_BYTES` across at most
  * `CHAT_MAX_TURNS` turns; this cap exists specifically for the fresh, still-unvalidated-by-anything-
@@ -91,9 +116,11 @@ export const CHAT_MAX_MESSAGE_CHARS = 2000;
 
 /** Rejects anything that isn't a plain JSON object with a non-empty `messages` array of strict
  * user/assistant-alternating, string-only-content turns ending on a user turn, within size/length
- * caps — see the file doc comment. Every failure path returns a specific, distinguishable `error`
- * string (never a generic "invalid body") so a caller can tell the user what to fix, and so tests
- * can assert on which check actually fired. Never throws.
+ * caps — see the file doc comment. An OPTIONAL `incidentId` ("Dig deeper" scoping) is accepted
+ * when it passes the `INCIDENT_ID_PATTERN` shape guard and surfaces on the success arm; absent
+ * means `undefined` (an ordinary unscoped turn). Every failure path returns a specific,
+ * distinguishable `error` string (never a generic "invalid body") so a caller can tell the user
+ * what to fix, and so tests can assert on which check actually fired. Never throws.
  */
 export function validateChatBody(raw: unknown): ValidateChatBodyResult {
   // Size check first, on the RE-serialized form — works whether the caller already ran
@@ -164,7 +191,25 @@ export function validateChatBody(raw: unknown): ValidateChatBodyResult {
     return { ok: false, status: 400, error: `the last message must not exceed ${CHAT_MAX_MESSAGE_CHARS} characters` };
   }
 
-  return { ok: true, messages };
+  // Optional "Dig deeper" scoping — the client may name ONE incident, and only by id (see
+  // `INCIDENT_ID_PATTERN`'s doc comment). Strictly `undefined` means absent; any PRESENT value
+  // (including `null`) must be an id-shaped string, so a probing client gets one fixed error
+  // string that reveals nothing about which sub-check fired.
+  const incidentIdRaw = rec.incidentId;
+  let incidentId: string | undefined;
+  if (incidentIdRaw !== undefined) {
+    if (
+      typeof incidentIdRaw !== "string" ||
+      incidentIdRaw.length === 0 ||
+      incidentIdRaw.length > INCIDENT_ID_MAX_CHARS ||
+      !INCIDENT_ID_PATTERN.test(incidentIdRaw)
+    ) {
+      return { ok: false, status: 400, error: "incidentId must be a short id string" };
+    }
+    incidentId = incidentIdRaw;
+  }
+
+  return { ok: true, messages, incidentId };
 }
 
 // --- Cost guardrails: meta-backed counters ----------------------------------------------------
@@ -298,17 +343,21 @@ async function tryEnterChatTurn(db: D1Database, nowMs: number): Promise<ChatGate
   if (leaseKey === null) {
     return { ok: false, reason: "too many people are chatting right now — please try again in a moment" };
   }
-  let allowed: boolean;
-  try {
-    allowed = await tryConsumeChatTurnBudget(db, nowMs);
-  } catch (err) {
-    await releaseConcurrentSSESlot(db, leaseKey);
-    throw err;
-  }
-  if (!allowed) {
-    await releaseConcurrentSSESlot(db, leaseKey);
-    return { ok: false, reason: "chat has hit its hourly limit — please try again later" };
-  }
+  // TEMPORARILY DISABLED (2026-07-16): the hourly chat-turn budget is switched off for now.
+  // Re-enable by uncommenting this block and un-skipping the "hourly limit" test in
+  // test/integration/chat.test.ts. The concurrency lease above and the per-turn loop caps
+  // (CHAT_CAPS) stay active — this only removes the 60-turns/hour ceiling.
+  // let allowed: boolean;
+  // try {
+  //   allowed = await tryConsumeChatTurnBudget(db, nowMs);
+  // } catch (err) {
+  //   await releaseConcurrentSSESlot(db, leaseKey);
+  //   throw err;
+  // }
+  // if (!allowed) {
+  //   await releaseConcurrentSSESlot(db, leaseKey);
+  //   return { ok: false, reason: "chat has hit its hourly limit — please try again later" };
+  // }
   return { ok: true, leaseKey };
 }
 
@@ -430,6 +479,11 @@ interface PumpArgs {
   llmFactory: (env: Env, hooks: StreamHooks) => LLM;
   nowFn: () => number;
   messages: ChatTurn[];
+  /** The "Dig deeper" incident block for `buildChatSystemPrompt`, or `undefined` for an unscoped
+   * turn. Always SERVER-rendered (the handler loads the incident from D1 and runs it through
+   * `buildIncidentContext`) — never a client-supplied string; the client's entire contribution to
+   * incident scoping is the validated id (file doc comment's security story). */
+  incidentContext?: string;
   /** Polled by the loop's `shouldAbort` at every iteration top: a disconnected client means
    * further model spend has no audience, so the loop exits (`failure: "aborted"`) after at most
    * the one in-flight call — dropped tabs must not burn the full 8-step/90s turn budget. */
@@ -442,8 +496,8 @@ interface PumpArgs {
  * rejects). Does NOT own the concurrency-gauge release (the caller's `finally` does) — this
  * function's only job is the turn itself. */
 async function pumpChatTurn(stream: SSEStreamingApi, args: PumpArgs): Promise<void> {
-  const { env, llmFactory, nowFn, messages, isDisconnected } = args;
-  const system = buildChatSystemPrompt({ nowMs: nowFn() });
+  const { env, llmFactory, nowFn, messages, incidentContext, isDisconnected } = args;
+  const system = buildChatSystemPrompt({ nowMs: nowFn(), incidentContext });
   const initialMessages = toMessageParams(messages);
 
   // Fire-and-forget by design: `StreamHooks` callbacks are synchronous (they fire from inside the
@@ -558,6 +612,23 @@ export function createChatApp({ llmFactory = streamingLLM, nowFn = Date.now }: C
       return c.json({ error: validated.error }, validated.status);
     }
 
+    // "Dig deeper" incident scoping — resolved BEFORE the cap gate, so an unknown id never
+    // consumes an SSE slot. ALL of the incident's context (status, trigger, report, steps) is
+    // loaded server-side right here from the validated id — the id is the client's entire
+    // contribution (file doc comment's security story). An unknown incident is a plain JSON 400
+    // exactly like a validation failure — this handler NEVER opens an SSE stream until every
+    // input, incident included, has been resolved.
+    let incidentContext: string | undefined;
+    if (validated.incidentId !== undefined) {
+      const { incidents } = await getIncidents(c.env.DB, { id: validated.incidentId });
+      const incident = incidents[0];
+      if (incident === undefined) {
+        return c.json({ error: "unknown incident id" }, 400);
+      }
+      const steps = await listInvestigationSteps(c.env.DB, validated.incidentId);
+      incidentContext = buildIncidentContext(incident, steps);
+    }
+
     // The gate itself can throw on a D1 hiccup — that must still come back as the graceful
     // single-SSE-error shape, not a raw 5xx (the same "never a hard failure the UI has to
     // special-case" contract as an over-cap rejection). `tryEnterChatTurn` guarantees a thrown
@@ -587,6 +658,7 @@ export function createChatApp({ llmFactory = streamingLLM, nowFn = Date.now }: C
           llmFactory,
           nowFn,
           messages: validated.messages,
+          incidentContext,
           // Both signals: the request's own abort signal (the runtime's disconnect notification)
           // and Hono's stream-level aborted flag — either one means nobody is reading.
           isDisconnected: () => c.req.raw.signal.aborted || stream.aborted,

@@ -10,7 +10,11 @@
   "assets": {
     "directory": "ui/dist",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"]
+    // "/__scheduled" exists so `wrangler dev --test-scheduled` can actually reach the scheduled
+    // handler: without it the SPA fallback swallows the request and the cron sweep can never be
+    // fired locally. In production the path simply 404s from the worker instead of serving the
+    // app shell — nothing routes there.
+    "run_worker_first": ["/api/*", "/__scheduled"]
   },
   "d1_databases": [{ "binding": "DB", "database_name": "watchtower", "database_id": "39cc28fd-a81f-40df-a34d-d4eed5b53746", "migrations_dir": "migrations" }],
   "durable_objects": { "bindings": [

@@ -13,11 +13,12 @@ polylane ("Watchtower") is an AI incident investigator on Cloudflare Workers: a 
 - `pnpm typecheck` — `tsc --noEmit`
 - `pnpm dev` — wrangler dev + UI dev server concurrently
 - `pnpm deploy` — builds `ui/dist` then `wrangler deploy` (bare `wrangler deploy` serves a stale/missing UI)
-- Migrations: `wrangler d1 migrations apply watchtower` (files in `migrations/`)
+- `pnpm eval [--base https://…]` — drive all four fault scenarios against a deployed URL, grade root-cause accuracy, write `docs/eval-latest.md`
+- Migrations: `wrangler d1 migrations apply watchtower` (files in `migrations/`; add `--remote` for the deployed DB)
 
 ## Architecture
 
-- `src/index.ts` — entry: Hono app (mounts `api/routes.ts` GETs, `api/chaos.ts`, `api/chat.ts` at `/api/*`) + the `scheduled` handler driving `detect/sweep.ts` every minute
+- `src/index.ts` — entry: Hono app (mounts `api/routes.ts` GETs, `api/chaos.ts`, `api/chat.ts`, `api/remediate.ts` at `/api/*`) + the `scheduled` handler driving `detect/sweep.ts` every minute
 - `src/sim/` — SimulatorDO (singleton `world`): topology, generator, fault scenarios, backfill/reset
 - `src/telemetry/` — D1 read/write layer (`read.ts` is the query seam; shape-aware result caps live here), incidents lifecycle, retention
 - `src/detect/` — baselines (median/MAD), rules, the cron sweep (world gate → detect → lifecycle → baselines → retention)

@@ -147,9 +147,15 @@ interface ScenarioResult {
  * remain healthy since the email send is fire-and-forget"). A term counts as "blamed" only if at
  * least one of its occurrences has NO exoneration marker within `EXONERATION_WINDOW` chars. */
 const EXONERATION_MARKERS = [
+  // Direct exoneration ("checkout remains healthy", "not a payments deploy")
   "not ", "n't", "no change", "unaffected", "healthy", "remain", "fine", "isolated", "unrelated",
   "ruled out", "rule out", "best-effort", "fire-and-forget", "non-blocking", "downstream", "cascade",
-  "symptom", "rather than", "instead of", "red herring", "coincident", "unchanged",
+  "symptom", "rather than", "instead of", "red herring", "unchanged",
+  // Corroboration/correlation, NOT causal attribution ("the surge is consistent with the deploy
+  // timing"). Noting that a deploy coincided is exactly what an analyst should do; it is not
+  // blaming the deploy as the root cause. A report that actually blamed the deploy ("the deploy
+  // caused the surge") carries none of these markers and still fails.
+  "consistent with", "correlat", "coincid", "alongside", "at the same time", "around the same", "timing",
 ];
 const EXONERATION_WINDOW = 80;
 

@@ -6,6 +6,7 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "eval": "tsx scripts/eval.ts",
     "build:ui": "pnpm --filter watchtower-ui build",
     "dev": "concurrently -n worker,ui -c blue,green \"wrangler dev\" \"pnpm --filter watchtower-ui dev\"",
     "deploy": "pnpm run build:ui && wrangler deploy"
