@@ -12,7 +12,7 @@
  * across every tab (evidence chips in the Traces tab open the same drawer Overview's would).
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { getIncidentDetail, getState, remediateIncident } from "../../lib/api";
 import { clockTime, relativeTime } from "../../lib/format";
 import { KIND_META } from "../../lib/kinds";
@@ -130,9 +130,31 @@ const TABS: { id: TabId; label: string }[] = [
  * component belongs to another cluster's file). Wrapped in its own `overflow-x-auto` so all six
  * tabs stay reachable by horizontal scroll at mobile widths without wrapping or shrinking labels. */
 function DetailTabBar({ active, onChange }: { active: TabId; onChange: (id: TabId) => void }) {
+  // WAI-ARIA tabs pattern: Left/Right (and Home/End) move selection with wrap-around, and focus
+  // follows selection so the roving tabindex stays coherent with what's announced.
+  function onKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
+    const idx = TABS.findIndex((t) => t.id === active);
+    let next: number | null = null;
+    if (e.key === "ArrowRight") next = (idx + 1) % TABS.length;
+    else if (e.key === "ArrowLeft") next = (idx - 1 + TABS.length) % TABS.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = TABS.length - 1;
+    if (next === null) return;
+    e.preventDefault();
+    const target = TABS[next];
+    if (!target) return;
+    onChange(target.id);
+    document.getElementById(`incident-tab-${target.id}`)?.focus();
+  }
+
   return (
     <div className="overflow-x-auto">
-      <div role="tablist" aria-label="Incident detail sections" className="flex w-max items-center gap-0.5 rounded-full bg-panel-raised p-0.5">
+      <div
+        role="tablist"
+        aria-label="Incident detail sections"
+        onKeyDown={onKeyDown}
+        className="flex w-max items-center gap-0.5 rounded-full bg-panel-raised p-0.5"
+      >
         {TABS.map((t) => (
           <button
             key={t.id}
@@ -141,6 +163,7 @@ function DetailTabBar({ active, onChange }: { active: TabId; onChange: (id: TabI
             id={`incident-tab-${t.id}`}
             aria-selected={active === t.id}
             aria-controls={`incident-tabpanel-${t.id}`}
+            tabIndex={active === t.id ? 0 : -1}
             onClick={() => onChange(t.id)}
             className={`shrink-0 whitespace-nowrap rounded-full px-3 py-1.5 font-sans text-xs font-medium transition-colors ${
               active === t.id ? "border border-hairline bg-panel text-ink shadow-sm" : "text-ink-dim hover:text-ink"

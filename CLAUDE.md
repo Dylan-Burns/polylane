@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-polylane ("Watchtower") is an AI incident investigator on Cloudflare Workers: a simulated e-commerce system ("Acme Shop") emits telemetry into D1, a cron sweep detects anomalies and opens incidents, and an agent loop (Claude via the Anthropic SDK) investigates and reports. Design spec: `docs/specs/2026-07-14-watchtower-design.md`; implementation plan: `docs/plans/`.
+polylane ("Watchtower") is an AI incident investigator on Cloudflare Workers: a simulated e-commerce system emits telemetry into D1, a cron sweep detects anomalies and opens incidents, and an agent loop (Claude via the Anthropic SDK) investigates and reports. Since 2026-07-17 the simulated topology is CF-native — `edge-gateway`/`checkout-edge`/`payments-api` (Workers), `ledger-db` (D1), `catalog-kv` (Worker+KV), `notify` (Queue consumer), `email-api` (external) — the old `gateway/checkout/payments/payments-db/catalog/notifications/email-provider` names survive only in pre-rename incident reports and provenance comments. Design specs: `docs/specs/2026-07-14-watchtower-design.md` + `docs/specs/2026-07-17-cf-native-revamp-design.md`; implementation plans: `docs/plans/`.
 
 ## Commands
 
