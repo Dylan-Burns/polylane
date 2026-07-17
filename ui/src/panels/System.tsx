@@ -25,21 +25,21 @@ interface NodePos {
 }
 
 /** Hand-placed positions mirroring `sim/topology.ts`'s own ASCII diagram — three tiers,
- * edge-gateway on the left fanning out to its two branches. */
-/** Card heights are +20 over the pre-typed-grid baseline to fit the new kind-sublabel row (added
- * uniformly so `edgePath`'s vertical-center math — which derives straight from these positions —
- * keeps every curve landing on the right edge). */
+ * edge-gateway on the left fanning out to its two branches. Column pitch (254) deliberately leaves
+ * ~72px between columns so the edge curves get a real run instead of a stubby hook, and the wider
+ * viewBox renders every card ~15% smaller at the same container width. `edgePath` derives curve
+ * endpoints straight from these boxes, so any resize must move x/w/h together. */
 const NODE_POSITIONS: Record<string, NodePos> = {
-  "edge-gateway": { x: 20, y: 115, w: 182, h: 128 },
-  "checkout-edge": { x: 224, y: 16, w: 182, h: 128 },
-  "catalog-kv": { x: 224, y: 216, w: 182, h: 128 },
-  "payments-api": { x: 428, y: 16, w: 182, h: 128 },
-  notify: { x: 428, y: 216, w: 182, h: 128 },
-  "ledger-db": { x: 632, y: 16, w: 182, h: 128 },
-  "email-api": { x: 632, y: 232, w: 182, h: 96 },
+  "edge-gateway": { x: 20, y: 116, w: 182, h: 112 },
+  "checkout-edge": { x: 274, y: 16, w: 182, h: 112 },
+  "catalog-kv": { x: 274, y: 216, w: 182, h: 112 },
+  "payments-api": { x: 528, y: 16, w: 182, h: 112 },
+  notify: { x: 528, y: 216, w: 182, h: 112 },
+  "ledger-db": { x: 782, y: 16, w: 182, h: 112 },
+  "email-api": { x: 782, y: 232, w: 182, h: 80 },
 };
-const VIEWBOX_W = 834;
-const VIEWBOX_H = 360;
+const VIEWBOX_W = 984;
+const VIEWBOX_H = 344;
 
 const SPARKLINE_SLOTS = 30;
 const MINUTE_MS = 60_000;
@@ -190,7 +190,7 @@ function NodeCard({
   return (
     <foreignObject x={pos.x} y={pos.y} width={pos.w} height={pos.h}>
       <div
-        className="flex h-full flex-col gap-1.5 rounded-lg border bg-panel px-3 py-2 shadow-sm"
+        className="flex h-full flex-col gap-1 rounded-lg border bg-panel px-3 py-1.5 shadow-sm"
         style={{ borderColor: status === "green" ? "var(--color-hairline)" : HEALTH_COLOR[status] }}
       >
         <div className="flex items-center justify-between gap-2">
