@@ -10,7 +10,7 @@ import type {
   Usage,
 } from "@anthropic-ai/sdk/resources/messages";
 import { realLLM, scriptedLLM, type LLM } from "../../src/agent/llm";
-import { runLoop, SALVAGE_FLOOR_MS, SALVAGE_MAX_TOKENS, type LoopConfig, type StepRecord } from "../../src/agent/loop";
+import { runLoop, SALVAGE_FLOOR_MS, SALVAGE_INSTRUCTION, SALVAGE_MAX_TOKENS, type LoopConfig, type StepRecord } from "../../src/agent/loop";
 import { SUBMIT_REPORT, TOOLS } from "../../src/agent/tools";
 
 // ============================================================================================
@@ -362,7 +362,7 @@ describe("runLoop", () => {
     expect(salvageReq?.messages).toHaveLength(3); // [user0, assistant(end_turn), user(salvage instruction)]
     const salvageMsg = salvageReq?.messages[2];
     expect(salvageMsg?.role).toBe("user");
-    expect(((salvageMsg?.content as ContentBlockParam[])[0] as { text: string }).text).toBe("conclude with what you have; state low confidence");
+    expect(((salvageMsg?.content as ContentBlockParam[])[0] as { text: string }).text).toBe(SALVAGE_INSTRUCTION);
 
     // Review-mandated: a "note" step lands the instant salvage begins, so a caller persisting
     // steps live (Task 4.2) sees an explicit marker instead of a silent gap until the report.

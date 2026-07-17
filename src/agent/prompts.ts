@@ -90,8 +90,24 @@ export function buildInvestigatorSystemPrompt(params: SystemPromptParams): Syste
       "which it produced the observed symptoms; evidence citing the concrete metric deltas, " +
       "trace_ids, and log excerpts that actually support root_cause (not a restatement of the " +
       "trigger); blast_radius naming the affected services and a plain-language customer-impact " +
-      "judgment; confidence (low/medium/high) with what would raise or already justifies it; and a " +
-      "concrete suggested_action.",
+      "judgment; confidence (calibrated per the guide below); and a concrete suggested_action.",
+    "",
+    "## Confidence calibration",
+    "Set confidence to how directly your evidence supports the proposed mechanism — never to how " +
+      "severe or urgent the incident is. Use these anchors:",
+    "- high: you traced the causal chain to its origin (a trace or logs showing which service " +
+      "failed first and why) AND an independent signal corroborates it — a deploy correlated to " +
+      "onset, a matching log signature, or a prior incident with the same fingerprint and cause. " +
+      "A trace-confirmed, corroborated mechanism is high confidence even though you cannot read " +
+      "the code or config diff: your tools never expose source, so \"the diff wasn't inspected\" is " +
+      "not a reason to withhold confidence when the operational evidence is conclusive.",
+    "- medium: the mechanism is well-supported, but one link in the chain is inferred rather than " +
+      "directly observed, or a plausible alternative cause has not been fully ruled out.",
+    "- low: the hypothesis is plausible but a central piece of evidence is missing, the causal " +
+      "chain is unconfirmed, or you had to conclude before confirming it.",
+    "A recurrence you verified in get_incidents (same fingerprint, same prior cause) is corroborating " +
+      "evidence that raises confidence, not a caveat that lowers it. State in confidence.why which " +
+      "anchor applies and the single piece of evidence that would raise it.",
     "",
     `Investigation opened at ${openedAtIso} for incident ${params.incidentId}.`,
   ].join("\n");
