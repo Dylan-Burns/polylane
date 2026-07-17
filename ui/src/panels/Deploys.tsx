@@ -16,6 +16,7 @@ import { useMemo } from "react";
 import { getDeploys } from "../lib/api";
 import { relativeTime } from "../lib/format";
 import { usePoll } from "../lib/poll";
+import { LIVE_INCIDENT_STATUSES } from "../lib/status";
 import type { IncidentView, PublicDeploy } from "../lib/types";
 
 const DEPLOYS_POLL_MS = 30_000;
@@ -23,8 +24,6 @@ const DEPLOYS_POLL_MS = 30_000;
 /** Show at most this many rows — the card is a rail, not a log browser; the mono footer says how
  * many more the window actually held. */
 const MAX_ROWS = 8;
-
-const LIVE_STATUSES = new Set(["open", "investigating", "reported"]);
 
 type Correlation = { kind: "live"; incidentId: string } | { kind: "closed"; incidentId: string } | null;
 
@@ -69,9 +68,9 @@ function correlate(deploy: PublicDeploy, entries: CorrelationEntry[]): Correlati
     if (deploy.ts_ms < windowStart || deploy.ts_ms > windowEnd) return false;
     return reportJson.includes(deploy.version);
   };
-  const live = entries.find((e) => LIVE_STATUSES.has(e.incident.status) && mentions(e));
+  const live = entries.find((e) => LIVE_INCIDENT_STATUSES.has(e.incident.status) && mentions(e));
   if (live) return { kind: "live", incidentId: live.incident.id };
-  const closed = entries.find((e) => !LIVE_STATUSES.has(e.incident.status) && mentions(e));
+  const closed = entries.find((e) => !LIVE_INCIDENT_STATUSES.has(e.incident.status) && mentions(e));
   if (closed) return { kind: "closed", incidentId: closed.incident.id };
   return null;
 }
@@ -116,10 +115,18 @@ function DeployRow({ deploy, correlation }: { deploy: PublicDeploy; correlation:
 
 /** `incidents` comes from the dashboard's existing poll (no second fetch of the same data);
  * `active` gates this card's own deploys poll the same way every dashboard poll is gated. */
-export function DeploysCard({ incidents, active }: { incidents: IncidentView[]; active: boolean }) {
+export function DeploysCard({
+  incidents,
+  active,
+  maxRows = MAX_ROWS,
+}: {
+  incidents: IncidentView[];
+  active: boolean;
+  maxRows?: number;
+}) {
   const { data, error } = usePoll(getDeploys, active ? DEPLOYS_POLL_MS : null);
   const deploys = data?.deploys ?? [];
-  const shown = deploys.slice(0, MAX_ROWS);
+  const shown = deploys.slice(0, maxRows);
   // Serialized once per incidents-poll, not per deploy row per render.
   const correlationEntries = useMemo(() => prepareCorrelation(incidents), [incidents]);
 
@@ -141,8 +148,8 @@ export function DeploysCard({ incidents, active }: { incidents: IncidentView[]; 
         ))}
       </ul>
 
-      {deploys.length > MAX_ROWS && (
-        <p className="font-mono text-[10px] text-ink-faint">+{deploys.length - MAX_ROWS} more in the last 24h</p>
+      {deploys.length > maxRows && (
+        <p className="font-mono text-[10px] text-ink-faint">+{deploys.length - maxRows} more in the last 24h</p>
       )}
     </section>
   );

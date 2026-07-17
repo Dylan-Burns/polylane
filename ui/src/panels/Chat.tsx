@@ -310,8 +310,8 @@ export function ChatPanel() {
   }, [messages]);
 
   // Abort any in-flight turn if the whole app unmounts (tab close/navigation away) — the panel
-  // itself stays mounted across the Dashboard/Chat tab switch (see App.tsx) specifically so a
-  // still-streaming turn is never interrupted just by glancing at the dashboard.
+  // itself stays mounted-but-hidden across view navigation (see App.tsx) specifically so a
+  // still-streaming turn is never interrupted just by switching to another view.
   useEffect(() => {
     return () => abortRef.current?.abort();
   }, []);
@@ -355,7 +355,7 @@ export function ChatPanel() {
   }
 
   return (
-    <section className="flex h-[calc(100vh-11rem)] min-h-[420px] flex-col rounded-2xl border border-hairline bg-panel/40 p-5">
+    <section className="flex h-[calc(100dvh-12rem)] min-h-[420px] lg:h-[calc(100dvh-8rem)] flex-col rounded-2xl border border-hairline bg-panel/40 p-5">
       <header className="mb-3 border-b border-hairline pb-3">
         <h2 className="font-display text-lg font-semibold tracking-tight text-ink">Chat</h2>
         <p className="mt-1 text-xs text-ink-dim">Same watchdog, same read-only tools — ask it anything about the live world.</p>
