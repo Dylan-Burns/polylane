@@ -32,7 +32,7 @@ const CHAT_MAX_TURNS = 20;
  * brief: "enforce in the composer with a live counter"), not just on rejection. */
 const CHAT_MAX_MESSAGE_CHARS = 2000;
 
-const STARTER_PROMPTS = ["What happened in the last hour?", "Is checkout healthy?", "Summarize the last incident"];
+const STARTER_PROMPTS = ["What happened in the last hour?", "Is checkout-edge healthy?", "Summarize the last incident"];
 
 type ActivityEntry =
   | { id: string; kind: "thinking" }

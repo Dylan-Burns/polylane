@@ -86,9 +86,9 @@ describe("POST /api/admin/reset", () => {
       ),
       // Health rows for the two soon-to-fail incidents plus one for the reported incident, which
       // must SURVIVE the reset (autoResolve still needs it to resolve the reported incident later).
-      env.DB.prepare("INSERT INTO meta (key, value) VALUES ('incident_health:inc-open:payments:errors', '1000')"),
-      env.DB.prepare("INSERT INTO meta (key, value) VALUES ('incident_health:inc-investigating:checkout:errors', '1000')"),
-      env.DB.prepare("INSERT INTO meta (key, value) VALUES ('incident_health:inc-reported:catalog:traffic', '1000')"),
+      env.DB.prepare("INSERT INTO meta (key, value) VALUES ('incident_health:inc-open:payments-api:errors', '1000')"),
+      env.DB.prepare("INSERT INTO meta (key, value) VALUES ('incident_health:inc-investigating:checkout-edge:errors', '1000')"),
+      env.DB.prepare("INSERT INTO meta (key, value) VALUES ('incident_health:inc-reported:catalog-kv:traffic', '1000')"),
     ]);
 
     const res = await SELF.fetch("https://example.com/api/admin/reset", { method: "POST" });
@@ -115,7 +115,7 @@ describe("POST /api/admin/reset", () => {
     const healthRows = await env.DB
       .prepare("SELECT key FROM meta WHERE key LIKE 'incident_health:%' ORDER BY key")
       .all<{ key: string }>();
-    expect((healthRows.results ?? []).map((r) => r.key)).toEqual(["incident_health:inc-reported:catalog:traffic"]);
+    expect((healthRows.results ?? []).map((r) => r.key)).toEqual(["incident_health:inc-reported:catalog-kv:traffic"]);
   });
 
   it("still proxies the reset even with no active incidents at all", async () => {

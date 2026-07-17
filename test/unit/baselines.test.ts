@@ -57,39 +57,39 @@ describe("computeBaselines", () => {
     // Unsorted insertion order on purpose, to prove the implementation sorts before taking the
     // middle element rather than relying on row order.
     await insertRollups(env.DB, [
-      mkRollup("checkout", "POST /checkout", T0 - 3 * MIN, 30, 0, 300),
-      mkRollup("checkout", "POST /checkout", T0 - 2 * MIN, 10, 0, 100),
-      mkRollup("checkout", "POST /checkout", T0 - 1 * MIN, 20, 0, 200),
+      mkRollup("checkout-edge", "POST /checkout", T0 - 3 * MIN, 30, 0, 300),
+      mkRollup("checkout-edge", "POST /checkout", T0 - 2 * MIN, 10, 0, 100),
+      mkRollup("checkout-edge", "POST /checkout", T0 - 1 * MIN, 20, 0, 200),
     ]);
 
     const written = await computeBaselines(env.DB, T0);
     expect(written).toBe(4); // req_rate + error_rate + p95 + p50
 
-    const reqRate = await baselineRow("checkout", "POST /checkout", "req_rate");
+    const reqRate = await baselineRow("checkout-edge", "POST /checkout", "req_rate");
     expect(reqRate).toEqual({ median: 20, mad: 10, computed_at: T0 }); // sorted [10,20,30]; devs [10,0,10] -> median 10
 
-    const p95 = await baselineRow("checkout", "POST /checkout", "p95");
+    const p95 = await baselineRow("checkout-edge", "POST /checkout", "p95");
     expect(p95).toEqual({ median: 200, mad: 100, computed_at: T0 });
 
     // mkRollup sets p50_ms = p95Ms / 2, so the p50 series is [150, 50, 100] -> median 100, MAD 50.
-    const p50 = await baselineRow("checkout", "POST /checkout", "p50");
+    const p50 = await baselineRow("checkout-edge", "POST /checkout", "p50");
     expect(p50).toEqual({ median: 100, mad: 50, computed_at: T0 });
 
-    const errorRate = await baselineRow("checkout", "POST /checkout", "error_rate");
+    const errorRate = await baselineRow("checkout-edge", "POST /checkout", "error_rate");
     expect(errorRate).toEqual({ median: 0, mad: 0, computed_at: T0 }); // all error_count 0
   });
 
   it("computes the mean-of-two-middles median for an even number of trailing minutes", async () => {
     await insertRollups(env.DB, [
-      mkRollup("catalog", "GET /catalog", T0 - 4 * MIN, 10, 0, 0),
-      mkRollup("catalog", "GET /catalog", T0 - 3 * MIN, 40, 0, 0),
-      mkRollup("catalog", "GET /catalog", T0 - 2 * MIN, 20, 0, 0),
-      mkRollup("catalog", "GET /catalog", T0 - 1 * MIN, 30, 0, 0),
+      mkRollup("catalog-kv", "GET /catalog", T0 - 4 * MIN, 10, 0, 0),
+      mkRollup("catalog-kv", "GET /catalog", T0 - 3 * MIN, 40, 0, 0),
+      mkRollup("catalog-kv", "GET /catalog", T0 - 2 * MIN, 20, 0, 0),
+      mkRollup("catalog-kv", "GET /catalog", T0 - 1 * MIN, 30, 0, 0),
     ]);
 
     const reqRate = await (async () => {
       await computeBaselines(env.DB, T0);
-      return baselineRow("catalog", "GET /catalog", "req_rate");
+      return baselineRow("catalog-kv", "GET /catalog", "req_rate");
     })();
 
     // sorted [10,20,30,40] -> median (20+30)/2 = 25
@@ -99,36 +99,36 @@ describe("computeBaselines", () => {
 
   it("MAD is 0 for a flat series (every minute identical)", async () => {
     await insertRollups(env.DB, [
-      mkRollup("payments", "charge", T0 - 3 * MIN, 50, 2, 90),
-      mkRollup("payments", "charge", T0 - 2 * MIN, 50, 2, 90),
-      mkRollup("payments", "charge", T0 - 1 * MIN, 50, 2, 90),
+      mkRollup("payments-api", "charge", T0 - 3 * MIN, 50, 2, 90),
+      mkRollup("payments-api", "charge", T0 - 2 * MIN, 50, 2, 90),
+      mkRollup("payments-api", "charge", T0 - 1 * MIN, 50, 2, 90),
     ]);
 
     await computeBaselines(env.DB, T0);
-    const reqRate = await baselineRow("payments", "charge", "req_rate");
+    const reqRate = await baselineRow("payments-api", "charge", "req_rate");
     expect(reqRate).toEqual({ median: 50, mad: 0, computed_at: T0 });
-    const p95 = await baselineRow("payments", "charge", "p95");
+    const p95 = await baselineRow("payments-api", "charge", "p95");
     expect(p95).toEqual({ median: 90, mad: 0, computed_at: T0 });
-    const p50 = await baselineRow("payments", "charge", "p50");
+    const p50 = await baselineRow("payments-api", "charge", "p50");
     expect(p50).toEqual({ median: 45, mad: 0, computed_at: T0 });
   });
 
   it("excludes count=0 minutes from error_rate but still includes them (as 0) in req_rate/p95", async () => {
     await insertRollups(env.DB, [
-      mkRollup("notifications", "send_receipt", T0 - 3 * MIN, 100, 5, 100), // error_rate 0.05
-      mkRollup("notifications", "send_receipt", T0 - 2 * MIN, 0, 0, 40), // excluded from error_rate
-      mkRollup("notifications", "send_receipt", T0 - 1 * MIN, 50, 0, 60), // error_rate 0
+      mkRollup("notify", "send_receipt", T0 - 3 * MIN, 100, 5, 100), // error_rate 0.05
+      mkRollup("notify", "send_receipt", T0 - 2 * MIN, 0, 0, 40), // excluded from error_rate
+      mkRollup("notify", "send_receipt", T0 - 1 * MIN, 50, 0, 60), // error_rate 0
     ]);
 
     const written = await computeBaselines(env.DB, T0);
     expect(written).toBe(4);
 
     // req_rate includes the zero-traffic minute as a literal 0: sorted [0,50,100] -> median 50.
-    const reqRate = await baselineRow("notifications", "send_receipt", "req_rate");
+    const reqRate = await baselineRow("notify", "send_receipt", "req_rate");
     expect(reqRate?.median).toBe(50);
 
     // error_rate only sees [0.05, 0] (the count=0 minute excluded) -> mean-of-two-middles.
-    const errorRate = await baselineRow("notifications", "send_receipt", "error_rate");
+    const errorRate = await baselineRow("notify", "send_receipt", "error_rate");
     expect(errorRate?.median).toBeCloseTo(0.025);
   });
 
@@ -216,22 +216,22 @@ describe("getBaselines", () => {
   });
 
   it("round-trips computeBaselines' output, keyed by baselineKey(service, operation, metric)", async () => {
-    await insertRollups(env.DB, [mkRollup("checkout", "POST /checkout", T0 - MIN, 100, 5, 150)]);
+    await insertRollups(env.DB, [mkRollup("checkout-edge", "POST /checkout", T0 - MIN, 100, 5, 150)]);
     await computeBaselines(env.DB, T0);
 
     const map = await getBaselines(env.DB);
     expect(map.size).toBe(4);
-    expect(map.get(baselineKey("checkout", "POST /checkout", "req_rate"))).toEqual({ median: 100, mad: 0 });
-    expect(map.get(baselineKey("checkout", "POST /checkout", "error_rate"))).toEqual({ median: 0.05, mad: 0 });
-    expect(map.get(baselineKey("checkout", "POST /checkout", "p95"))).toEqual({ median: 150, mad: 0 });
-    expect(map.get(baselineKey("checkout", "POST /checkout", "p50"))).toEqual({ median: 75, mad: 0 });
-    expect(map.get(baselineKey("checkout", "POST /checkout", "req_rate" as const))).not.toBeUndefined();
+    expect(map.get(baselineKey("checkout-edge", "POST /checkout", "req_rate"))).toEqual({ median: 100, mad: 0 });
+    expect(map.get(baselineKey("checkout-edge", "POST /checkout", "error_rate"))).toEqual({ median: 0.05, mad: 0 });
+    expect(map.get(baselineKey("checkout-edge", "POST /checkout", "p95"))).toEqual({ median: 150, mad: 0 });
+    expect(map.get(baselineKey("checkout-edge", "POST /checkout", "p50"))).toEqual({ median: 75, mad: 0 });
+    expect(map.get(baselineKey("checkout-edge", "POST /checkout", "req_rate" as const))).not.toBeUndefined();
     expect(map.get("nonexistent:key:req_rate")).toBeUndefined();
   });
 });
 
 describe("baselineKey", () => {
   it("joins service, operation, metric with ':'", () => {
-    expect(baselineKey("checkout", "POST /checkout", "p95")).toBe("checkout:POST /checkout:p95");
+    expect(baselineKey("checkout-edge", "POST /checkout", "p95")).toBe("checkout-edge:POST /checkout:p95");
   });
 });

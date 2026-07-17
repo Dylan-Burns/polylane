@@ -2,27 +2,41 @@
  * The demo universe's static, data-driven service topology (spec §6):
  *
  * ```
- * gateway ──► checkout ──► payments ──► payments-db
- *    │            │
- *    │            └──► notifications ──► email-provider (external)
- *    └──► catalog
+ * edge-gateway ──► checkout-edge ──► payments-api ──► ledger-db
+ *    │                   │
+ *    │                   └──► notify ──► email-api (external)
+ *    └──► catalog-kv
  * ```
  *
- * Six internal services emit spans; `email-provider` is an external dependency (no internal
+ * Six internal services emit spans; `email-api` is an external dependency (no internal
  * spans of its own, only call results — see `EXTERNAL_SERVICE` below). Each internal service
  * exposes 2-3 operations with distinct latency/error profiles (spec §6). `generator.ts` walks
  * `FLOWS` to build traces; this file only holds data, no generation logic.
  */
 
-export const SERVICES = ["gateway", "checkout", "payments", "payments-db", "notifications", "catalog"] as const;
+export const SERVICES = ["edge-gateway", "checkout-edge", "payments-api", "ledger-db", "notify", "catalog-kv"] as const;
 
 export type ServiceName = (typeof SERVICES)[number];
 
 /**
- * `email-provider` is a dependency `notifications` calls, but per spec §6 it emits no internal
+ * `email-api` is a dependency `notify` calls, but per spec §6 it emits no internal
  * span — only its latency/error outcome folds into the calling step's timing and propagation.
  */
-export const EXTERNAL_SERVICE = "email-provider";
+export const EXTERNAL_SERVICE = "email-api";
+
+/** Cloudflare-native product each service is modeled after — drives UI sublabels and node icons. */
+export type ServiceKind = "worker" | "d1" | "kv" | "queue" | "external";
+
+/** Kind for every one of the seven service names (six internal + the external dependency). */
+export const SERVICE_KIND: Readonly<Record<string, ServiceKind>> = {
+  "edge-gateway": "worker",
+  "checkout-edge": "worker",
+  "payments-api": "worker",
+  "ledger-db": "d1",
+  "catalog-kv": "kv",
+  notify: "queue",
+  "email-api": "external",
+};
 
 export interface Latency {
   mu: number;
@@ -35,8 +49,8 @@ export interface Latency {
  * marker live *alongside* the step defs below (`ERROR_LOG_MESSAGES`, `ASYNC_STEP_KEYS`), keyed
  * by `${service}:${operation}`, rather than as extra fields on `Step` itself.
  *
- * Step objects are immutable data; a leaf may be shared by several parents (e.g. both payments
- * operations hit the same payments-db steps) — the generator never mutates them.
+ * Step objects are immutable data; a leaf may be shared by several parents (e.g. both payments-api
+ * operations hit the same ledger-db steps) — the generator never mutates them.
  */
 export interface Step {
   service: string;
@@ -61,7 +75,7 @@ export function stepKey(step: Pick<Step, "service" | "operation">): string {
 // Latency `mu` is log-space, so `exp(mu)` is the operation's median duration in ms.
 
 const paymentsDbQueryStep: Step = {
-  service: "payments-db",
+  service: "ledger-db",
   operation: "query_ledger",
   latency: { mu: Math.log(12), sigma: 0.45 },
   errorRate: 0.003,
@@ -69,7 +83,7 @@ const paymentsDbQueryStep: Step = {
 };
 
 const paymentsDbUpdateStep: Step = {
-  service: "payments-db",
+  service: "ledger-db",
   operation: "update_ledger",
   latency: { mu: Math.log(18), sigma: 0.5 },
   errorRate: 0.004,
@@ -77,16 +91,16 @@ const paymentsDbUpdateStep: Step = {
 };
 
 const paymentsChargeStep: Step = {
-  service: "payments",
+  service: "payments-api",
   operation: "charge",
   latency: { mu: Math.log(25), sigma: 0.35 },
   errorRate: 0.002,
-  // Read the ledger, then write the charge — both payments-db operations on every charge.
+  // Read the ledger, then write the charge — both ledger-db operations on every charge.
   children: [paymentsDbQueryStep, paymentsDbUpdateStep],
 };
 
 const paymentsRefundStep: Step = {
-  service: "payments",
+  service: "payments-api",
   operation: "refund",
   latency: { mu: Math.log(30), sigma: 0.4 },
   errorRate: 0.003,
@@ -102,7 +116,7 @@ const emailProviderStep: Step = {
 };
 
 const notificationsRenderStep: Step = {
-  service: "notifications",
+  service: "notify",
   operation: "render_template",
   latency: { mu: Math.log(3), sigma: 0.25 },
   errorRate: 0.001,
@@ -110,7 +124,7 @@ const notificationsRenderStep: Step = {
 };
 
 const notificationsSendStep: Step = {
-  service: "notifications",
+  service: "notify",
   operation: "send_email",
   latency: { mu: Math.log(6), sigma: 0.3 },
   errorRate: 0.002,
@@ -119,7 +133,7 @@ const notificationsSendStep: Step = {
 };
 
 const checkoutGetCartStep: Step = {
-  service: "checkout",
+  service: "checkout-edge",
   operation: "get_cart",
   latency: { mu: Math.log(7), sigma: 0.3 },
   errorRate: 0.001,
@@ -127,18 +141,18 @@ const checkoutGetCartStep: Step = {
 };
 
 const checkoutPlaceOrderStep: Step = {
-  service: "checkout",
+  service: "checkout-edge",
   operation: "place_order",
   latency: { mu: Math.log(15), sigma: 0.4 },
   errorRate: 0.002,
-  // Two children: the synchronous payments chain, and the async notifications branch (see
+  // Two children: the synchronous payments-api chain, and the async notify branch (see
   // ASYNC_STEP_KEYS below). The async branch starts inside place_order's window but does not
-  // extend it, and its errors do NOT bubble up to checkout/gateway.
+  // extend it, and its errors do NOT bubble up to checkout-edge/edge-gateway.
   children: [paymentsChargeStep, notificationsSendStep],
 };
 
 const checkoutRefundOrderStep: Step = {
-  service: "checkout",
+  service: "checkout-edge",
   operation: "refund_order",
   latency: { mu: Math.log(12), sigma: 0.35 },
   errorRate: 0.002,
@@ -146,7 +160,7 @@ const checkoutRefundOrderStep: Step = {
 };
 
 const catalogListStep: Step = {
-  service: "catalog",
+  service: "catalog-kv",
   operation: "list_products",
   latency: { mu: Math.log(40), sigma: 0.45 },
   errorRate: 0.002,
@@ -154,20 +168,20 @@ const catalogListStep: Step = {
 };
 
 const catalogGetStep: Step = {
-  service: "catalog",
+  service: "catalog-kv",
   operation: "get_product",
   latency: { mu: Math.log(15), sigma: 0.35 },
   errorRate: 0.0015,
   children: [],
 };
 
-// Gateway is the entry point for every flow. It exposes exactly three operations
+// edge-gateway is the entry point for every flow. It exposes exactly three operations
 // (route_checkout, route_browse, get_status) — the refund flow enters through route_checkout
-// (gateway routes both order placement and refunds to checkout), keeping every service within
-// spec §6's "2-3 operations" band.
+// (edge-gateway routes both order placement and refunds to checkout-edge), keeping every service
+// within spec §6's "2-3 operations" band.
 
 const gatewayCheckoutEntry: Step = {
-  service: "gateway",
+  service: "edge-gateway",
   operation: "route_checkout",
   latency: { mu: Math.log(8), sigma: 0.35 },
   errorRate: 0.002,
@@ -176,7 +190,7 @@ const gatewayCheckoutEntry: Step = {
 };
 
 const gatewayRefundEntry: Step = {
-  service: "gateway",
+  service: "edge-gateway",
   operation: "route_checkout", // same (service, operation) profile as gatewayCheckoutEntry
   latency: { mu: Math.log(8), sigma: 0.35 },
   errorRate: 0.002,
@@ -184,16 +198,16 @@ const gatewayRefundEntry: Step = {
 };
 
 const gatewayBrowseEntry: Step = {
-  service: "gateway",
+  service: "edge-gateway",
   operation: "route_browse",
   latency: { mu: Math.log(6), sigma: 0.3 },
   errorRate: 0.002,
-  // List products, then view one — exercises both catalog operations per browse.
+  // List products, then view one — exercises both catalog-kv operations per browse.
   children: [catalogListStep, catalogGetStep],
 };
 
 const gatewayStatusEntry: Step = {
-  service: "gateway",
+  service: "edge-gateway",
   operation: "get_status",
   latency: { mu: Math.log(4), sigma: 0.25 },
   errorRate: 0.0015,
@@ -202,8 +216,8 @@ const gatewayStatusEntry: Step = {
 
 /**
  * Flows: checkout ~15%, browse ~70%, status ~15% (spec §6), plus a rare `refund` flow (~2%;
- * weights are normalized by `generator.ts`) that exercises checkout.refund_order /
- * payments.refund so every service genuinely has 2-3 operations with distinct profiles.
+ * weights are normalized by `generator.ts`) that exercises checkout-edge.refund_order /
+ * payments-api.refund so every service genuinely has 2-3 operations with distinct profiles.
  */
 export const FLOWS: Flow[] = [
   { name: "checkout", weight: 0.15, entry: gatewayCheckoutEntry },
@@ -215,9 +229,8 @@ export const FLOWS: Flow[] = [
 /**
  * Symptom-only log message for when a step is the one with its own intrinsic error (spec §6
  * telemetry honesty calibration: realistic-sounding, but never names the injected root cause —
- * no deploy/version/scenario references). Keyed by `stepKey`. `payments-db:query_ledger` and
- * `email-provider:send` use the exact example strings from spec §6 / the task brief. Note
- * `gateway:route_checkout` covers both gateway entry Steps that share that operation.
+ * no deploy/version/scenario references). Keyed by `stepKey`. Note `edge-gateway:route_checkout`
+ * covers both gateway entry Steps that share that operation.
  */
 export const ERROR_LOG_MESSAGES: Readonly<Record<string, string>> = {
   [stepKey(gatewayCheckoutEntry)]: "request handling failed: unexpected client disconnect",
@@ -228,20 +241,20 @@ export const ERROR_LOG_MESSAGES: Readonly<Record<string, string>> = {
   [stepKey(checkoutRefundOrderStep)]: "refund processing failed: order state conflict",
   [stepKey(paymentsChargeStep)]: "payment authorization failed: card issuer declined",
   [stepKey(paymentsRefundStep)]: "refund request failed: settlement batch not found",
-  [stepKey(paymentsDbQueryStep)]: "connection pool exhausted: 25/25 in use, acquire timeout 5000ms",
-  [stepKey(paymentsDbUpdateStep)]: "write conflict: ledger row lock timeout after 3 retries",
+  [stepKey(paymentsDbQueryStep)]: "D1_ERROR: too many queued queries — 25 in flight, acquire timed out after 5000ms",
+  [stepKey(paymentsDbUpdateStep)]: "D1_ERROR: database is locked — ledger write retried 3 times, giving up",
   [stepKey(notificationsSendStep)]: "email send failed: connection reset by peer",
   [stepKey(notificationsRenderStep)]: "template render error: missing field 'order_id'",
   [stepKey(emailProviderStep)]: "upstream 503 from provider",
-  [stepKey(catalogListStep)]: "catalog search failed: index shard timeout",
-  [stepKey(catalogGetStep)]: "product lookup failed: cache read timeout",
+  [stepKey(catalogListStep)]: "KV list failed: cursor expired mid-pagination",
+  [stepKey(catalogGetStep)]: "KV get failed: read timed out at edge cache",
 };
 
 /**
  * Keys of steps whose failures are fire-and-forget from the caller's perspective — the brief's
- * "async branch" (checkout -> notifications -> email-provider). An async step's span starts
+ * "async branch" (checkout-edge -> notify -> email-api). An async step's span starts
  * within its parent's window but the parent does not wait for it: no duration contribution and
- * no error propagation to the parent (spec §6 scenario 2: "notifications degrade; checkout
+ * no error propagation to the parent (spec §6 scenario 2: "notify degrades; checkout-edge
  * unaffected").
  */
 export const ASYNC_STEP_KEYS: ReadonlySet<string> = new Set([stepKey(notificationsSendStep)]);

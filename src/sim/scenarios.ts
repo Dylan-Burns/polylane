@@ -7,7 +7,7 @@
  * Key format note: `FaultEffects.latencyMult` / `errorRateOverride` are keyed by plain **service**
  * name, matching `step.service` as read by `generator.ts` (`effects.latencyMult.get(step.service)`
  * etc.) — there is no per-operation granularity in the generator today, so an override on
- * `"payments"` reaches both `payments.charge` and `payments.refund`.
+ * `"payments-api"` reaches both `payments-api.charge` and `payments-api.refund`.
  *
  * Honesty calibration (spec §6): every string here that the agent could observe through the query
  * layer (log messages, deploy notes) stays symptom-only — never names a scenario, "deploy", a
@@ -47,13 +47,13 @@ const BAD_DEPLOY_ONSET_MS = 30_000;
 const BAD_DEPLOY_LATENCY_MULT = 6;
 const BAD_DEPLOY_ERROR_RATE = 0.25;
 const BAD_DEPLOY_ERROR_TYPE = "pool_exhausted";
-/** Reuses the exact phrasing already established for `payments-db:query_ledger`'s baseline
+/** Reuses the exact phrasing already established for `ledger-db:query_ledger`'s baseline
  * pool-exhaustion error — sounds like a real resource exhaustion, never names the deploy. */
-const BAD_DEPLOY_LOG_MESSAGE = establishedLogMessage("payments-db:query_ledger");
+const BAD_DEPLOY_LOG_MESSAGE = establishedLogMessage("ledger-db:query_ledger");
 
 const DEPENDENCY_OUTAGE_ERROR_RATE = 1;
 const DEPENDENCY_OUTAGE_ERROR_TYPE = "upstream_unavailable";
-/** Reuses the email-provider step's own established symptom string. */
+/** Reuses the email-api step's own established symptom string. */
 const DEPENDENCY_OUTAGE_LOG_MESSAGE = establishedLogMessage(`${EXTERNAL_SERVICE}:send`);
 
 const LATENCY_CREEP_RAMP_MS = 4 * 60_000;
@@ -78,15 +78,15 @@ export function effectsFor(fault: FaultState, nowMs: number): FaultEffects {
     case "bad-deploy": {
       if (elapsedMs < BAD_DEPLOY_ONSET_MS) return identityEffects();
       return {
-        latencyMult: new Map([["payments", BAD_DEPLOY_LATENCY_MULT]]),
+        latencyMult: new Map([["payments-api", BAD_DEPLOY_LATENCY_MULT]]),
         errorRateOverride: new Map([
           [
-            "payments",
+            "payments-api",
             { rate: BAD_DEPLOY_ERROR_RATE, errorType: BAD_DEPLOY_ERROR_TYPE, logMessage: BAD_DEPLOY_LOG_MESSAGE },
           ],
         ]),
-        // The checkout-timeout / gateway-5xx cascade is NOT modeled here — it comes free from
-        // the generator's own downstream-error propagation once "payments" reports an error.
+        // The checkout-edge-timeout / edge-gateway-5xx cascade is NOT modeled here — it comes free
+        // from the generator's own downstream-error propagation once "payments-api" reports an error.
         trafficMult: 1,
       };
     }
@@ -115,7 +115,7 @@ export function effectsFor(fault: FaultState, nowMs: number): FaultEffects {
       const rampProgress = Math.min(1, Math.max(0, elapsedMs / LATENCY_CREEP_RAMP_MS));
       const mult = 1 + (LATENCY_CREEP_MAX_MULT - 1) * rampProgress;
       return {
-        latencyMult: new Map([["payments-db", mult]]),
+        latencyMult: new Map([["ledger-db", mult]]),
         errorRateOverride: new Map(),
         trafficMult: 1,
       };
@@ -144,10 +144,10 @@ function deployId(scenario: ScenarioId, service: string, version: string): strin
   return `deploy-${scenario}-${service}-${version}`;
 }
 
-/** `fault === null` emits nothing. Otherwise always includes the benign red-herring `catalog`
- * deploy, plus (bad-deploy only) the real `payments@v2.4.1` deploy that the agent must correlate
- * with the regression onset 30s later. Deploy notes are ordinary, non-revealing release notes —
- * they never hint that one of the two is the actual cause. */
+/** `fault === null` emits nothing. Otherwise always includes the benign red-herring `catalog-kv`
+ * deploy, plus (bad-deploy only) the real `payments-api@v2.4.1` deploy that the agent must
+ * correlate with the regression onset 30s later. Deploy notes are ordinary, non-revealing release
+ * notes — they never hint that one of the two is the actual cause. */
 export function deployEventsFor(fault: FaultState): Deploy[] {
   if (fault === null) return [];
   const { scenario, startedMs } = fault;
@@ -155,8 +155,8 @@ export function deployEventsFor(fault: FaultState): Deploy[] {
 
   if (scenario === "bad-deploy") {
     deploys.push({
-      id: deployId(scenario, "payments", "v2.4.1"),
-      service: "payments",
+      id: deployId(scenario, "payments-api", "v2.4.1"),
+      service: "payments-api",
       version: "v2.4.1",
       ts_ms: startedMs,
       note: "routine release",
@@ -164,8 +164,8 @@ export function deployEventsFor(fault: FaultState): Deploy[] {
   }
 
   deploys.push({
-    id: deployId(scenario, "catalog", "v1.8.3"),
-    service: "catalog",
+    id: deployId(scenario, "catalog-kv", "v1.8.3"),
+    service: "catalog-kv",
     version: "v1.8.3",
     ts_ms: startedMs + RED_HERRING_DELAY_MS,
     note: "routine release",
@@ -180,29 +180,29 @@ export function deployEventsFor(fault: FaultState): Deploy[] {
  * consumes, so (unlike log messages / deploy notes above) it may describe the mechanism plainly. */
 export const SCENARIOS: Record<ScenarioId, { label: string; description: string; expectedDetection: string }> = {
   "bad-deploy": {
-    label: "Bad deploy",
+    label: "Bad Worker deploy",
     description:
-      "A payments deploy quietly regresses latency and reliability starting 30s after release, cascading into checkout timeouts and gateway 5xxs.",
+      "A payments-api Worker release quietly regresses latency and reliability starting 30s after ship, cascading into checkout-edge timeouts and edge-gateway 5xxs.",
     expectedDetection:
-      "Correlates the payments deploy event's timestamp with the regression's later onset (not the red-herring catalog deploy), and traces the cascade from payments through checkout to gateway.",
+      "Correlates the payments-api deploy event's timestamp with the regression's later onset (not the red-herring catalog-kv deploy), and traces the cascade from payments-api through checkout-edge to edge-gateway.",
   },
   "dependency-outage": {
     label: "Dependency outage",
     description:
-      "The external email provider becomes fully unavailable; notification sends fail, but checkout completes normally.",
+      "The external email API becomes fully unavailable; notify sends fail, but checkout completes normally.",
     expectedDetection:
-      "Scopes the blast radius to notifications/email-provider only, and concludes checkout/customer impact is low rather than over-escalating.",
+      "Scopes the blast radius to notify/email-api only, and concludes checkout/customer impact is low rather than over-escalating.",
   },
   "latency-creep": {
     label: "Latency creep (slow burn: ~5 min)",
     description:
-      "payments-db latency ramps up gradually over about 4 minutes with no sharp edge and no change in error rate.",
+      "ledger-db (D1) latency ramps up gradually over about 4 minutes with no sharp edge and no change in error rate.",
     expectedDetection:
-      "Recognizes a gradual drift trend in payments-db latency (not a step change) and attributes it to the database tier.",
+      "Recognizes a gradual drift trend in ledger-db latency (not a step change) and attributes it to the database tier.",
   },
   "traffic-spike": {
     label: "Traffic spike",
-    description: "Gateway load jumps 5x; latency rises broadly across services with no underlying defect.",
+    description: "Edge traffic jumps 5x; latency rises broadly across services with no underlying defect.",
     expectedDetection:
       "Attributes elevated latency to load volume proportionally across services, and does not misidentify a code or deploy culprit.",
   },

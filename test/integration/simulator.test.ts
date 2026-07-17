@@ -20,6 +20,11 @@ interface StatusBody {
   fault: { scenario: string; startedMs: number } | null;
   generation: number;
   seedProgress?: number;
+  live?: {
+    minuteTs: number;
+    elapsedMs: number;
+    services: Record<string, { count: number; errPct: number; p95: number }>;
+  };
 }
 
 async function statusOf(stub: DurableObjectStub): Promise<StatusBody> {
@@ -32,7 +37,7 @@ function makeSpan(i: number): Span {
     trace_id: `pre-existing-trace-${i}`,
     span_id: `pre-existing-span-${i}`,
     parent_span_id: null,
-    service: "checkout",
+    service: "checkout-edge",
     operation: "place_order",
     start_ms: 1_700_000_000_000 + i,
     duration_ms: 10,
@@ -138,14 +143,14 @@ describe("SimulatorDO fault/restore", () => {
     expect(await secondRes.json()).toEqual({ error: "scenario_active" });
 
     // Advance well past the 30s onset with a wide (5min) window so pool-exhaustion errors are
-    // all but certain to appear (25% error rate on payments once active).
+    // all but certain to appear (25% error rate on payments-api once active).
     await runInDurableObject(stub, async (instance) => {
       instance.setTestNow(PEAK_HOUR_T0 + 5 * MINUTE_MS);
       await instance.alarm();
     });
 
     const faultedErrors = await env.DB.prepare(
-      "SELECT count(*) as n FROM spans WHERE service = 'payments' AND error_type = 'pool_exhausted'",
+      "SELECT count(*) as n FROM spans WHERE service = 'payments-api' AND error_type = 'pool_exhausted'",
     ).first<{ n: number }>();
     expect(faultedErrors?.n).toBeGreaterThan(0);
 
@@ -164,7 +169,7 @@ describe("SimulatorDO fault/restore", () => {
     });
 
     const postRestoreErrors = await env.DB.prepare(
-      "SELECT count(*) as n FROM spans WHERE service = 'payments' AND error_type = 'pool_exhausted' AND start_ms >= ?",
+      "SELECT count(*) as n FROM spans WHERE service = 'payments-api' AND error_type = 'pool_exhausted' AND start_ms >= ?",
     )
       .bind(restoreTickStart)
       .first<{ n: number }>();
@@ -369,5 +374,60 @@ describe("SimulatorDO stale-generation guard", () => {
     // Sanity check the guard is a real, reachable branch: a matching (current) generation does write.
     const currentResult = await runInDurableObject(stub, (instance) => instance.runLiveTickForTest(2));
     expect(currentResult.wrote).toBe(true);
+  });
+});
+
+describe("SimulatorDO live metrics (Table 7)", () => {
+  it("GET /status omits `live` unless the world is running AND the open minute has accumulated stats", async () => {
+    const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("test-live-1"));
+
+    // Not running yet: `live` omitted even with a partialMinute already sitting in storage.
+    await runInDurableObject(stub, async (instance, state) => {
+      await state.storage.put("worldStatus", "seeding");
+      await state.storage.put("partialMinute", {
+        minuteTs: PEAK_HOUR_T0,
+        stats: [{ service: "checkout-edge", operation: "place_order", duration_ms: 50, isError: false }],
+      });
+      instance.setTestNow(PEAK_HOUR_T0 + 15_000);
+    });
+    expect((await statusOf(stub)).live).toBeUndefined();
+
+    // Running, but the open minute has no accumulated stats at all (no partialMinute key): still omitted.
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put("worldStatus", "running");
+      await state.storage.delete("partialMinute");
+    });
+    expect((await statusOf(stub)).live).toBeUndefined();
+  });
+
+  it("GET /status's `live` aggregates partialMinute per service (count/errPct/p95) with the correct elapsedMs", async () => {
+    const stub = env.SIMULATOR.get(env.SIMULATOR.idFromName("test-live-2"));
+
+    await runInDurableObject(stub, async (instance, state) => {
+      await state.storage.put("worldStatus", "running");
+      await state.storage.put("partialMinute", {
+        minuteTs: PEAK_HOUR_T0,
+        stats: [
+          { service: "checkout-edge", operation: "place_order", duration_ms: 50, isError: false },
+          { service: "checkout-edge", operation: "place_order", duration_ms: 150, isError: true },
+          { service: "edge-gateway", operation: "GET /", duration_ms: 10, isError: false },
+        ],
+      });
+      instance.setTestNow(PEAK_HOUR_T0 + 15_000); // 15s into the open minute
+    });
+
+    const status = await statusOf(stub);
+    expect(status.live).toEqual({
+      minuteTs: PEAK_HOUR_T0,
+      elapsedMs: 15_000,
+      services: {
+        "checkout-edge": { count: 2, errPct: 50, p95: 150 }, // nearest-rank p95 of [50,150] -> 150
+        "edge-gateway": { count: 1, errPct: 0, p95: 10 },
+      },
+    });
+
+    // The same aggregate is threaded through `/api/state` (routes.test.ts covers the HTTP shape) --
+    // this file only proves SimulatorDO's own `/status` body is correct, which `/api/state` passes
+    // through verbatim per Table 7.
   });
 });

@@ -19,6 +19,7 @@ import type {
   FaultState,
   IncidentDetailResponse,
   IncidentListResponse,
+  IncidentLogsResponse,
   IncidentMetricsResponse,
   ScenarioId,
   StateResponse,
@@ -80,6 +81,14 @@ export function getDeploys(): Promise<DeployListResponse> {
 
 export function getIncidentMetrics(id: string): Promise<IncidentMetricsResponse> {
   return getJson<IncidentMetricsResponse>(`/api/incidents/${encodeURIComponent(id)}/metrics`);
+}
+
+/** The incident detail modal's Logs tab: raw log lines from the incident's window, fetched lazily
+ * (only once that tab is opened) since `/api/incidents/:id/logs` 404s for an unknown id and returns
+ * an honestly-empty `{logs: [], total: 0}` once raw telemetry has aged out of retention — both are
+ * ordinary outcomes the tab renders inline, not exceptions. */
+export function getIncidentLogs(id: string): Promise<IncidentLogsResponse> {
+  return getJson<IncidentLogsResponse>(`/api/incidents/${encodeURIComponent(id)}/logs`);
 }
 
 // --- Remediation ---------------------------------------------------------------------------------

@@ -13,9 +13,14 @@ interface SparklineProps {
   height?: number;
   color: string;
   ariaLabel: string;
+  /** True when the last entry of `values` is a live (in-progress, not-yet-closed-minute) point
+   * rather than a normal rollup — drawn as a small pulsing dot in the signal color on top of the
+   * line, so "this one point is still moving" reads at a glance (spec: live metrics, Canonical
+   * Table 7). No effect if that last value is `null`. */
+  live?: boolean;
 }
 
-export function Sparkline({ values, width = 96, height = 22, color, ariaLabel }: SparklineProps) {
+export function Sparkline({ values, width = 96, height = 22, color, ariaLabel, live = false }: SparklineProps) {
   const known = values.filter((v): v is number => v !== null);
 
   if (known.length === 0) {
@@ -59,13 +64,20 @@ export function Sparkline({ values, width = 96, height = 22, color, ariaLabel }:
 
   const last = known[known.length - 1] as number;
 
+  const lastIdx = values.length - 1;
+  const lastRawValue = values[lastIdx];
+  const liveDot =
+    live && lastRawValue !== null
+      ? { x: lastIdx * stepX, y: padding + drawableH - ((lastRawValue - min) / range) * drawableH }
+      : null;
+
   return (
     <svg
       width={width}
       height={height}
       viewBox={`0 0 ${width} ${height}`}
       role="img"
-      aria-label={`${ariaLabel}: latest ${last.toFixed(2)}`}
+      aria-label={`${ariaLabel}: latest ${last.toFixed(2)}${live ? " (live)" : ""}`}
       className="overflow-visible"
     >
       {segments.map((points, i) => (
@@ -79,6 +91,16 @@ export function Sparkline({ values, width = 96, height = 22, color, ariaLabel }:
           strokeLinecap="round"
         />
       ))}
+      {liveDot && (
+        <circle
+          cx={liveDot.x}
+          cy={liveDot.y}
+          r={2.5}
+          fill="var(--color-signal)"
+          className="animate-scan-pulse"
+          aria-hidden="true"
+        />
+      )}
     </svg>
   );
 }

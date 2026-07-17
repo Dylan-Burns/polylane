@@ -92,18 +92,18 @@ function neverRespondingLLM(): LLM {
 }
 
 const GOOD_REPORT = {
-  summary: "Payments pool exhaustion caused checkout failures.",
-  timeline: [{ time: "14:32Z", description: "checkout error_rate spiked" }],
-  root_cause: { hypothesis: "connection pool exhaustion", mechanism: "payments pool saturated" },
+  summary: "Payments pool exhaustion caused checkout-edge failures.",
+  timeline: [{ time: "14:32Z", description: "checkout-edge error_rate spiked" }],
+  root_cause: { hypothesis: "connection pool exhaustion", mechanism: "payments-api pool saturated" },
   evidence: [{ description: "failing trace", trace_id: "test-trace-1", metric: null, log_excerpt: null }],
-  blast_radius: { affected_services: ["checkout", "payments"], customer_impact: "~5% of checkouts failed" },
+  blast_radius: { affected_services: ["checkout-edge", "payments-api"], customer_impact: "~5% of checkouts failed" },
   confidence: { level: "high", why: "reproduced in a single trace" },
-  suggested_action: "roll back the payments deploy",
+  suggested_action: "roll back the payments-api deploy",
 };
 
 const GOOD_REPORT_NO_EVIDENCE = {
   ...GOOD_REPORT,
-  evidence: [{ description: "no trace cited", trace_id: null, metric: "payments error_rate", log_excerpt: null }],
+  evidence: [{ description: "no trace cited", trace_id: null, metric: "payments-api error_rate", log_excerpt: null }],
 };
 
 interface IncidentRow {
@@ -144,7 +144,7 @@ function makeSpan(overrides: Partial<Span> = {}): Span {
     trace_id: "test-trace-1",
     span_id: "span-1",
     parent_span_id: null,
-    service: "payments",
+    service: "payments-api",
     operation: "charge",
     start_ms: NOW0 - 60_000,
     duration_ms: 3000,
@@ -170,8 +170,8 @@ describe("InvestigatorDO: end-to-end mock investigation", () => {
 
     const r1 = makeMessage({
       content: [
-        thinking("checking payments metrics first", "sig-e2e-1"),
-        toolUse("call-1", "query_metrics", { service: "payments", operation: null, metrics: null, window: { from: "-30m", to: null }, step: null }),
+        thinking("checking payments-api metrics first", "sig-e2e-1"),
+        toolUse("call-1", "query_metrics", { service: "payments-api", operation: null, metrics: null, window: { from: "-30m", to: null }, step: null }),
       ],
       stop_reason: "tool_use",
       usage: usage({ input_tokens: 500, output_tokens: 80 }),
@@ -203,7 +203,7 @@ describe("InvestigatorDO: end-to-end mock investigation", () => {
     const startRes = await stub.fetch("http://investigator/start", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ incidentId, statement: "payments error_rate 24% vs baseline 0.3%" }),
+      body: JSON.stringify({ incidentId, statement: "payments-api error_rate 24% vs baseline 0.3%" }),
     });
     expect(startRes.status).toBe(202);
     expect((await getIncident(incidentId))?.status).toBe("investigating");
@@ -216,7 +216,7 @@ describe("InvestigatorDO: end-to-end mock investigation", () => {
     expect(midRunConv).toBeDefined();
     const assistantTurn = midRunConv?.find((m) => m.role === "assistant");
     const thinkingBlock = (assistantTurn?.content as ContentBlockParam[] | undefined)?.find((b) => b.type === "thinking");
-    expect(thinkingBlock).toEqual(thinking("checking payments metrics first", "sig-e2e-1"));
+    expect(thinkingBlock).toEqual(thinking("checking payments-api metrics first", "sig-e2e-1"));
 
     // --- Steps landed in D1, in order, correct kinds/tokens. ---
     const steps = await getSteps(incidentId);
@@ -265,7 +265,7 @@ describe("InvestigatorDO: resume after a simulated death", () => {
       content: [{ type: "tool_result", tool_use_id: "call-1", content: JSON.stringify({ ok: true }), is_error: false }],
     };
     const preCrashConv: MessageParam[] = [
-      { role: "user", content: [{ type: "text", text: "Anomaly detected: payments p95 8x baseline" }] },
+      { role: "user", content: [{ type: "text", text: "Anomaly detected: payments-api p95 8x baseline" }] },
       priorAssistant,
       priorToolResult,
     ];
@@ -274,7 +274,7 @@ describe("InvestigatorDO: resume after a simulated death", () => {
       await state.storage.put("active", incidentId);
       await state.storage.put(`conv:${incidentId}`, preCrashConv);
       await state.storage.put(`meta:${incidentId}`, {
-        statement: "payments p95 8x baseline",
+        statement: "payments-api p95 8x baseline",
         openedAtMs: NOW0 - 60_000,
         runId: "run-resume-1",
         nextStepNo: 3,
@@ -332,7 +332,7 @@ describe("InvestigatorDO: resume after a simulated death", () => {
     // never got to react to): the transcript's tail is assistant-final -- review minor: replaying
     // that verbatim would be an instruction to CONTINUE generating that same turn (prefill).
     const preCrashConv: MessageParam[] = [
-      { role: "user", content: [{ type: "text", text: "Anomaly detected: catalog latency" }] },
+      { role: "user", content: [{ type: "text", text: "Anomaly detected: catalog-kv latency" }] },
       { role: "assistant", content: [{ type: "text", text: "I believe the investigation is complete." }] as unknown as ContentBlockParam[] },
     ];
 
@@ -340,7 +340,7 @@ describe("InvestigatorDO: resume after a simulated death", () => {
       await state.storage.put("active", incidentId);
       await state.storage.put(`conv:${incidentId}`, preCrashConv);
       await state.storage.put(`meta:${incidentId}`, {
-        statement: "catalog latency",
+        statement: "catalog-kv latency",
         openedAtMs: NOW0 - 30_000,
         runId: "run-resume-tail-1",
         nextStepNo: 1,
@@ -499,11 +499,11 @@ describe("InvestigatorDO: cooperative abort mid-run", () => {
     // tool turn + a salvage-shaped submit_report): the request-count assertion below proves the
     // loop stopped after the one in-flight call instead of continuing into them.
     const r1 = makeMessage({
-      content: [toolUse("ca-1", "query_metrics", { service: "payments", operation: null, metrics: null, window: null, step: null })],
+      content: [toolUse("ca-1", "query_metrics", { service: "payments-api", operation: null, metrics: null, window: null, step: null })],
       stop_reason: "tool_use",
     });
     const r2 = makeMessage({
-      content: [toolUse("ca-2", "search_logs", { service: "payments", level: "error", contains: null, window: null, limit: null })],
+      content: [toolUse("ca-2", "search_logs", { service: "payments-api", level: "error", contains: null, window: null, limit: null })],
       stop_reason: "tool_use",
     });
     const wouldBeSalvage = makeMessage({ content: [toolUse("ca-3", "submit_report", GOOD_REPORT_NO_EVIDENCE)], stop_reason: "tool_use" });
@@ -534,7 +534,7 @@ describe("InvestigatorDO: cooperative abort mid-run", () => {
     const startRes = await stub.fetch("http://investigator/start", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ incidentId, statement: "payments error_rate 24% vs baseline 0.3%" }),
+      body: JSON.stringify({ incidentId, statement: "payments-api error_rate 24% vs baseline 0.3%" }),
     });
     expect(startRes.status).toBe(202);
 
@@ -572,12 +572,12 @@ describe("InvestigatorDO: cooperative abort mid-run", () => {
 describe("InvestigatorDO: detector update injection", () => {
   it("an undelivered fingerprint seeded mid-run is injected as a 'detector update:' user message on the NEXT model call, and marked delivered", async () => {
     const incidentId = "inc-update-1";
-    const trigger = { statements: ["checkout error_rate 12%"], anomalies: [{ statement: "checkout error_rate 12%", fingerprint: "checkout:errors", service: "checkout", rule: "sustained" }] };
+    const trigger = { statements: ["checkout-edge error_rate 12%"], anomalies: [{ statement: "checkout-edge error_rate 12%", fingerprint: "checkout-edge:errors", service: "checkout-edge", rule: "sustained" }] };
     await insertIncident(incidentId, "open", NOW0 - 10_000, JSON.stringify(trigger));
 
     const stub = env.INVESTIGATOR.get(env.INVESTIGATOR.idFromName("test-update-1"));
 
-    const r1 = makeMessage({ content: [toolUse("call-1", "query_metrics", { service: "checkout", operation: null, metrics: null, window: null, step: null })], stop_reason: "tool_use" });
+    const r1 = makeMessage({ content: [toolUse("call-1", "query_metrics", { service: "checkout-edge", operation: null, metrics: null, window: null, step: null })], stop_reason: "tool_use" });
     const r2 = makeMessage({ content: [toolUse("call-2", "submit_report", GOOD_REPORT_NO_EVIDENCE)], stop_reason: "tool_use" });
     const script = scriptedLLM([r1, r2]);
 
@@ -592,12 +592,12 @@ describe("InvestigatorDO: detector update injection", () => {
             // D1 by the time call 2's checkUpdates runs (the loop checks BEFORE each model call).
             await env.DB.batch([
               env.DB.prepare(
-                `INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES (?, 'payments:latency', ?, 0)`,
+                `INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES (?, 'payments-api:latency', ?, 0)`,
               ).bind(incidentId, NOW0),
               env.DB.prepare(`UPDATE incidents SET trigger_json = ? WHERE id = ?`).bind(
                 JSON.stringify({
-                  statements: [...trigger.statements, "payments p95 now 9x baseline"],
-                  anomalies: [...trigger.anomalies, { statement: "payments p95 now 9x baseline", fingerprint: "payments:latency", service: "payments", rule: "sustained" }],
+                  statements: [...trigger.statements, "payments-api p95 now 9x baseline"],
+                  anomalies: [...trigger.anomalies, { statement: "payments-api p95 now 9x baseline", fingerprint: "payments-api:latency", service: "payments-api", rule: "sustained" }],
                 }),
                 incidentId,
               ),
@@ -612,7 +612,7 @@ describe("InvestigatorDO: detector update injection", () => {
     const startRes = await stub.fetch("http://investigator/start", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ incidentId, statement: "checkout error_rate 12%" }),
+      body: JSON.stringify({ incidentId, statement: "checkout-edge error_rate 12%" }),
     });
     expect(startRes.status).toBe(202);
 
@@ -626,13 +626,13 @@ describe("InvestigatorDO: detector update injection", () => {
     const lastMsg = secondReqMessages[secondReqMessages.length - 1];
     expect(lastMsg?.role).toBe("user");
     const lastText = ((lastMsg?.content as ContentBlockParam[] | undefined)?.[0] as { text?: string } | undefined)?.text;
-    expect(lastText).toBe("detector update: payments p95 now 9x baseline");
+    expect(lastText).toBe("detector update: payments-api p95 now 9x baseline");
 
     const incident = await getIncident(incidentId);
     expect(incident?.status).toBe("reported");
 
     const fpRow = await env.DB
-      .prepare(`SELECT delivered_to_agent FROM incident_fingerprints WHERE incident_id = ? AND fingerprint = 'payments:latency'`)
+      .prepare(`SELECT delivered_to_agent FROM incident_fingerprints WHERE incident_id = ? AND fingerprint = 'payments-api:latency'`)
       .bind(incidentId)
       .first<{ delivered_to_agent: number }>();
     expect(fpRow?.delivered_to_agent).toBe(1);

@@ -149,8 +149,17 @@ export interface StepContext {
  * whole loop by the cap check below, not by squeezing this constant. */
 const MAX_TOKENS_PER_CALL = 8192;
 
-/** The instruction appended as a user message for the one-shot salvage call (spec §9, verbatim). */
-const SALVAGE_INSTRUCTION = "conclude with what you have; state low confidence";
+/** The instruction appended as a user message for the one-shot salvage call (spec §9). Defers the
+ * confidence level to the system prompt's calibration guide rather than hard-clamping "low": a run
+ * that salvages because it hit the step/wall cap *right after* confirming its mechanism (a
+ * trace-confirmed, deploy-correlated bad deploy is the canonical case) was producing a badly
+ * under-calibrated "low" on an otherwise-correct report. The clamp's real intent — don't overclaim
+ * when cut off — survives as the "unconfirmed ⇒ low" half of the rubric. */
+export const SALVAGE_INSTRUCTION =
+  "Conclude now with the evidence you have — do not start any new query. Set confidence by the " +
+  "calibration guide in your instructions: low if the causal chain is still unconfirmed or a " +
+  "central piece of evidence is missing, but do not force it below what the evidence you have " +
+  "already gathered supports.";
 
 /**
  * Minimum per-call timeout for the SALVAGE call specifically. Without a floor, tripping the wall

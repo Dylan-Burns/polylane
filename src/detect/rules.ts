@@ -5,7 +5,7 @@
  *
  * Every rule pairs a ratio threshold with an EVIDENCE gate (spec §8 v2.1) — absolute error counts
  * for error rules, a p50 distribution-shift confirmation for latency rules — because at this
- * world's per-operation volumes (~10-15 req/min on the checkout path) small-sample noise otherwise
+ * world's per-operation volumes (~10-15 req/min on the checkout-edge path) small-sample noise otherwise
  * produces hundreds of spurious p95 trips/day, while naive request-count gates (>= 20 req/min)
  * structurally disable detection on exactly the operations the fault scenarios hit. Both failure
  * modes were measured empirically (v2 literal: ~437 p95 FP/day; uniform >=20 gate: 15-31% scenario
@@ -58,17 +58,21 @@
  * Two gates are TIGHTER than spec §8 v2.1's published values, forced by the multi-day
  * false-positive bound (the ratified escalation path: tighten via evidence gates, never via
  * traffic-volume gates) and validated to cost zero scenario-detection trials:
- *   - p50 confirmation is 2x, not 1.5x: `notifications.send_email`'s external-provider call has
+ *   - p50 confirmation is 2x, not 1.5x: `notify.send_email`'s external-provider call has
  *     sigma 0.5, so its per-minute sample p50 naturally crosses 1.5x baseline several times a day;
  *     whenever that coincides with one incidental timeout minute, 1.5x leaks a hard trip
  *     (observed ratios 1.50-1.59, ~1.6 FP/day). Every fault path lifts p50 by >= 2.3x, so 2x
  *     keeps full margin on detection (40/40 trials, unchanged latency distribution).
- *   - Sustained error evidence is >= 3 errors per minute, not >= 2: one payments-db baseline error
- *     propagates to checkout AND gateway in the same request (`walkStep`'s downstream
+ *   - Sustained error evidence is >= 3 errors per minute, not >= 2: one ledger-db baseline error
+ *     propagates to checkout-edge AND edge-gateway in the same request (`walkStep`'s downstream
  *     propagation), so "2 errors/minute, twice in a row" occurs ~1-2x/day from ~1.3% compound
- *     baseline error rates at ~20 req/min (observed: exactly-2-error pairs on checkout/gateway).
+ *     baseline error rates at ~20 req/min (observed: exactly-2-error pairs on checkout-edge/edge-gateway).
  *     Three propagated errors per minute for two consecutive minutes does not occur at baseline
  *     rates in any tested window; all four scenarios clear >= 3 with wide margin.
+ *
+ * Provenance note: every threshold above was empirically validated pre-rename, on the old service
+ * names, over identical traffic/fault shapes — the rename changes labels only, not the underlying
+ * measured distributions, so the validated numbers still apply unchanged to the renamed services.
  */
 
 import { baselineKey, type BaselineMap } from "./baselines";
@@ -286,7 +290,7 @@ function pickWorst(pool: readonly Breach[]): Breach {
 }
 
 /** Human-facing display name per metric class, matching the task brief's statement example
- * ("checkout error_rate 22.4% vs baseline 0.4% ..."). */
+ * ("checkout-edge error_rate 22.4% vs baseline 0.4% ..."). */
 function metricLabel(metricClass: MetricClass): string {
   switch (metricClass) {
     case "errors":

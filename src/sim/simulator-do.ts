@@ -83,6 +83,55 @@ interface PartialMinute {
   stats: RequestStat[];
 }
 
+/** Table 7's per-service live-metric shape, served on `GET /status` and threaded through
+ * `/api/state` (`src/telemetry/state.ts`'s `WorldStatusView.live` / `StateResponse.live`) — see
+ * `aggregateLiveServices`'s doc comment for how it's derived. */
+export interface LiveMetrics {
+  minuteTs: number;
+  elapsedMs: number;
+  services: Record<string, { count: number; errPct: number; p95: number }>;
+}
+
+/**
+ * Table 7's per-service aggregate of the still-open minute's `partialMinute` stats, exposed as
+ * `live` so the UI can plot a near-real-time point past the last CLOSED minute the sparklines
+ * chart. Reuses `rollupFromStats` (100%-of-traffic, per-(service, operation) nearest-rank
+ * percentiles — the exact function that produces real `rollups` rows) rather than re-deriving
+ * percentiles, then folds those per-operation rows down to one point per service via the same
+ * count-weighted averaging `sparklineSeries` (SQL) and `routes.ts`'s `aggregateToServiceMinutes`
+ * already use for multi-operation services — a live point and a closed-minute sparkline point are
+ * thus computed by the identical method, just one still mid-flight. Pure aggregation over
+ * already-stored state: no new D1 reads/writes, and never consulted by detection (`sweep.ts`/
+ * `rules.ts` stay untouched — this function isn't imported by either).
+ */
+export function aggregateLiveServices(
+  stats: readonly RequestStat[],
+  minuteTs: number,
+): Record<string, { count: number; errPct: number; p95: number }> {
+  const rows = rollupFromStats([...stats], minuteTs);
+  const byService = new Map<string, { count: number; errorCount: number; p95Weighted: number }>();
+  for (const row of rows) {
+    let acc = byService.get(row.service);
+    if (!acc) {
+      acc = { count: 0, errorCount: 0, p95Weighted: 0 };
+      byService.set(row.service, acc);
+    }
+    acc.count += row.count;
+    acc.errorCount += row.error_count;
+    acc.p95Weighted += row.p95_ms * row.count;
+  }
+
+  const services: Record<string, { count: number; errPct: number; p95: number }> = {};
+  for (const [service, acc] of byService) {
+    services[service] = {
+      count: acc.count,
+      errPct: acc.count === 0 ? 0 : (100 * acc.errorCount) / acc.count,
+      p95: acc.count === 0 ? 0 : acc.p95Weighted / acc.count,
+    };
+  }
+  return services;
+}
+
 function jsonResponse(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
@@ -163,8 +212,25 @@ export class SimulatorDO extends DurableObject<Env> {
     const fault = (await this.ctx.storage.get<FaultState>("fault")) ?? null;
     const generation = (await this.ctx.storage.get<number>("generation")) ?? 0;
     const seedProgress = await this.ctx.storage.get<number>("seedProgress");
-    // `seedProgress: undefined` is dropped by JSON.stringify, matching the brief's `seedProgress?`.
-    return jsonResponse({ worldStatus, fault, generation, seedProgress }, 200);
+    const live = await this.buildLiveMetrics(worldStatus);
+    // `seedProgress`/`live` are dropped by JSON.stringify when `undefined`, matching the brief's
+    // `seedProgress?`/Table 7's "omitted when absent".
+    return jsonResponse({ worldStatus, fault, generation, seedProgress, live }, 200);
+  }
+
+  /** Table 7: `live` is present only while the world is genuinely running AND the open minute has
+   * accumulated at least one request — every non-running `worldStatus` and a freshly-opened empty
+   * minute (right after a tick just closed the previous one) both correctly omit it rather than
+   * shipping a zero-traffic phantom point. */
+  private async buildLiveMetrics(worldStatus: WorldStatus): Promise<LiveMetrics | undefined> {
+    if (worldStatus !== "running") return undefined;
+    const partial = await this.ctx.storage.get<PartialMinute>("partialMinute");
+    if (!partial || partial.stats.length === 0) return undefined;
+    return {
+      minuteTs: partial.minuteTs,
+      elapsedMs: Math.max(0, this.now() - partial.minuteTs),
+      services: aggregateLiveServices(partial.stats, partial.minuteTs),
+    };
   }
 
   private async handleFault(request: Request): Promise<Response> {

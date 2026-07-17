@@ -18,8 +18,8 @@ import { FLOWS, type Step } from "../sim/topology";
 /** Renders the service topology as `parent -> child` edges, walked from `topology.ts`'s own
  * `FLOWS` data (never hand-copied) so the prompt can never silently drift from the simulated
  * world it's actually describing. Deduped/sorted since several flows share the same sub-trees
- * (e.g. every flow enters through `gateway`, both payments operations hit the same payments-db
- * steps). Exported so `chat-prompt.ts` (Task 6.1) renders the identical topology summary rather
+ * (e.g. every flow enters through `edge-gateway`, both payments-api operations hit the same
+ * ledger-db steps). Exported so `chat-prompt.ts` (Task 6.1) renders the identical topology summary rather
  * than hand-copying a second version that could silently drift from this one. */
 export function renderTopology(): string {
   const edges = new Set<string>();
@@ -58,8 +58,8 @@ export function buildInvestigatorSystemPrompt(params: SystemPromptParams): Syste
     "## Service topology",
     renderTopology(),
     "",
-    "email-provider is an external dependency notifications calls; it emits no internal spans of " +
-      "its own, only a latency/error outcome folded into the calling step.",
+    "email-api is an external SaaS dependency the notify Worker calls; it emits no internal spans " +
+      "of its own, only a latency/error outcome folded into the calling step.",
     "",
     "## Investigation protocol",
     "Work through these in order, adapting to what you find rather than following it mechanically:",
@@ -90,8 +90,24 @@ export function buildInvestigatorSystemPrompt(params: SystemPromptParams): Syste
       "which it produced the observed symptoms; evidence citing the concrete metric deltas, " +
       "trace_ids, and log excerpts that actually support root_cause (not a restatement of the " +
       "trigger); blast_radius naming the affected services and a plain-language customer-impact " +
-      "judgment; confidence (low/medium/high) with what would raise or already justifies it; and a " +
-      "concrete suggested_action.",
+      "judgment; confidence (calibrated per the guide below); and a concrete suggested_action.",
+    "",
+    "## Confidence calibration",
+    "Set confidence to how directly your evidence supports the proposed mechanism — never to how " +
+      "severe or urgent the incident is. Use these anchors:",
+    "- high: you traced the causal chain to its origin (a trace or logs showing which service " +
+      "failed first and why) AND an independent signal corroborates it — a deploy correlated to " +
+      "onset, a matching log signature, or a prior incident with the same fingerprint and cause. " +
+      "A trace-confirmed, corroborated mechanism is high confidence even though you cannot read " +
+      "the code or config diff: your tools never expose source, so \"the diff wasn't inspected\" is " +
+      "not a reason to withhold confidence when the operational evidence is conclusive.",
+    "- medium: the mechanism is well-supported, but one link in the chain is inferred rather than " +
+      "directly observed, or a plausible alternative cause has not been fully ruled out.",
+    "- low: the hypothesis is plausible but a central piece of evidence is missing, the causal " +
+      "chain is unconfirmed, or you had to conclude before confirming it.",
+    "A recurrence you verified in get_incidents (same fingerprint, same prior cause) is corroborating " +
+      "evidence that raises confidence, not a caveat that lowers it. State in confidence.why which " +
+      "anchor applies and the single piece of evidence that would raise it.",
     "",
     `Investigation opened at ${openedAtIso} for incident ${params.incidentId}.`,
   ].join("\n");

@@ -18,9 +18,9 @@ const NO_EFFECTS: FaultEffects = { latencyMult: new Map(), errorRateOverride: ne
 const PEAK_HOUR_ANCHOR_MS = Date.UTC(2026, 0, 5, 14, 0, 0);
 
 describe("topology", () => {
-  it("defines exactly 6 internal services (email-provider is external) with FLOWS weights ~15/70/15", () => {
+  it("defines exactly 6 internal services (email-api is external) with FLOWS weights ~15/70/15", () => {
     expect(SERVICES.length).toBe(6);
-    expect(SERVICES).not.toContain("email-provider");
+    expect(SERVICES).not.toContain("email-api");
     const byName = Object.fromEntries(FLOWS.map((f) => [f.name, f.weight]));
     expect(byName["checkout"]).toBeCloseTo(0.15, 5);
     expect(byName["browse"]).toBeCloseTo(0.7, 5);
@@ -31,7 +31,7 @@ describe("topology", () => {
     type StepLike = { service: string; operation: string; latency: { mu: number; sigma: number }; children: StepLike[] };
     const opsByService = new Map<string, Map<string, { mu: number; sigma: number }>>();
     const visit = (step: StepLike) => {
-      if (step.service !== "email-provider") {
+      if (step.service !== "email-api") {
         const ops = opsByService.get(step.service) ?? new Map<string, { mu: number; sigma: number }>();
         ops.set(step.operation, step.latency);
         opsByService.set(step.service, ops);
@@ -85,12 +85,12 @@ describe("deterministic for same seed", () => {
 });
 
 describe("error propagation", () => {
-  it("error in payments-db propagates to payments, checkout, and gateway spans of the same trace", () => {
+  it("error in ledger-db propagates to payments-api, checkout-edge, and edge-gateway spans of the same trace", () => {
     const effects: FaultEffects = {
       latencyMult: new Map(),
       errorRateOverride: new Map([
         [
-          "payments-db",
+          "ledger-db",
           {
             rate: 1,
             errorType: "pool_exhausted",
@@ -104,15 +104,15 @@ describe("error propagation", () => {
     const to = from + 5 * 60_000; // 5 minutes: ~450 requests, ~15% checkout flow => plenty of hits
     const batch = generateWindow(from, to, effects, mulberry32(7), 1);
 
-    const dbErrorSpans = batch.spans.filter((s) => s.service === "payments-db" && s.status === "error");
+    const dbErrorSpans = batch.spans.filter((s) => s.service === "ledger-db" && s.status === "error");
     expect(dbErrorSpans.length).toBeGreaterThan(0);
 
     for (const dbSpan of dbErrorSpans) {
       const bySpanId = new Map(batch.spans.filter((s) => s.trace_id === dbSpan.trace_id).map((s) => [s.span_id, s]));
       // Walk the ancestor chain from the erroring db span to the root: every ancestor on the
-      // call path (payments -> checkout -> gateway) must report a downstream error. This is the
-      // on-path chain — sibling spans off the path (e.g. checkout.get_cart) are rightly
-      // unaffected.
+      // call path (payments-api -> checkout-edge -> edge-gateway) must report a downstream
+      // error. This is the on-path chain — sibling spans off the path (e.g.
+      // checkout-edge.get_cart) are rightly unaffected.
       const ancestors: Span[] = [];
       let cursor = dbSpan.parent_span_id === null ? undefined : bySpanId.get(dbSpan.parent_span_id);
       while (cursor !== undefined) {
@@ -121,9 +121,9 @@ describe("error propagation", () => {
       }
 
       const ancestorServices = ancestors.map((s) => s.service);
-      expect(ancestorServices).toContain("payments");
-      expect(ancestorServices).toContain("checkout");
-      expect(ancestorServices).toContain("gateway");
+      expect(ancestorServices).toContain("payments-api");
+      expect(ancestorServices).toContain("checkout-edge");
+      expect(ancestorServices).toContain("edge-gateway");
       for (const ancestor of ancestors) {
         expect(ancestor.status).toBe("error");
         expect(ancestor.error_type).toBe("downstream");
@@ -131,18 +131,18 @@ describe("error propagation", () => {
     }
   });
 
-  it("does not propagate an email-provider/notifications error to checkout or gateway (async branch)", () => {
+  it("does not propagate an email-api/notify error to checkout-edge or edge-gateway (async branch)", () => {
     const effects: FaultEffects = {
       latencyMult: new Map(),
       errorRateOverride: new Map([
-        ["email-provider", { rate: 1, errorType: "outage", logMessage: "upstream 503 from provider" }],
+        ["email-api", { rate: 1, errorType: "outage", logMessage: "upstream 503 from provider" }],
         // Zero out ambient baseline noise on the sync path so this test isolates the property
         // under test (async branch failures don't propagate) from unrelated coincidental errors
         // elsewhere in the same trace, which would otherwise make this assertion seed-dependent.
-        ["gateway", { rate: 0, errorType: "n/a", logMessage: "n/a" }],
-        ["checkout", { rate: 0, errorType: "n/a", logMessage: "n/a" }],
-        ["payments", { rate: 0, errorType: "n/a", logMessage: "n/a" }],
-        ["payments-db", { rate: 0, errorType: "n/a", logMessage: "n/a" }],
+        ["edge-gateway", { rate: 0, errorType: "n/a", logMessage: "n/a" }],
+        ["checkout-edge", { rate: 0, errorType: "n/a", logMessage: "n/a" }],
+        ["payments-api", { rate: 0, errorType: "n/a", logMessage: "n/a" }],
+        ["ledger-db", { rate: 0, errorType: "n/a", logMessage: "n/a" }],
       ]),
       trafficMult: 1,
     };
@@ -150,17 +150,17 @@ describe("error propagation", () => {
     const to = from + 5 * 60_000;
     const batch = generateWindow(from, to, effects, mulberry32(11), 1);
 
-    // email-provider is external (spec §6): no internal span of its own, ever.
-    expect(batch.spans.some((s) => s.service === "email-provider")).toBe(false);
+    // email-api is external (spec §6): no internal span of its own, ever.
+    expect(batch.spans.some((s) => s.service === "email-api")).toBe(false);
 
-    const notificationErrorSpans = batch.spans.filter((s) => s.service === "notifications" && s.status === "error");
+    const notificationErrorSpans = batch.spans.filter((s) => s.service === "notify" && s.status === "error");
     expect(notificationErrorSpans.length).toBeGreaterThan(0);
 
     for (const notifSpan of notificationErrorSpans) {
       const traceSpans = batch.spans.filter((s) => s.trace_id === notifSpan.trace_id);
-      // EVERY checkout/gateway span in the trace stays ok — the async failure must not leak.
+      // EVERY checkout-edge/edge-gateway span in the trace stays ok — the async failure must not leak.
       for (const span of traceSpans) {
-        if (span.service === "checkout" || span.service === "gateway") {
+        if (span.service === "checkout-edge" || span.service === "edge-gateway") {
           expect(span.status).toBe("ok");
         }
       }
@@ -169,14 +169,14 @@ describe("error propagation", () => {
 });
 
 describe("async branch duration isolation (fire-and-forget)", () => {
-  it("100% email-provider errors leave checkout durations and error rate at baseline", () => {
+  it("100% email-api errors leave checkout-edge durations and error rate at baseline", () => {
     const from = PEAK_HOUR_ANCHOR_MS;
     const to = from + 60 * 60_000; // 1 hour at peak: ~800 checkout-flow traces
     const healthy = generateWindow(from, to, NO_EFFECTS, mulberry32(31), 1);
     const effects: FaultEffects = {
       latencyMult: new Map(),
       errorRateOverride: new Map([
-        ["email-provider", { rate: 1, errorType: "outage", logMessage: "upstream 503 from provider" }],
+        ["email-api", { rate: 1, errorType: "outage", logMessage: "upstream 503 from provider" }],
       ]),
       trafficMult: 1,
     };
@@ -184,28 +184,29 @@ describe("async branch duration isolation (fire-and-forget)", () => {
 
     const placeOrderMean = (spans: Span[]) => {
       const durations = spans
-        .filter((s) => s.service === "checkout" && s.operation === "place_order")
+        .filter((s) => s.service === "checkout-edge" && s.operation === "place_order")
         .map((s) => s.duration_ms);
       expect(durations.length).toBeGreaterThan(100);
       return durations.reduce((a, b) => a + b, 0) / durations.length;
     };
 
-    // Sanity: the fault is actually firing — every notifications.send_email span degrades.
-    const sendSpans = faulted.spans.filter((s) => s.service === "notifications" && s.operation === "send_email");
+    // Sanity: the fault is actually firing — every notify.send_email span degrades.
+    const sendSpans = faulted.spans.filter((s) => s.service === "notify" && s.operation === "send_email");
     expect(sendSpans.length).toBeGreaterThan(100);
     expect(sendSpans.every((s) => s.status === "error")).toBe(true);
 
-    // (a) The duration-leak regression this guards against inflated checkout ~14x (notifications'
-    // downstream-timeout floor folding into checkout's timeline). 1.5x is generous headroom for
-    // rng-stream divergence between the two runs, but far below the failure mode.
+    // (a) The duration-leak regression this guards against inflated checkout-edge ~14x (notify's
+    // downstream-timeout floor folding into checkout-edge's timeline). 1.5x is generous headroom
+    // for rng-stream divergence between the two runs, but far below the failure mode.
     const healthyMean = placeOrderMean(healthy.spans);
     const faultedMean = placeOrderMean(faulted.spans);
     expect(faultedMean).toBeLessThan(healthyMean * 1.5);
     expect(faultedMean).toBeGreaterThan(healthyMean / 1.5);
 
-    // (b) checkout's error rate stays at ambient baseline — the async failure must not turn
-    // checkout spans into errors (would be ~50% of checkout-service spans if propagation leaked).
-    const checkoutSpans = faulted.spans.filter((s) => s.service === "checkout");
+    // (b) checkout-edge's error rate stays at ambient baseline — the async failure must not turn
+    // checkout-edge spans into errors (would be ~50% of checkout-edge-service spans if propagation
+    // leaked).
+    const checkoutSpans = faulted.spans.filter((s) => s.service === "checkout-edge");
     const errorRate = checkoutSpans.filter((s) => s.status === "error").length / checkoutSpans.length;
     expect(errorRate).toBeLessThan(0.02);
   });
@@ -250,13 +251,13 @@ describe("sampled persistence", () => {
 describe("rollupFromStats", () => {
   it("matches hand-computed count/error_count/p50/p95/p99 across two (service, operation) groups (20 requests total)", () => {
     const paymentsStats: RequestStat[] = Array.from({ length: 12 }, (_, i) => ({
-      service: "payments",
+      service: "payments-api",
       operation: "charge",
       duration_ms: 100 + i * 10, // sorted asc: 100, 110, ..., 210
       isError: i === 0, // 1 error
     }));
     const catalogStats: RequestStat[] = Array.from({ length: 8 }, (_, i) => ({
-      service: "catalog",
+      service: "catalog-kv",
       operation: "search",
       duration_ms: 50 + i * 10, // sorted asc: 50, 60, ..., 120
       isError: i === 3, // 1 error
@@ -266,8 +267,8 @@ describe("rollupFromStats", () => {
     const rows = rollupFromStats([...paymentsStats, ...catalogStats], minuteTs);
 
     expect(rows.length).toBe(2);
-    const payments = rows.find((r) => r.service === "payments" && r.operation === "charge");
-    const catalog = rows.find((r) => r.service === "catalog" && r.operation === "search");
+    const payments = rows.find((r) => r.service === "payments-api" && r.operation === "charge");
+    const catalog = rows.find((r) => r.service === "catalog-kv" && r.operation === "search");
 
     // Nearest-rank percentile, N=12: rank = ceil(p*12). p50 -> rank 6 -> 6th smallest (index 5) = 150.
     // p95 -> rank ceil(11.4)=12 -> 12th (index 11, max) = 210. p99 -> rank ceil(11.88)=12 -> 210.

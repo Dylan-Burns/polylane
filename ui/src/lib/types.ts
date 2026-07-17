@@ -23,9 +23,14 @@ export type { FaultState, IncidentView, LogLine, PublicDeploy, ScenarioId, Span,
 
 export type HealthStatus = "red" | "amber" | "green";
 
+/** Mirrors `src/sim/topology.ts`'s `ServiceKind` (not imported directly — see this file's header
+ * comment on why D1-typed server modules are hand-mirrored instead). */
+export type ServiceKind = "worker" | "d1" | "kv" | "queue" | "external";
+
 export interface TopologyServiceNode {
   name: string;
   external?: boolean;
+  kind: ServiceKind;
 }
 
 export interface TopologyPayload {
@@ -56,12 +61,22 @@ export interface OpsHealth {
   retentionWatermarkAgeMs?: number;
 }
 
+/** The open (not-yet-closed) minute's accumulated per-service stats — mirrors
+ * `src/sim/simulator-do.ts`'s `handleStatus` live aggregation. Omitted when the world isn't
+ * running. See `docs/plans/2026-07-17-cf-native-revamp.md` Canonical Table 7. */
+export interface LiveMetrics {
+  minuteTs: number;
+  elapsedMs: number;
+  services: Record<string, { count: number; errPct: number; p95: number }>;
+}
+
 export interface StateResponse {
   topology: TopologyPayload;
   health: Record<string, HealthStatus>;
   sparklines: Record<string, SparklinePoint[]>;
   worldStatus: WorldStatusView;
   opsHealth: OpsHealth;
+  live?: LiveMetrics;
 }
 
 // --- /api/incidents/:id (mirrors src/telemetry/read.ts's StepView + src/api/routes.ts's
@@ -102,6 +117,15 @@ export interface AnalyticsResponse {
 
 export interface DeployListResponse {
   deploys: PublicDeploy[];
+}
+
+// --- /api/incidents/:id/logs (mirrors src/api/routes.ts's IncidentLogsResponse — hand-mirrored,
+// not imported, for the same D1-typed-source reason as this file's header comment) ---------------
+
+export interface IncidentLogsResponse {
+  logs: LogLine[];
+  total: number;
+  truncated: boolean;
 }
 
 // --- /api/incidents/:id/metrics (mirrors src/api/routes.ts's IncidentMetricsResponse) -----------

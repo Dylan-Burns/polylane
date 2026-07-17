@@ -56,8 +56,8 @@ export function buildChatSystemPrompt(params: ChatSystemPromptParams): SystemBlo
     "## Service topology",
     renderTopology(),
     "",
-    "email-provider is an external dependency notifications calls; it emits no internal spans of " +
-      "its own, only a latency/error outcome folded into the calling step.",
+    "email-api is an external SaaS dependency the notify Worker calls; it emits no internal spans " +
+      "of its own, only a latency/error outcome folded into the calling step.",
     "",
     "## Scope",
     "Answer questions about Acme Shop's observed world using the read-only tools below: " +

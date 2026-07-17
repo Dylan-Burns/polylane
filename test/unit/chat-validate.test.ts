@@ -276,23 +276,23 @@ describe("buildIncidentContext", () => {
     const context = buildIncidentContext(
       makeIncident({
         trigger: {
-          statements: ["payments error_rate 24.1% (baseline 0.3%)", "payments p95 578ms (baseline 92ms)"],
-          anomalies: [{ fingerprint: "payments:errors" }],
+          statements: ["payments-api error_rate 24.1% (baseline 0.3%)", "payments-api p95 578ms (baseline 92ms)"],
+          anomalies: [{ fingerprint: "payments-api:errors" }],
         },
       }),
       [],
     );
-    expect(context).toContain("trigger: payments error_rate 24.1% (baseline 0.3%)");
-    expect(context).toContain("trigger: payments p95 578ms (baseline 92ms)");
+    expect(context).toContain("trigger: payments-api error_rate 24.1% (baseline 0.3%)");
+    expect(context).toContain("trigger: payments-api p95 578ms (baseline 92ms)");
   });
 
   it("renders the seeded incident's singular {statement} trigger shape", () => {
     // sim/seed-incident.ts writes {statement, fingerprints, detected_at_ms}.
     const context = buildIncidentContext(
-      makeIncident({ trigger: { statement: "payments error rate 24.1%; sustained 3 consecutive minutes", fingerprints: ["payments:errors"] } }),
+      makeIncident({ trigger: { statement: "payments-api error rate 24.1%; sustained 3 consecutive minutes", fingerprints: ["payments-api:errors"] } }),
       [],
     );
-    expect(context).toContain("trigger: payments error rate 24.1%; sustained 3 consecutive minutes");
+    expect(context).toContain("trigger: payments-api error rate 24.1%; sustained 3 consecutive minutes");
   });
 
   it("skips non-array triggers and non-string statements without throwing (defensive: trigger is unknown)", () => {

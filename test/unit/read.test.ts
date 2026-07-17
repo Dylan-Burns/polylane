@@ -26,9 +26,9 @@ const INCIDENT_CAP_START = T0 + 60 * MIN;
 /**
  * Inserts one deterministic mini-world, once for the whole file (read functions never mutate
  * data, so — unlike `queries-insert.test.ts` — there's nothing to clean up between tests):
- *  - rollups: checkout across two consecutive minutes + payments for one minute (queryMetrics
+ *  - rollups: checkout-edge across two consecutive minutes + payments-api for one minute (queryMetrics
  *    aggregation/bucketing fixture).
- *  - baselines: checkout only (payments deliberately has none — proves baseline/delta are
+ *  - baselines: checkout-edge only (payments-api deliberately has none — proves baseline/delta are
  *    omitted cleanly, not NaN, when the baselines table has no row for an entity).
  *  - five traces: a small error-cascade trace with an async (fire-and-forget) tail, a 90-span
  *    synthetic trace built to exercise the "collapse repeated healthy siblings" cap mechanism, a
@@ -45,13 +45,13 @@ const INCIDENT_CAP_START = T0 + 60 * MIN;
  */
 async function seedFixture(): Promise<void> {
   const rollups: RollupRow[] = [
-    { service: "checkout", operation: "POST /checkout", minute_ts: T0, count: 100, error_count: 5, p50_ms: 40, p95_ms: 150, p99_ms: 250 },
-    { service: "checkout", operation: "POST /checkout", minute_ts: T0 + MIN, count: 100, error_count: 3, p50_ms: 60, p95_ms: 170, p99_ms: 270 },
-    { service: "payments", operation: "charge", minute_ts: T0, count: 80, error_count: 1, p50_ms: 30, p95_ms: 90, p99_ms: 140 },
+    { service: "checkout-edge", operation: "POST /checkout", minute_ts: T0, count: 100, error_count: 5, p50_ms: 40, p95_ms: 150, p99_ms: 250 },
+    { service: "checkout-edge", operation: "POST /checkout", minute_ts: T0 + MIN, count: 100, error_count: 3, p50_ms: 60, p95_ms: 170, p99_ms: 270 },
+    { service: "payments-api", operation: "charge", minute_ts: T0, count: 80, error_count: 1, p50_ms: 30, p95_ms: 90, p99_ms: 140 },
   ];
   await insertRollups(env.DB, rollups);
 
-  // Baselines: checkout only. Chosen so every delta in the T0-only tests is a clean integer
+  // Baselines: checkout-edge only. Chosen so every delta in the T0-only tests is a clean integer
   // (req_rate median 50 -> 100/50=2; error_rate median 0.025 -> 0.05/0.025=2; p95 median 10 ->
   // 150/10=15) — the T0+MIN-minute and 2-min-bucket tests use non-integer deltas asserted with
   // `toBeCloseTo`.
@@ -64,25 +64,25 @@ async function seedFixture(): Promise<void> {
     baselineRows.map((row) =>
       env.DB.prepare(
         "INSERT INTO baselines (service, operation, metric, median, mad, computed_at) VALUES (?, ?, ?, ?, ?, ?)",
-      ).bind("checkout", row.operation, row.metric, row.median, row.mad, T0),
+      ).bind("checkout-edge", row.operation, row.metric, row.median, row.mad, T0),
     ),
   );
 
-  // A dedicated (service, operation) pair with a zero-median baseline, isolated from the checkout
+  // A dedicated (service, operation) pair with a zero-median baseline, isolated from the checkout-edge
   // fixture above, purely to prove queryMetrics' delta ratio never produces NaN: 0-value-vs-0-
   // median is "no deviation" (0), nonzero-value-vs-0-median is an unbounded spike (Infinity) —
   // never 0/0's NaN.
   await insertRollups(env.DB, [
-    { service: "catalog", operation: "zero_baseline_zero", minute_ts: T0 + 9 * MIN, count: 0, error_count: 0, p50_ms: 0, p95_ms: 0, p99_ms: 0 },
-    { service: "catalog", operation: "zero_baseline_nonzero", minute_ts: T0 + 9 * MIN, count: 10, error_count: 0, p50_ms: 5, p95_ms: 8, p99_ms: 9 },
+    { service: "catalog-kv", operation: "zero_baseline_zero", minute_ts: T0 + 9 * MIN, count: 0, error_count: 0, p50_ms: 0, p95_ms: 0, p99_ms: 0 },
+    { service: "catalog-kv", operation: "zero_baseline_nonzero", minute_ts: T0 + 9 * MIN, count: 10, error_count: 0, p50_ms: 5, p95_ms: 8, p99_ms: 9 },
   ]);
   await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO baselines (service, operation, metric, median, mad, computed_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).bind("catalog", "zero_baseline_zero", "req_rate", 0, 0, T0),
+    ).bind("catalog-kv", "zero_baseline_zero", "req_rate", 0, 0, T0),
     env.DB.prepare(
       "INSERT INTO baselines (service, operation, metric, median, mad, computed_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).bind("catalog", "zero_baseline_nonzero", "req_rate", 0, 0, T0),
+    ).bind("catalog-kv", "zero_baseline_nonzero", "req_rate", 0, 0, T0),
   ]);
 
   // --- Trace A: error-cascade with an async (fire-and-forget) tail ---------------------------
@@ -92,7 +92,7 @@ async function seedFixture(): Promise<void> {
       trace_id: "trace-cascade",
       span_id: "cascade-root",
       parent_span_id: null,
-      service: "gateway",
+      service: "edge-gateway",
       operation: "POST /checkout",
       start_ms: cascadeRootStart,
       duration_ms: 800,
@@ -101,9 +101,9 @@ async function seedFixture(): Promise<void> {
     },
     {
       trace_id: "trace-cascade",
-      span_id: "cascade-checkout",
+      span_id: "cascade-checkout-edge",
       parent_span_id: "cascade-root",
-      service: "checkout",
+      service: "checkout-edge",
       operation: "POST /checkout",
       start_ms: cascadeRootStart + 5,
       duration_ms: 780,
@@ -112,23 +112,23 @@ async function seedFixture(): Promise<void> {
     },
     {
       trace_id: "trace-cascade",
-      span_id: "cascade-payments",
-      parent_span_id: "cascade-checkout",
-      service: "payments",
+      span_id: "cascade-payments-api",
+      parent_span_id: "cascade-checkout-edge",
+      service: "payments-api",
       operation: "charge",
       start_ms: cascadeRootStart + 15,
       duration_ms: 700,
       status: "error",
       error_type: "pool_exhausted",
     },
-    // Fire-and-forget: spawned partway through `cascade-checkout` but its 2000ms duration ends
+    // Fire-and-forget: spawned partway through `cascade-checkout-edge` but its 2000ms duration ends
     // long after the root (and every synchronous ancestor) has already finished — the domain
     // caveat `getTrace` must not "fix" (see read.ts's `collapseTrace` doc comment).
     {
       trace_id: "trace-cascade",
       span_id: "cascade-notify",
-      parent_span_id: "cascade-checkout",
-      service: "notifications",
+      parent_span_id: "cascade-checkout-edge",
+      service: "notify",
       operation: "send_receipt",
       start_ms: cascadeRootStart + 20,
       duration_ms: 2000,
@@ -137,11 +137,11 @@ async function seedFixture(): Promise<void> {
     },
   ];
   const cascadeLogs: LogLine[] = [
-    { ts_ms: cascadeRootStart, service: "gateway", level: "info", message: "POST /checkout request handled", trace_id: "trace-cascade", span_id: "cascade-root" },
-    { ts_ms: cascadeRootStart + 20, service: "notifications", level: "info", message: "send_receipt request handled", trace_id: "trace-cascade", span_id: "cascade-notify" },
-    { ts_ms: cascadeRootStart + 15 + 700, service: "payments", level: "error", message: "connection pool exhausted: 25/25 in use, acquire timeout 5000ms", trace_id: "trace-cascade", span_id: "cascade-payments" },
-    { ts_ms: cascadeRootStart + 5 + 780, service: "checkout", level: "error", message: "downstream call to payments failed", trace_id: "trace-cascade", span_id: "cascade-checkout" },
-    { ts_ms: cascadeRootStart + 800, service: "gateway", level: "error", message: "downstream call to checkout failed", trace_id: "trace-cascade", span_id: "cascade-root" },
+    { ts_ms: cascadeRootStart, service: "edge-gateway", level: "info", message: "POST /checkout request handled", trace_id: "trace-cascade", span_id: "cascade-root" },
+    { ts_ms: cascadeRootStart + 20, service: "notify", level: "info", message: "send_receipt request handled", trace_id: "trace-cascade", span_id: "cascade-notify" },
+    { ts_ms: cascadeRootStart + 15 + 700, service: "payments-api", level: "error", message: "connection pool exhausted: 25/25 in use, acquire timeout 5000ms", trace_id: "trace-cascade", span_id: "cascade-payments-api" },
+    { ts_ms: cascadeRootStart + 5 + 780, service: "checkout-edge", level: "error", message: "downstream call to payments-api failed", trace_id: "trace-cascade", span_id: "cascade-checkout-edge" },
+    { ts_ms: cascadeRootStart + 800, service: "edge-gateway", level: "error", message: "downstream call to checkout-edge failed", trace_id: "trace-cascade", span_id: "cascade-root" },
   ];
 
   // --- Trace B: 90-span synthetic trace for the cap/collapse test ----------------------------
@@ -151,7 +151,7 @@ async function seedFixture(): Promise<void> {
       trace_id: "trace-cap",
       span_id: "cap-root",
       parent_span_id: null,
-      service: "gateway",
+      service: "edge-gateway",
       operation: "GET /catalog",
       start_ms: capRootStart,
       duration_ms: 900,
@@ -164,7 +164,7 @@ async function seedFixture(): Promise<void> {
       trace_id: "trace-cap",
       span_id: `cap-list-${i}`,
       parent_span_id: "cap-root",
-      service: "catalog",
+      service: "catalog-kv",
       operation: "list_items",
       start_ms: capRootStart + 1 + i,
       duration_ms: 20,
@@ -177,7 +177,7 @@ async function seedFixture(): Promise<void> {
       trace_id: "trace-cap",
       span_id: `cap-get-${i}`,
       parent_span_id: "cap-root",
-      service: "catalog",
+      service: "catalog-kv",
       operation: "get_item",
       start_ms: capRootStart + 100 + i,
       duration_ms: 15,
@@ -188,9 +188,9 @@ async function seedFixture(): Promise<void> {
   capSpans.push(
     {
       trace_id: "trace-cap",
-      span_id: "cap-checkout",
+      span_id: "cap-checkout-edge",
       parent_span_id: "cap-root",
-      service: "checkout",
+      service: "checkout-edge",
       operation: "POST /checkout",
       start_ms: capRootStart + 50,
       duration_ms: 800,
@@ -199,9 +199,9 @@ async function seedFixture(): Promise<void> {
     },
     {
       trace_id: "trace-cap",
-      span_id: "cap-payments",
-      parent_span_id: "cap-checkout",
-      service: "payments",
+      span_id: "cap-payments-api",
+      parent_span_id: "cap-checkout-edge",
+      service: "payments-api",
       operation: "charge",
       start_ms: capRootStart + 55,
       duration_ms: 700,
@@ -211,7 +211,7 @@ async function seedFixture(): Promise<void> {
   );
   expect(capSpans).toHaveLength(90); // fixture sanity: the brief calls for exactly 90 spans here.
   const capLogs: LogLine[] = [
-    { ts_ms: capRootStart + 55 + 700, service: "payments", level: "error", message: "connection pool exhausted: 25/25 in use, acquire timeout 5000ms", trace_id: "trace-cap", span_id: "cap-payments" },
+    { ts_ms: capRootStart + 55 + 700, service: "payments-api", level: "error", message: "connection pool exhausted: 25/25 in use, acquire timeout 5000ms", trace_id: "trace-cap", span_id: "cap-payments-api" },
   ];
 
   // --- Trace C: 46 all-distinct-leaves trace, for the cap's defensive fallback trim -----------
@@ -221,7 +221,7 @@ async function seedFixture(): Promise<void> {
       trace_id: "trace-fallback",
       span_id: "fb-root",
       parent_span_id: null,
-      service: "gateway",
+      service: "edge-gateway",
       operation: "GET /health",
       start_ms: fbRootStart,
       duration_ms: 50,
@@ -234,7 +234,7 @@ async function seedFixture(): Promise<void> {
       trace_id: "trace-fallback",
       span_id: `fb-op-${i}`,
       parent_span_id: "fb-root",
-      service: "catalog",
+      service: "catalog-kv",
       // Every child has a *distinct* operation, so no sibling group ever reaches size >=2 —
       // nothing is collapsible, forcing getTrace's fallback trim path.
       operation: `op-${i}`,
@@ -252,7 +252,7 @@ async function seedFixture(): Promise<void> {
       trace_id: "trace-healthy-a",
       span_id: "healthy-a-root",
       parent_span_id: null,
-      service: "checkout",
+      service: "checkout-edge",
       operation: "GET /cart",
       start_ms: T0 + 1 * MIN,
       duration_ms: 50,
@@ -263,7 +263,7 @@ async function seedFixture(): Promise<void> {
       trace_id: "trace-healthy-b",
       span_id: "healthy-b-root",
       parent_span_id: null,
-      service: "gateway",
+      service: "edge-gateway",
       operation: "GET /catalog",
       start_ms: T0 + 2 * MIN,
       duration_ms: 120,
@@ -286,7 +286,7 @@ async function seedFixture(): Promise<void> {
       trace_id: "trace-wide-fanout",
       span_id: "wf-root",
       parent_span_id: null,
-      service: "gateway",
+      service: "edge-gateway",
       operation: "POST /checkout",
       start_ms: wfRootStart,
       duration_ms: 900,
@@ -297,7 +297,7 @@ async function seedFixture(): Promise<void> {
       trace_id: "trace-wide-fanout",
       span_id: "wf-error-mid",
       parent_span_id: "wf-root",
-      service: "checkout",
+      service: "checkout-edge",
       operation: "POST /checkout",
       start_ms: wfRootStart + 1,
       duration_ms: 800,
@@ -308,7 +308,7 @@ async function seedFixture(): Promise<void> {
       trace_id: "trace-wide-fanout",
       span_id: "wf-error-leaf",
       parent_span_id: "wf-error-mid",
-      service: "payments",
+      service: "payments-api",
       operation: "charge",
       start_ms: wfRootStart + 2,
       duration_ms: 700,
@@ -325,7 +325,7 @@ async function seedFixture(): Promise<void> {
         trace_id: "trace-wide-fanout",
         span_id: `wf-b${b}-${d}`,
         parent_span_id: d === 0 ? "wf-root" : `wf-b${b}-${d - 1}`,
-        service: "catalog",
+        service: "catalog-kv",
         // Every node's parent_span_id is unique to its own branch/depth, so leaf-collapse's
         // (parent_span_id, service, operation) grouping never finds >=2 siblings to collapse —
         // this fixture is only reachable/testable via the subtree-drop pass.
@@ -348,7 +348,7 @@ async function seedFixture(): Promise<void> {
     trace_id: "trace-long-error-chain",
     span_id: `chain-${i}`,
     parent_span_id: i === 0 ? null : `chain-${i - 1}`,
-    service: "catalog",
+    service: "catalog-kv",
     operation: `step_${i}`,
     start_ms: chainRootStart + i,
     duration_ms: 5,
@@ -367,18 +367,18 @@ async function seedFixture(): Promise<void> {
 
   const noiseLogs: LogLine[] = Array.from({ length: 60 }, (_, i) => ({
     ts_ms: T0 + i * 1000,
-    service: "catalog",
+    service: "catalog-kv",
     level: "info" as const,
     message: `noise log ${i}`,
   }));
   await insertLogs(env.DB, [...cascadeLogs, ...capLogs, ...noiseLogs]);
 
-  await insertDeploy(env.DB, { id: "deploy-1", service: "payments", version: "v2.4.1", ts_ms: T0 - 10 * MIN, note: "bump payment provider SDK" });
-  await insertDeploy(env.DB, { id: "deploy-2", service: "catalog", version: "v1.8.3", ts_ms: T0 + 3 * MIN, note: "routine release" });
+  await insertDeploy(env.DB, { id: "deploy-1", service: "payments-api", version: "v2.4.1", ts_ms: T0 - 10 * MIN, note: "bump payment provider SDK" });
+  await insertDeploy(env.DB, { id: "deploy-2", service: "catalog-kv", version: "v1.8.3", ts_ms: T0 + 3 * MIN, note: "routine release" });
 
-  const resolvedTrigger = { statement: "checkout error_rate 22% vs baseline 0.4% since 14:32Z", fingerprints: ["checkout:errors"] };
-  const resolvedReport = { summary: "Bad deploy caused checkout errors.", root_cause: { hypothesis: "connection pool exhaustion" } };
-  const openTrigger = { statement: "payments p95 8x baseline", fingerprints: ["payments:latency"] };
+  const resolvedTrigger = { statement: "checkout-edge error_rate 22% vs baseline 0.4% since 14:32Z", fingerprints: ["checkout-edge:errors"] };
+  const resolvedReport = { summary: "Bad deploy caused checkout-edge errors.", root_cause: { hypothesis: "connection pool exhaustion" } };
+  const openTrigger = { statement: "payments-api p95 8x baseline", fingerprints: ["payments-api:latency"] };
   await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO incidents (id, status, severity, opened_at, reported_at, resolved_at, trigger_json, report_json, follow_up_of) VALUES (?, 'resolved', 'critical', ?, ?, ?, ?, ?, NULL)",
@@ -394,13 +394,13 @@ async function seedFixture(): Promise<void> {
   await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES (?, ?, ?, ?)",
-    ).bind("incident-resolved-1", "payments:latency", T0 - 2 * MIN + 30_000, 1),
+    ).bind("incident-resolved-1", "payments-api:latency", T0 - 2 * MIN + 30_000, 1),
     env.DB.prepare(
       "INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES (?, ?, ?, ?)",
-    ).bind("incident-resolved-1", "checkout:errors", T0 - 2 * MIN, 1),
+    ).bind("incident-resolved-1", "checkout-edge:errors", T0 - 2 * MIN, 1),
     env.DB.prepare(
       "INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES (?, ?, ?, ?)",
-    ).bind("incident-open-1", "payments:latency", T0 + 15 * MIN, 1),
+    ).bind("incident-open-1", "payments-api:latency", T0 + 15 * MIN, 1),
   ]);
 
   // Investigation steps for the open incident, inserted OUT of step_no order (2, 0, 1) so the
@@ -458,10 +458,10 @@ beforeAll(async () => {
 describe("queryMetrics", () => {
   it("maps a single rollup minute 1:1 with error_rate computed and baseline+delta attached", async () => {
     const points = await queryMetrics(env.DB, { fromMs: T0, toMs: T0 + MIN, stepMin: 1 });
-    expect(points).toHaveLength(2); // checkout + payments, both have a T0 row; sorted service asc
+    expect(points).toHaveLength(2); // checkout-edge + payments-api, both have a T0 row; sorted service asc
 
     expect(points[0]).toEqual({
-      service: "checkout",
+      service: "checkout-edge",
       operation: "POST /checkout",
       minute_ts: T0,
       count: 100,
@@ -477,9 +477,9 @@ describe("queryMetrics", () => {
       delta: { req_rate: 2, error_rate: 2, p95: 15 },
     });
 
-    // payments has no baseline rows at all — the fields must be absent, not `{}`/NaN.
+    // payments-api has no baseline rows at all — the fields must be absent, not `{}`/NaN.
     expect(points[1]).toEqual({
-      service: "payments",
+      service: "payments-api",
       operation: "charge",
       minute_ts: T0,
       count: 80,
@@ -492,9 +492,9 @@ describe("queryMetrics", () => {
     expect(points[1]?.delta).toBeUndefined();
   });
 
-  it("computes the second checkout minute's aggregates and non-integer deltas", async () => {
+  it("computes the second checkout-edge minute's aggregates and non-integer deltas", async () => {
     const points = await queryMetrics(env.DB, { fromMs: T0 + MIN, toMs: T0 + 2 * MIN, stepMin: 1 });
-    expect(points).toHaveLength(1); // payments has no row at T0+MIN
+    expect(points).toHaveLength(1); // payments-api has no row at T0+MIN
 
     const p = points[0];
     expect(p?.count).toBe(100);
@@ -512,32 +512,32 @@ describe("queryMetrics", () => {
     expect(p?.delta?.p95).toBeCloseTo(17);
   });
 
-  it("bucketing (stepMin=2) sums counts and count-weights p50/p95/p99 across both checkout minutes", async () => {
+  it("bucketing (stepMin=2) sums counts and count-weights p50/p95/p99 across both checkout-edge minutes", async () => {
     const points = await queryMetrics(env.DB, { fromMs: T0, toMs: T0 + 2 * MIN, stepMin: 2 });
     expect(points).toHaveLength(2);
 
-    const checkout = points.find((p) => p.service === "checkout");
-    expect(checkout).toBeDefined();
-    expect(checkout?.minute_ts).toBe(T0); // epoch-aligned bucket start
-    expect(checkout?.count).toBe(200);
-    expect(checkout?.error_rate).toBeCloseTo(0.04); // (5+3)/200
-    expect(checkout?.p50).toBe(50); // (40*100 + 60*100) / 200
-    expect(checkout?.p95).toBe(160); // (150*100 + 170*100) / 200
-    expect(checkout?.p99).toBe(260); // (250*100 + 270*100) / 200
-    expect(checkout?.delta?.req_rate).toBe(4); // 200/50
-    expect(checkout?.delta?.error_rate).toBeCloseTo(1.6); // 0.04/0.025
-    expect(checkout?.delta?.p95).toBe(16); // 160/10
+    const checkoutEdge = points.find((p) => p.service === "checkout-edge");
+    expect(checkoutEdge).toBeDefined();
+    expect(checkoutEdge?.minute_ts).toBe(T0); // epoch-aligned bucket start
+    expect(checkoutEdge?.count).toBe(200);
+    expect(checkoutEdge?.error_rate).toBeCloseTo(0.04); // (5+3)/200
+    expect(checkoutEdge?.p50).toBe(50); // (40*100 + 60*100) / 200
+    expect(checkoutEdge?.p95).toBe(160); // (150*100 + 170*100) / 200
+    expect(checkoutEdge?.p99).toBe(260); // (250*100 + 270*100) / 200
+    expect(checkoutEdge?.delta?.req_rate).toBe(4); // 200/50
+    expect(checkoutEdge?.delta?.error_rate).toBeCloseTo(1.6); // 0.04/0.025
+    expect(checkoutEdge?.delta?.p95).toBe(16); // 160/10
 
-    const payments = points.find((p) => p.service === "payments");
-    expect(payments).toBeDefined();
-    expect(payments?.count).toBe(80); // only one contributing minute in this bucket
-    expect(payments?.baseline).toBeUndefined();
+    const paymentsApi = points.find((p) => p.service === "payments-api");
+    expect(paymentsApi).toBeDefined();
+    expect(paymentsApi?.count).toBe(80); // only one contributing minute in this bucket
+    expect(paymentsApi?.baseline).toBeUndefined();
   });
 
   it("filters by service", async () => {
-    const points = await queryMetrics(env.DB, { service: "payments", fromMs: T0, toMs: T0 + 2 * MIN, stepMin: 1 });
+    const points = await queryMetrics(env.DB, { service: "payments-api", fromMs: T0, toMs: T0 + 2 * MIN, stepMin: 1 });
     expect(points).toHaveLength(1);
-    expect(points[0]?.service).toBe("payments");
+    expect(points[0]?.service).toBe("payments-api");
   });
 
   it("filters by operation", async () => {
@@ -553,7 +553,7 @@ describe("queryMetrics", () => {
 
   it("never produces NaN when a baseline's median is 0 — 0-vs-0 is 0, nonzero-vs-0 is Infinity", async () => {
     const points = await queryMetrics(env.DB, {
-      service: "catalog",
+      service: "catalog-kv",
       fromMs: T0 + 9 * MIN,
       toMs: T0 + 9 * MIN + MIN,
       stepMin: 1,
@@ -573,7 +573,7 @@ describe("queryMetrics", () => {
     const points = await queryMetrics(env.DB, { fromMs: T0, toMs: T0 + MIN, stepMin: Number.NaN });
     const explicit = await queryMetrics(env.DB, { fromMs: T0, toMs: T0 + MIN, stepMin: 1 });
     expect(points).toEqual(explicit);
-    expect(points).toHaveLength(2); // checkout + payments, both have a T0 row
+    expect(points).toHaveLength(2); // checkout-edge + payments-api, both have a T0 row
   });
 });
 
@@ -582,7 +582,7 @@ describe("searchLogs", () => {
     const { logs, total } = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, contains: "pool exhausted" });
     expect(logs).toHaveLength(2);
     expect(total).toBe(2); // nothing capped: total equals the page size
-    // cap-trace's payments log (ts = capRootStart+55+700) is newer than cascade-trace's
+    // cap-trace's payments-api log (ts = capRootStart+55+700) is newer than cascade-trace's
     // (ts = cascadeRootStart+15+700) since capRootStart > cascadeRootStart.
     expect(logs[0]?.trace_id).toBe("trace-cap");
     expect(logs[1]?.trace_id).toBe("trace-cascade");
@@ -593,27 +593,27 @@ describe("searchLogs", () => {
   });
 
   it("filters by service and level", async () => {
-    const { logs } = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "checkout", level: "error" });
+    const { logs } = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "checkout-edge", level: "error" });
     expect(logs).toHaveLength(1);
-    expect(logs[0]?.span_id).toBe("cascade-checkout");
+    expect(logs[0]?.span_id).toBe("cascade-checkout-edge");
   });
 
   it("excludes non-matching levels/services", async () => {
-    const { logs } = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "notifications" });
+    const { logs } = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "notify" });
     expect(logs).toHaveLength(1);
     expect(logs[0]?.level).toBe("info");
   });
 
   it("clamps limit to 50 by default and to an explicit lower value, while total always reports the full match count", async () => {
-    const defaulted = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "catalog", level: "info" });
+    const defaulted = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "catalog-kv", level: "info" });
     expect(defaulted.logs).toHaveLength(50); // 60 noise logs match; clamp caps the page at 50
     expect(defaulted.total).toBe(60); // ...but total is the uncapped match count
 
-    const oversized = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "catalog", level: "info", limit: 1000 });
+    const oversized = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "catalog-kv", level: "info", limit: 1000 });
     expect(oversized.logs).toHaveLength(50);
     expect(oversized.total).toBe(60);
 
-    const small = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "catalog", level: "info", limit: 5 });
+    const small = await searchLogs(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, service: "catalog-kv", level: "info", limit: 5 });
     expect(small.logs).toHaveLength(5);
     expect(small.total).toBe(60); // total is independent of the caller's limit
   });
@@ -624,7 +624,7 @@ describe("searchLogs", () => {
     const { logs } = await searchLogs(env.DB, {
       fromMs: T0,
       toMs: T0 + 30 * MIN,
-      service: "catalog",
+      service: "catalog-kv",
       level: "info",
       limit: Number.NaN,
     });
@@ -636,7 +636,7 @@ describe("findTraces", () => {
   it("criteria 'errors' returns only traces containing an error span, newest first, with entry service/op, span_count, and total", async () => {
     const { traces, total } = await findTraces(env.DB, { fromMs: T0, toMs: T0 + 30 * MIN, criteria: "errors" });
     expect(traces.map((t) => t.trace_id)).toEqual(["trace-cap", "trace-cascade"]);
-    expect(traces.map((t) => t.entry_service)).toEqual(["gateway", "gateway"]);
+    expect(traces.map((t) => t.entry_service)).toEqual(["edge-gateway", "edge-gateway"]);
     expect(traces.map((t) => t.entry_operation)).toEqual(["GET /catalog", "POST /checkout"]);
     expect(traces.map((t) => t.span_count)).toEqual([90, 4]); // full persisted span count, not the capped getTrace view
     expect(total).toBe(2); // nothing capped: total equals the page size
@@ -644,13 +644,13 @@ describe("findTraces", () => {
   });
 
   it("criteria 'errors' with a service filter that has no error traces returns an empty page with total 0", async () => {
-    const { traces, total } = await findTraces(env.DB, { service: "checkout", fromMs: T0, toMs: T0 + 30 * MIN, criteria: "errors" });
-    expect(traces).toEqual([]); // trace-healthy-a enters via checkout but is fully ok
+    const { traces, total } = await findTraces(env.DB, { service: "checkout-edge", fromMs: T0, toMs: T0 + 30 * MIN, criteria: "errors" });
+    expect(traces).toEqual([]); // trace-healthy-a enters via checkout-edge but is fully ok
     expect(total).toBe(0);
   });
 
   it("criteria 'slowest' sorts by the root span's own duration, filtered to a service", async () => {
-    const { traces } = await findTraces(env.DB, { service: "gateway", fromMs: T0, toMs: T0 + 30 * MIN, criteria: "slowest" });
+    const { traces } = await findTraces(env.DB, { service: "edge-gateway", fromMs: T0, toMs: T0 + 30 * MIN, criteria: "slowest" });
     expect(traces.map((t) => t.trace_id)).toEqual(["trace-cap", "trace-cascade", "trace-healthy-b", "trace-fallback"]);
     expect(traces.map((t) => t.duration_ms)).toEqual([900, 800, 120, 50]);
     expect(traces.map((t) => t.span_count)).toEqual([90, 4, 1, 46]);
@@ -677,7 +677,7 @@ describe("getTrace", () => {
     const result = await getTrace(env.DB, "trace-cascade");
     expect(result.truncated).toBe(false);
     expect(result.note).toBeUndefined();
-    expect(result.spans.map((s) => s.span_id)).toEqual(["cascade-root", "cascade-checkout", "cascade-payments", "cascade-notify"]);
+    expect(result.spans.map((s) => s.span_id)).toEqual(["cascade-root", "cascade-checkout-edge", "cascade-payments-api", "cascade-notify"]);
 
     const root = result.spans.find((s) => s.span_id === "cascade-root");
     const notify = result.spans.find((s) => s.span_id === "cascade-notify");
@@ -688,7 +688,7 @@ describe("getTrace", () => {
     expect((notify?.start_ms ?? 0) + (notify?.duration_ms ?? 0)).toBeGreaterThan((root?.start_ms ?? 0) + (root?.duration_ms ?? 0));
     expect(notify?.status).toBe("ok");
 
-    expect(result.errorLogs.map((l) => l.span_id)).toEqual(["cascade-payments", "cascade-checkout", "cascade-root"]);
+    expect(result.errorLogs.map((l) => l.span_id)).toEqual(["cascade-payments-api", "cascade-checkout-edge", "cascade-root"]);
     for (const log of result.errorLogs) expect(log.level).toBe("error");
   });
 
@@ -696,13 +696,13 @@ describe("getTrace", () => {
     const result = await getTrace(env.DB, "trace-cap");
     expect(result.truncated).toBe(true);
     expect(result.spans.length).toBeLessThanOrEqual(40);
-    expect(result.spans).toHaveLength(5); // root + checkout + payments (error path) + 2 collapse markers
+    expect(result.spans).toHaveLength(5); // root + checkout-edge + payments-api (error path) + 2 collapse markers
 
     const byId = new Map(result.spans.map((s) => [s.span_id, s]));
     expect(byId.get("cap-root")?.status).toBe("error");
-    expect(byId.get("cap-checkout")?.status).toBe("error");
-    expect(byId.get("cap-payments")?.status).toBe("error");
-    expect(byId.get("cap-payments")?.error_type).toBe("pool_exhausted");
+    expect(byId.get("cap-checkout-edge")?.status).toBe("error");
+    expect(byId.get("cap-payments-api")?.status).toBe("error");
+    expect(byId.get("cap-payments-api")?.error_type).toBe("pool_exhausted");
 
     // None of the collapsed originals survive individually.
     expect(byId.has("cap-list-0")).toBe(false);
@@ -721,7 +721,7 @@ describe("getTrace", () => {
     }
 
     expect(result.errorLogs).toHaveLength(1);
-    expect(result.errorLogs[0]?.span_id).toBe("cap-payments");
+    expect(result.errorLogs[0]?.span_id).toBe("cap-payments-api");
 
     expect(result.note).toContain("90");
     expect(result.note).toContain("5");
@@ -768,12 +768,12 @@ describe("getIncidents", () => {
       id: "incident-resolved-1",
       status: "resolved",
       severity: "critical",
-      trigger: { statement: "checkout error_rate 22% vs baseline 0.4% since 14:32Z", fingerprints: ["checkout:errors"] },
-      report: { summary: "Bad deploy caused checkout errors.", root_cause: { hypothesis: "connection pool exhaustion" } },
+      trigger: { statement: "checkout-edge error_rate 22% vs baseline 0.4% since 14:32Z", fingerprints: ["checkout-edge:errors"] },
+      report: { summary: "Bad deploy caused checkout-edge errors.", root_cause: { hypothesis: "connection pool exhaustion" } },
     });
-    // Inserted payments:latency (later first_seen_ms) before checkout:errors (earlier) above —
+    // Inserted payments-api:latency (later first_seen_ms) before checkout-edge:errors (earlier) above —
     // this ordering only passes if getIncidents sorts by first_seen_ms, not insertion order.
-    expect(incidents[0]?.fingerprints).toEqual(["checkout:errors", "payments:latency"]);
+    expect(incidents[0]?.fingerprints).toEqual(["checkout-edge:errors", "payments-api:latency"]);
   });
 
   it("by id returns [] and total 0 for an unknown id", async () => {
@@ -788,9 +788,9 @@ describe("getIncidents", () => {
     expect(total).toBe(2); // nothing capped: total equals the page size
     expect(incidents[0]?.report).toBeNull();
     expect(incidents[0]?.status).toBe("investigating");
-    expect(incidents[0]?.fingerprints).toEqual(["payments:latency"]);
+    expect(incidents[0]?.fingerprints).toEqual(["payments-api:latency"]);
     expect(incidents[1]?.report).not.toBeNull();
-    expect(incidents[1]?.fingerprints).toEqual(["checkout:errors", "payments:latency"]);
+    expect(incidents[1]?.fingerprints).toEqual(["checkout-edge:errors", "payments-api:latency"]);
   });
 
   it("listInvestigationSteps returns steps ordered by step_no with content parsed and token columns intact", async () => {
