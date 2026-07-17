@@ -161,7 +161,7 @@ function Shell() {
           {view === "chaos" && (
             <div className="mx-auto w-full max-w-[880px]">
               {state.data ? (
-                <ChaosPanel worldStatus={state.data.worldStatus} onActionSettled={state.refresh} />
+                <ChaosPanel worldStatus={state.data.worldStatus} onActionSettled={state.refresh} wide />
               ) : (
                 <LoadingCard label="Loading chaos panel…" />
               )}
@@ -170,7 +170,7 @@ function Shell() {
 
           {view === "deploys" && (
             <div className="mx-auto w-full max-w-[880px]">
-              <DeploysCard incidents={incidents} active />
+              <DeploysCard incidents={incidents} active maxRows={Number.POSITIVE_INFINITY} />
             </div>
           )}
 

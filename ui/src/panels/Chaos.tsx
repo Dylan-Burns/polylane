@@ -107,7 +107,15 @@ function ScenarioCard({
   );
 }
 
-export function ChaosPanel({ worldStatus, onActionSettled }: { worldStatus: WorldStatusView; onActionSettled: () => void }) {
+export function ChaosPanel({
+  worldStatus,
+  onActionSettled,
+  wide = false,
+}: {
+  worldStatus: WorldStatusView;
+  onActionSettled: () => void;
+  wide?: boolean;
+}) {
   const toast = useToast();
   const [pendingId, setPendingId] = useState<ScenarioId | null>(null);
   const [restorePending, setRestorePending] = useState(false);
@@ -160,7 +168,9 @@ export function ChaosPanel({ worldStatus, onActionSettled }: { worldStatus: Worl
 
       {disabledReason && <p className="rounded-lg border border-status-amber/30 bg-status-amber/5 px-3 py-2 text-xs text-status-amber">{disabledReason}</p>}
 
-      <div className="flex flex-col gap-3">
+      {/* In the dedicated Chaos view the four scenarios sit two-up — the rail's stacked list
+          reads as a queue; the wide grid reads as a menu of equals. */}
+      <div className={wide ? "grid grid-cols-1 gap-3 sm:grid-cols-2" : "flex flex-col gap-3"}>
         {SCENARIO_ORDER.map((id) => (
           <ScenarioCard key={id} id={id} disabledReason={disabledReason} pending={pendingId === id} onTrigger={handleTrigger} />
         ))}

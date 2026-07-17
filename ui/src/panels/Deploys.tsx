@@ -115,10 +115,18 @@ function DeployRow({ deploy, correlation }: { deploy: PublicDeploy; correlation:
 
 /** `incidents` comes from the dashboard's existing poll (no second fetch of the same data);
  * `active` gates this card's own deploys poll the same way every dashboard poll is gated. */
-export function DeploysCard({ incidents, active }: { incidents: IncidentView[]; active: boolean }) {
+export function DeploysCard({
+  incidents,
+  active,
+  maxRows = MAX_ROWS,
+}: {
+  incidents: IncidentView[];
+  active: boolean;
+  maxRows?: number;
+}) {
   const { data, error } = usePoll(getDeploys, active ? DEPLOYS_POLL_MS : null);
   const deploys = data?.deploys ?? [];
-  const shown = deploys.slice(0, MAX_ROWS);
+  const shown = deploys.slice(0, maxRows);
   // Serialized once per incidents-poll, not per deploy row per render.
   const correlationEntries = useMemo(() => prepareCorrelation(incidents), [incidents]);
 
@@ -140,8 +148,8 @@ export function DeploysCard({ incidents, active }: { incidents: IncidentView[]; 
         ))}
       </ul>
 
-      {deploys.length > MAX_ROWS && (
-        <p className="font-mono text-[10px] text-ink-faint">+{deploys.length - MAX_ROWS} more in the last 24h</p>
+      {deploys.length > maxRows && (
+        <p className="font-mono text-[10px] text-ink-faint">+{deploys.length - maxRows} more in the last 24h</p>
       )}
     </section>
   );

@@ -355,7 +355,7 @@ export function ChatPanel() {
   }
 
   return (
-    <section className="flex h-[calc(100vh-11rem)] min-h-[420px] flex-col rounded-2xl border border-hairline bg-panel/40 p-5">
+    <section className="flex h-[calc(100dvh-12rem)] min-h-[420px] lg:h-[calc(100dvh-8rem)] flex-col rounded-2xl border border-hairline bg-panel/40 p-5">
       <header className="mb-3 border-b border-hairline pb-3">
         <h2 className="font-display text-lg font-semibold tracking-tight text-ink">Chat</h2>
         <p className="mt-1 text-xs text-ink-dim">Same watchdog, same read-only tools — ask it anything about the live world.</p>
