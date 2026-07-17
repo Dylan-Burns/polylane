@@ -26,6 +26,11 @@ export const INCIDENT_STATUS_META: Record<IncidentStatus, { label: string; color
   failed: { label: "Failed", color: "var(--color-status-gray)" },
 };
 
+/** Lifecycle statuses that count as "live" — the investigation is running or its report is still
+ * the operative document. Shared by the deploys correlation chips and the nav's incident badge so
+ * "live" can never mean two different things. */
+export const LIVE_INCIDENT_STATUSES: ReadonlySet<IncidentStatus> = new Set(["open", "investigating", "reported"]);
+
 export const CONFIDENCE_META: Record<"low" | "medium" | "high", { label: string; color: string }> = {
   high: { label: "High confidence", color: "var(--color-status-green)" },
   medium: { label: "Medium confidence", color: "var(--color-status-amber)" },

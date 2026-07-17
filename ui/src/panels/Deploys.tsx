@@ -16,6 +16,7 @@ import { useMemo } from "react";
 import { getDeploys } from "../lib/api";
 import { relativeTime } from "../lib/format";
 import { usePoll } from "../lib/poll";
+import { LIVE_INCIDENT_STATUSES } from "../lib/status";
 import type { IncidentView, PublicDeploy } from "../lib/types";
 
 const DEPLOYS_POLL_MS = 30_000;
@@ -23,8 +24,6 @@ const DEPLOYS_POLL_MS = 30_000;
 /** Show at most this many rows — the card is a rail, not a log browser; the mono footer says how
  * many more the window actually held. */
 const MAX_ROWS = 8;
-
-const LIVE_STATUSES = new Set(["open", "investigating", "reported"]);
 
 type Correlation = { kind: "live"; incidentId: string } | { kind: "closed"; incidentId: string } | null;
 
@@ -69,9 +68,9 @@ function correlate(deploy: PublicDeploy, entries: CorrelationEntry[]): Correlati
     if (deploy.ts_ms < windowStart || deploy.ts_ms > windowEnd) return false;
     return reportJson.includes(deploy.version);
   };
-  const live = entries.find((e) => LIVE_STATUSES.has(e.incident.status) && mentions(e));
+  const live = entries.find((e) => LIVE_INCIDENT_STATUSES.has(e.incident.status) && mentions(e));
   if (live) return { kind: "live", incidentId: live.incident.id };
-  const closed = entries.find((e) => !LIVE_STATUSES.has(e.incident.status) && mentions(e));
+  const closed = entries.find((e) => !LIVE_INCIDENT_STATUSES.has(e.incident.status) && mentions(e));
   if (closed) return { kind: "closed", incidentId: closed.incident.id };
   return null;
 }
