@@ -15,7 +15,7 @@
 import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { getIncidentDetail, getState, remediateIncident } from "../../lib/api";
 import { clockTime, relativeTime } from "../../lib/format";
-import { KIND_META } from "../../lib/kinds";
+import { KIND_META, KindChip } from "../../lib/kinds";
 import { usePoll } from "../../lib/poll";
 import { CONFIDENCE_META, INCIDENT_STATUS_META } from "../../lib/status";
 import { useToast } from "../../lib/toast";
@@ -205,9 +205,13 @@ function ResourceHeader({ service, kind }: { service: string | undefined; kind: 
   const meta = kind ? KIND_META[kind] : undefined;
   return (
     <div className="flex items-center gap-2.5 rounded-xl border border-hairline bg-panel-raised px-3.5 py-2.5">
-      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-panel text-ink-dim" aria-hidden="true">
-        {meta ? meta.icon : <span className="h-2 w-2 rounded-full bg-ink-faint" />}
-      </span>
+      {kind ? (
+        <KindChip kind={kind} size={32} />
+      ) : (
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-panel text-ink-dim" aria-hidden="true">
+          <span className="h-2 w-2 rounded-full bg-ink-faint" />
+        </span>
+      )}
       <div className="flex flex-col">
         <span className="font-mono text-sm text-ink">{service}</span>
         <span className="font-mono text-[10px] uppercase tracking-wide text-ink-faint">{meta ? meta.label : "Unknown service kind"}</span>

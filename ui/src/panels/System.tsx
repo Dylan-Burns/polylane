@@ -11,7 +11,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { SCENARIOS } from "../../../src/sim/scenarios";
 import { Sparkline } from "../components/Sparkline";
 import { relativeTime } from "../lib/format";
-import { KIND_META } from "../lib/kinds";
+import { KIND_META, KindChip } from "../lib/kinds";
 import { HEALTH_COLOR, HEALTH_LABEL } from "../lib/status";
 import { storageGet, storageSet } from "../lib/storage";
 import type { IncidentView, OpsHealth, SparklinePoint, StateResponse, TopologyServiceNode, WorldStatusView } from "../lib/types";
@@ -171,12 +171,14 @@ function NodeCard({
   if (node.external) {
     return (
       <foreignObject x={pos.x} y={pos.y} width={pos.w} height={pos.h}>
-        <div className="flex h-full flex-col justify-center gap-1 rounded-xl border border-dashed border-hairline-bright bg-panel/50 px-3 py-2">
-          <div className="flex min-w-0 items-center gap-1.5">
-            <span className="shrink-0 text-ink-dim">{KIND_META[node.kind].icon}</span>
-            <span className="truncate font-mono text-xs text-ink-dim">{node.name}</span>
+        <div className="flex h-full flex-col justify-center gap-1.5 rounded-lg border border-dashed border-hairline-bright bg-panel/60 px-3 py-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <KindChip kind={node.kind} size={22} />
+            <div className="flex min-w-0 flex-col">
+              <span className="truncate font-mono text-xs text-ink-dim">{node.name}</span>
+              <span className="font-mono text-[9px] uppercase tracking-wider text-ink-faint">{KIND_META[node.kind].label}</span>
+            </div>
           </div>
-          <span className="font-mono text-[9px] uppercase tracking-wider text-ink-faint">{KIND_META[node.kind].label}</span>
         </div>
       </foreignObject>
     );
@@ -188,13 +190,16 @@ function NodeCard({
   return (
     <foreignObject x={pos.x} y={pos.y} width={pos.w} height={pos.h}>
       <div
-        className="flex h-full flex-col gap-1.5 rounded-xl border bg-panel px-3 py-2 shadow-lg shadow-black/10"
+        className="flex h-full flex-col gap-1.5 rounded-lg border bg-panel px-3 py-2 shadow-sm"
         style={{ borderColor: status === "green" ? "var(--color-hairline)" : HEALTH_COLOR[status] }}
       >
         <div className="flex items-center justify-between gap-2">
-          <div className="flex min-w-0 items-center gap-1.5">
-            <span className="shrink-0 text-ink-dim">{KIND_META[node.kind].icon}</span>
-            <span className="truncate font-mono text-xs font-medium text-ink">{node.name}</span>
+          <div className="flex min-w-0 items-center gap-2">
+            <KindChip kind={node.kind} size={22} />
+            <div className="flex min-w-0 flex-col">
+              <span className="truncate font-mono text-xs font-medium leading-tight text-ink">{node.name}</span>
+              <span className="truncate font-mono text-[9px] uppercase tracking-wider text-ink-faint">{KIND_META[node.kind].label}</span>
+            </div>
           </div>
           <span
             className={`h-2 w-2 shrink-0 rounded-full ${status !== "green" ? "animate-scan-pulse" : ""}`}
@@ -202,7 +207,6 @@ function NodeCard({
             title={HEALTH_LABEL[status]}
           />
         </div>
-        <span className="-mt-1 font-mono text-[9px] uppercase tracking-wider text-ink-faint">{KIND_META[node.kind].label}</span>
         <SparkRow label="rate" color="var(--color-signal)" values={ext.rate} format={(v) => `${v.toFixed(0)}/m`} live={ext.rateLive} />
         <SparkRow label="err" color="var(--color-status-red)" values={ext.err} format={(v) => `${v.toFixed(1)}%`} live={ext.errLive} />
         <SparkRow label="p95" color="var(--color-status-amber)" values={ext.p95} format={(v) => `${v.toFixed(0)}ms`} live={ext.p95Live} />
@@ -306,7 +310,14 @@ export function WorldStatusBanner({ worldStatus }: { worldStatus: WorldStatusVie
 function TopologyGrid({ state, latestMinuteTs }: { state: StateResponse; latestMinuteTs: number }) {
   const { edges } = state.topology;
   return (
-    <div className="mx-auto w-full max-w-[980px] overflow-x-auto">
+    <div
+      className="mx-auto w-full max-w-[980px] overflow-x-auto rounded-xl border border-hairline/60"
+      style={{
+        backgroundImage: "radial-gradient(color-mix(in srgb, var(--color-hairline) 85%, transparent) 1px, transparent 1px)",
+        backgroundSize: "18px 18px",
+        backgroundPosition: "9px 9px",
+      }}
+    >
       <svg
         viewBox={`0 0 ${VIEWBOX_W} ${VIEWBOX_H}`}
         width="100%"
@@ -335,12 +346,13 @@ function TopologyGrid({ state, latestMinuteTs }: { state: StateResponse; latestM
   );
 }
 
-type TopologyViewMode = "galaxy" | "grid";
+type TopologyViewMode = "galaxy" | "grid" | "list";
 
 const VIEW_MODE_KEY = "wt-system-view";
 
 function initialViewMode(): TopologyViewMode {
-  return storageGet(VIEW_MODE_KEY) === "grid" ? "grid" : "galaxy";
+  const stored = storageGet(VIEW_MODE_KEY);
+  return stored === "grid" || stored === "list" ? stored : "galaxy";
 }
 
 /** The Galaxy|Grid segmented control — the same soft pill track as the header's Dashboard|Chat
@@ -348,7 +360,7 @@ function initialViewMode(): TopologyViewMode {
 function ViewToggle({ mode, onChange }: { mode: TopologyViewMode; onChange: (mode: TopologyViewMode) => void }) {
   return (
     <div className="flex items-center gap-0.5 rounded-full bg-panel-raised p-0.5" role="tablist" aria-label="Topology view">
-      {(["galaxy", "grid"] as const).map((m) => (
+      {(["galaxy", "grid", "list"] as const).map((m) => (
         <button
           key={m}
           type="button"
@@ -402,6 +414,88 @@ function useFreshnessLabel(state: StateResponse): string {
   return `live · updated ${seconds}s ago`;
 }
 
+/** The List view — polylane's "Table" segment: one row per resource, typed chip + name, health,
+ * and the three live numerics with their sparklines. The enterprise-table details carry the
+ * weight: micro uppercase column headers, hairline row dividers, right-aligned tabular numerals,
+ * quiet hover, generous row height. External resources sit last with their numerics dashed out
+ * (they emit no internal spans by design). */
+function ListView({ state, latestMinuteTs }: { state: StateResponse; latestMinuteTs: number }) {
+  const ordered = [...state.topology.services].sort((a, b) => Number(a.external) - Number(b.external));
+  return (
+    <div className="overflow-x-auto rounded-xl border border-hairline/60">
+      <table className="w-full min-w-[640px] border-collapse">
+        <thead>
+          <tr className="border-b border-hairline">
+            {["Resource", "Health", "Rate", "Error rate", "P95"].map((h, i) => (
+              <th
+                key={h}
+                scope="col"
+                className={`px-4 py-2.5 font-mono text-[9px] font-medium uppercase tracking-wider text-ink-faint ${i < 2 ? "text-left" : "text-right"}`}
+              >
+                {h}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {ordered.map((node) => {
+            const status = (state.health[node.name] as "red" | "amber" | "green" | undefined) ?? "green";
+            const ext = node.external ? null : extendedSlots(state, node.name, latestMinuteTs);
+            const rate = ext ? lastKnown(ext.rate) : null;
+            const err = ext ? lastKnown(ext.err) : null;
+            const p95 = ext ? lastKnown(ext.p95) : null;
+            return (
+              <tr key={node.name} className="border-b border-hairline/60 transition-colors last:border-b-0 hover:bg-panel-raised/60">
+                <td className="px-4 py-3">
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <KindChip kind={node.kind} size={24} />
+                    <div className="flex min-w-0 flex-col">
+                      <span className="truncate font-mono text-xs font-medium leading-tight text-ink">{node.name}</span>
+                      <span className="truncate font-mono text-[9px] uppercase tracking-wider text-ink-faint">{KIND_META[node.kind].label}</span>
+                    </div>
+                  </div>
+                </td>
+                <td className="px-4 py-3">
+                  {node.external ? (
+                    <span className="font-mono text-[10px] text-ink-faint">n/a</span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-ink-dim">
+                      <span
+                        className={`h-1.5 w-1.5 rounded-full ${status !== "green" ? "animate-scan-pulse" : ""}`}
+                        style={{ backgroundColor: HEALTH_COLOR[status] }}
+                        aria-hidden="true"
+                      />
+                      {HEALTH_LABEL[status]}
+                    </span>
+                  )}
+                </td>
+                <td className="px-4 py-3 text-right">
+                  <div className="inline-flex items-center justify-end gap-2">
+                    {ext && <Sparkline values={ext.rate} width={56} height={14} color="var(--color-signal)" ariaLabel={`${node.name} rate sparkline`} live={ext.rateLive} />}
+                    <span className="font-mono text-xs tabular-nums text-ink">{rate !== null ? `${rate.toFixed(0)}/m` : "—"}</span>
+                  </div>
+                </td>
+                <td className="px-4 py-3 text-right">
+                  <div className="inline-flex items-center justify-end gap-2">
+                    {ext && <Sparkline values={ext.err} width={56} height={14} color="var(--color-status-red)" ariaLabel={`${node.name} error-rate sparkline`} live={ext.errLive} />}
+                    <span className="font-mono text-xs tabular-nums text-ink">{err !== null ? `${err.toFixed(1)}%` : "—"}</span>
+                  </div>
+                </td>
+                <td className="px-4 py-3 text-right">
+                  <div className="inline-flex items-center justify-end gap-2">
+                    {ext && <Sparkline values={ext.p95} width={56} height={14} color="var(--color-status-amber)" ariaLabel={`${node.name} p95 sparkline`} live={ext.p95Live} />}
+                    <span className="font-mono text-xs tabular-nums text-ink">{p95 !== null ? `${p95.toFixed(0)}ms` : "—"}</span>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export function SystemView({ state, incidents }: { state: StateResponse; incidents: IncidentView[] }) {
   const scanning = isScanning(state.worldStatus, incidents);
   const latestMinuteTs = latestMinuteFromSparklines(state.sparklines);
@@ -440,8 +534,10 @@ export function SystemView({ state, incidents }: { state: StateResponse; inciden
 
       {viewMode === "galaxy" ? (
         <GalaxyView services={state.topology.services} edges={state.topology.edges} health={state.health} stats={stats} />
-      ) : (
+      ) : viewMode === "grid" ? (
         <TopologyGrid state={state} latestMinuteTs={latestMinuteTs} />
+      ) : (
+        <ListView state={state} latestMinuteTs={latestMinuteTs} />
       )}
 
       <Legend />
