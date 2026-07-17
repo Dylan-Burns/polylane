@@ -139,50 +139,50 @@ function toPoints(rollups: readonly RollupRow[]): MetricPoint[] {
 
 describe("evaluate: hard trip vs. sustained", () => {
   it("hard trip fires from a single completed minute alone (no minute[1] needed)", () => {
-    const baselines = mkBaselines([["checkout", "POST /checkout", "error_rate", 0.01, 0.005]]);
+    const baselines = mkBaselines([["checkout-edge", "POST /checkout", "error_rate", 0.01, 0.005]]);
     // 30% clears max(25%, 10*1%=10%) = 25%, with 30 errors clearing the >= 3-error evidence gate.
-    const minute0 = [mkPoint("checkout", "POST /checkout", T0, { count: 100, error_rate: 0.3 })];
+    const minute0 = [mkPoint("checkout-edge", "POST /checkout", T0, { count: 100, error_rate: 0.3 })];
 
     const anomalies = evaluate([minute0], baselines);
 
     expect(anomalies).toEqual<Anomaly[]>([
       {
-        fingerprint: "checkout:errors",
-        service: "checkout",
+        fingerprint: "checkout-edge:errors",
+        service: "checkout-edge",
         metricClass: "errors",
         rule: "hard",
         value: 0.3,
         baseline: 0.01,
-        statement: "checkout error_rate 30.0% vs baseline 1.0% (hard trip) since 14:00Z",
+        statement: "checkout-edge error_rate 30.0% vs baseline 1.0% (hard trip) since 14:00Z",
       },
     ]);
   });
 
   it("sustained needs the SAME (service, operation, metric) breaching in BOTH minutes", () => {
-    const baselines = mkBaselines([["checkout", "POST /checkout", "error_rate", 0.01, 0.005]]);
+    const baselines = mkBaselines([["checkout-edge", "POST /checkout", "error_rate", 0.01, 0.005]]);
     // 6%: below the 25% hard floor, above the sustained floor (max(5%, 1%+6*0.5%=4%) = 5%), and
     // 6 errors/minute clears the >= 3-per-minute evidence gate.
-    const minute0 = [mkPoint("checkout", "POST /checkout", T0, { count: 100, error_rate: 0.06 })];
+    const minute0 = [mkPoint("checkout-edge", "POST /checkout", T0, { count: 100, error_rate: 0.06 })];
 
     // No minute[1] at all -> sustained cannot evaluate.
     expect(evaluate([minute0], baselines)).toEqual([]);
 
     // minute[1] present but healthy -> the SAME metric didn't breach in both minutes.
-    const healthyMinute1 = [mkPoint("checkout", "POST /checkout", T0 - MIN, { count: 100, error_rate: 0.01 })];
+    const healthyMinute1 = [mkPoint("checkout-edge", "POST /checkout", T0 - MIN, { count: 100, error_rate: 0.01 })];
     expect(evaluate([minute0, healthyMinute1], baselines)).toEqual([]);
 
     // Both minutes breach -> sustained fires.
-    const breachingMinute1 = [mkPoint("checkout", "POST /checkout", T0 - MIN, { count: 100, error_rate: 0.06 })];
+    const breachingMinute1 = [mkPoint("checkout-edge", "POST /checkout", T0 - MIN, { count: 100, error_rate: 0.06 })];
     const anomalies = evaluate([minute0, breachingMinute1], baselines);
     expect(anomalies).toEqual<Anomaly[]>([
       {
-        fingerprint: "checkout:errors",
-        service: "checkout",
+        fingerprint: "checkout-edge:errors",
+        service: "checkout-edge",
         metricClass: "errors",
         rule: "sustained",
         value: 0.06,
         baseline: 0.01,
-        statement: "checkout error_rate 6.0% vs baseline 1.0% (sustained) since 14:00Z",
+        statement: "checkout-edge error_rate 6.0% vs baseline 1.0% (sustained) since 14:00Z",
       },
     ]);
   });
@@ -190,95 +190,95 @@ describe("evaluate: hard trip vs. sustained", () => {
 
 describe("breachesSustainedThreshold: the /api/state amber pre-incident check", () => {
   it("true for a single minute alone that clears the sustained ratio + evidence gate", () => {
-    const baselines = mkBaselines([["checkout", "POST /checkout", "error_rate", 0.01, 0.005]]);
+    const baselines = mkBaselines([["checkout-edge", "POST /checkout", "error_rate", 0.01, 0.005]]);
     // 6%: above the sustained floor (max(5%, 1%+6*0.5%=4%) = 5%), 6 errors clears the >=3 gate --
     // identical fixture to the "sustained needs the SAME ... in BOTH minutes" test above, but here
     // asserting the single-minute half fires on its own, with no second minute involved at all.
-    const point = mkPoint("checkout", "POST /checkout", T0, { count: 100, error_rate: 0.06 });
+    const point = mkPoint("checkout-edge", "POST /checkout", T0, { count: 100, error_rate: 0.06 });
     expect(breachesSustainedThreshold(point, baselines)).toBe(true);
   });
 
   it("false in steady state (well under every sustained floor)", () => {
-    const baselines = mkBaselines([["checkout", "POST /checkout", "error_rate", 0.01, 0.005]]);
-    const point = mkPoint("checkout", "POST /checkout", T0, { count: 100, error_rate: 0.01 });
+    const baselines = mkBaselines([["checkout-edge", "POST /checkout", "error_rate", 0.01, 0.005]]);
+    const point = mkPoint("checkout-edge", "POST /checkout", T0, { count: 100, error_rate: 0.01 });
     expect(breachesSustainedThreshold(point, baselines)).toBe(false);
   });
 
   it("false when the ratio breaches but the evidence gate (>= 3 errors) doesn't", () => {
-    const baselines = mkBaselines([["payments", "charge", "error_rate", 0.005, 0.002]]);
+    const baselines = mkBaselines([["payments-api", "charge", "error_rate", 0.005, 0.002]]);
     // 10% clears the sustained ratio, but only 2 errors -- below the >= 3-error evidence gate.
-    const point = mkPoint("payments", "charge", T0, { count: 20, error_rate: 0.1 });
+    const point = mkPoint("payments-api", "charge", T0, { count: 20, error_rate: 0.1 });
     expect(breachesSustainedThreshold(point, baselines)).toBe(false);
   });
 
   it("true for a hard-trip-level breach too (a bigger breach still clears the looser sustained gate)", () => {
-    const baselines = mkBaselines([["checkout", "POST /checkout", "error_rate", 0.01, 0.005]]);
-    const point = mkPoint("checkout", "POST /checkout", T0, { count: 100, error_rate: 0.3 });
+    const baselines = mkBaselines([["checkout-edge", "POST /checkout", "error_rate", 0.01, 0.005]]);
+    const point = mkPoint("checkout-edge", "POST /checkout", T0, { count: 100, error_rate: 0.3 });
     expect(breachesSustainedThreshold(point, baselines)).toBe(true);
   });
 
   it("checks every metric class, e.g. a latency breach with p50 confirmation", () => {
     const baselines = mkBaselines([
-      ["payments-db", "query_ledger", "p95", 30, 5],
-      ["payments-db", "query_ledger", "p50", 12, 2],
+      ["ledger-db", "query_ledger", "p95", 30, 5],
+      ["ledger-db", "query_ledger", "p50", 12, 2],
     ]);
-    const point = mkPoint("payments-db", "query_ledger", T0, { count: 15, p50: 24, p95: 90 }); // p95 3x (> 2.5x), p50 2x confirms
+    const point = mkPoint("ledger-db", "query_ledger", T0, { count: 15, p50: 24, p95: 90 }); // p95 3x (> 2.5x), p50 2x confirms
     expect(breachesSustainedThreshold(point, baselines)).toBe(true);
   });
 });
 
 describe("evaluate: error-count evidence gates", () => {
   it("suppresses the error hard-trip on thin evidence even at an extreme rate (2 errors < 3)", () => {
-    const baselines = mkBaselines([["catalog", "list_products", "error_rate", 0.01, 0.005]]);
+    const baselines = mkBaselines([["catalog-kv", "list_products", "error_rate", 0.01, 0.005]]);
     // 25% error rate clears the ratio threshold, but 2 errors are below the >= 3-error gate.
-    const minute0 = [mkPoint("catalog", "list_products", T0, { count: 8, error_rate: 0.25 })];
+    const minute0 = [mkPoint("catalog-kv", "list_products", T0, { count: 8, error_rate: 0.25 })];
 
     expect(evaluate([minute0], baselines)).toEqual([]);
   });
 
   it("the identical rate fires once the error count crosses the >= 3 evidence gate", () => {
-    const baselines = mkBaselines([["catalog", "list_products", "error_rate", 0.01, 0.005]]);
-    const minute0 = [mkPoint("catalog", "list_products", T0, { count: 12, error_rate: 0.25 })]; // 3 errors
+    const baselines = mkBaselines([["catalog-kv", "list_products", "error_rate", 0.01, 0.005]]);
+    const minute0 = [mkPoint("catalog-kv", "list_products", T0, { count: 12, error_rate: 0.25 })]; // 3 errors
 
     const anomalies = evaluate([minute0], baselines);
     expect(anomalies).toHaveLength(1);
-    expect(anomalies[0]).toMatchObject({ fingerprint: "catalog:errors", rule: "hard" });
+    expect(anomalies[0]).toMatchObject({ fingerprint: "catalog-kv:errors", rule: "hard" });
   });
 
   it("sustained needs >= 3 errors in EACH minute, not just a breaching rate", () => {
-    const baselines = mkBaselines([["payments", "charge", "error_rate", 0.005, 0.002]]);
+    const baselines = mkBaselines([["payments-api", "charge", "error_rate", 0.005, 0.002]]);
     // 10% rate breaches the sustained threshold in both minutes, but with only 2 errors/minute.
-    const thin0 = [mkPoint("payments", "charge", T0, { count: 20, error_rate: 0.1 })];
-    const thin1 = [mkPoint("payments", "charge", T0 - MIN, { count: 20, error_rate: 0.1 })];
+    const thin0 = [mkPoint("payments-api", "charge", T0, { count: 20, error_rate: 0.1 })];
+    const thin1 = [mkPoint("payments-api", "charge", T0 - MIN, { count: 20, error_rate: 0.1 })];
     expect(evaluate([thin0, thin1], baselines)).toEqual([]);
 
     // Same rate with 3 errors per minute -> fires.
-    const solid0 = [mkPoint("payments", "charge", T0, { count: 30, error_rate: 0.1 })];
-    const solid1 = [mkPoint("payments", "charge", T0 - MIN, { count: 30, error_rate: 0.1 })];
+    const solid0 = [mkPoint("payments-api", "charge", T0, { count: 30, error_rate: 0.1 })];
+    const solid1 = [mkPoint("payments-api", "charge", T0 - MIN, { count: 30, error_rate: 0.1 })];
     const anomalies = evaluate([solid0, solid1], baselines);
     expect(anomalies).toHaveLength(1);
-    expect(anomalies[0]).toMatchObject({ fingerprint: "payments:errors", rule: "sustained" });
+    expect(anomalies[0]).toMatchObject({ fingerprint: "payments-api:errors", rule: "sustained" });
   });
 });
 
 describe("evaluate: p50 distribution-shift confirmation (latency)", () => {
   const baselines = mkBaselines([
-    ["payments-db", "query_ledger", "p95", 30, 5],
-    ["payments-db", "query_ledger", "p50", 12, 2],
+    ["ledger-db", "query_ledger", "p95", 30, 5],
+    ["ledger-db", "query_ledger", "p50", 12, 2],
   ]);
 
   it("a lone-outlier p95 spike without a p50 shift never fires (the outlier-killer)", () => {
     // p95 100x baseline — the classic single-3s-timeout signature — but p50 dead on baseline.
-    const minute0 = [mkPoint("payments-db", "query_ledger", T0, { count: 15, p50: 12, p95: 3000 })];
+    const minute0 = [mkPoint("ledger-db", "query_ledger", T0, { count: 15, p50: 12, p95: 3000 })];
     expect(evaluate([minute0], baselines)).toEqual([]);
   });
 
   it("the same p95 spike WITH a >= 2x p50 shift fires the hard rule", () => {
-    const minute0 = [mkPoint("payments-db", "query_ledger", T0, { count: 15, p50: 24, p95: 3000 })];
+    const minute0 = [mkPoint("ledger-db", "query_ledger", T0, { count: 15, p50: 24, p95: 3000 })];
     const anomalies = evaluate([minute0], baselines);
     expect(anomalies).toHaveLength(1);
     expect(anomalies[0]).toMatchObject({
-      fingerprint: "payments-db:latency",
+      fingerprint: "ledger-db:latency",
       rule: "hard",
       value: 3000,
       baseline: 30,
@@ -286,20 +286,20 @@ describe("evaluate: p50 distribution-shift confirmation (latency)", () => {
   });
 
   it("suppressed below the 5-request sample floor even with both ratios breaching", () => {
-    const minute0 = [mkPoint("payments-db", "query_ledger", T0, { count: 4, p50: 48, p95: 3000 })];
+    const minute0 = [mkPoint("ledger-db", "query_ledger", T0, { count: 4, p50: 48, p95: 3000 })];
     expect(evaluate([minute0], baselines)).toEqual([]);
   });
 
   it("sustained latency requires the p50 confirmation in BOTH minutes", () => {
     // p95 3x baseline both minutes (> 2.5x), but minute[1]'s p50 is at baseline -> silent.
-    const m0 = [mkPoint("payments-db", "query_ledger", T0, { count: 15, p50: 24, p95: 90 })];
-    const m1NoShift = [mkPoint("payments-db", "query_ledger", T0 - MIN, { count: 15, p50: 12, p95: 90 })];
+    const m0 = [mkPoint("ledger-db", "query_ledger", T0, { count: 15, p50: 24, p95: 90 })];
+    const m1NoShift = [mkPoint("ledger-db", "query_ledger", T0 - MIN, { count: 15, p50: 12, p95: 90 })];
     expect(evaluate([m0, m1NoShift], baselines)).toEqual([]);
 
-    const m1Shifted = [mkPoint("payments-db", "query_ledger", T0 - MIN, { count: 15, p50: 24, p95: 90 })];
+    const m1Shifted = [mkPoint("ledger-db", "query_ledger", T0 - MIN, { count: 15, p50: 24, p95: 90 })];
     const anomalies = evaluate([m0, m1Shifted], baselines);
     expect(anomalies).toHaveLength(1);
-    expect(anomalies[0]).toMatchObject({ fingerprint: "payments-db:latency", rule: "sustained" });
+    expect(anomalies[0]).toMatchObject({ fingerprint: "ledger-db:latency", rule: "sustained" });
   });
 });
 
@@ -329,36 +329,36 @@ describe("evaluate: missing baseline", () => {
   });
 
   it("latency needs BOTH p95 and p50 baseline rows — p95 alone is not enough", () => {
-    const p95Only = mkBaselines([["catalog", "get_product", "p95", 20, 4]]);
-    const minute0 = [mkPoint("catalog", "get_product", T0, { count: 30, p50: 100, p95: 400 })];
+    const p95Only = mkBaselines([["catalog-kv", "get_product", "p95", 20, 4]]);
+    const minute0 = [mkPoint("catalog-kv", "get_product", T0, { count: 30, p50: 100, p95: 400 })];
     expect(evaluate([minute0], p95Only)).toEqual([]);
 
     const both = mkBaselines([
-      ["catalog", "get_product", "p95", 20, 4],
-      ["catalog", "get_product", "p50", 8, 2],
+      ["catalog-kv", "get_product", "p95", 20, 4],
+      ["catalog-kv", "get_product", "p50", 8, 2],
     ]);
     const anomalies = evaluate([minute0], both);
     expect(anomalies).toHaveLength(1);
-    expect(anomalies[0]).toMatchObject({ fingerprint: "catalog:latency", rule: "hard" });
+    expect(anomalies[0]).toMatchObject({ fingerprint: "catalog-kv:latency", rule: "hard" });
   });
 });
 
 describe("evaluate: traffic rules", () => {
   it("5x traffic trips the traffic hard rule (>= 4x baseline with >= 20 requests)", () => {
-    const baselines = mkBaselines([["gateway", "route_browse", "req_rate", 50, 10]]);
-    const minute0 = [mkPoint("gateway", "route_browse", T0, { count: 250 })]; // 5x the 50 baseline
+    const baselines = mkBaselines([["edge-gateway", "route_browse", "req_rate", 50, 10]]);
+    const minute0 = [mkPoint("edge-gateway", "route_browse", T0, { count: 250 })]; // 5x the 50 baseline
 
     const anomalies = evaluate([minute0], baselines);
 
     expect(anomalies).toEqual<Anomaly[]>([
       {
-        fingerprint: "gateway:traffic",
-        service: "gateway",
+        fingerprint: "edge-gateway:traffic",
+        service: "edge-gateway",
         metricClass: "traffic",
         rule: "hard",
         value: 250,
         baseline: 50,
-        statement: "gateway req_rate 250 req/min vs baseline 50 req/min (hard trip) since 14:00Z",
+        statement: "edge-gateway req_rate 250 req/min vs baseline 50 req/min (hard trip) since 14:00Z",
       },
     ]);
   });
@@ -382,35 +382,35 @@ describe("evaluate: traffic rules", () => {
 
 describe("evaluate: fingerprint consolidation", () => {
   it("a hard-trip and sustained hit on the same fingerprint dedupe to one anomaly with rule 'hard'", () => {
-    const baselines = mkBaselines([["payments", "charge", "error_rate", 0.01, 0.005]]);
+    const baselines = mkBaselines([["payments-api", "charge", "error_rate", 0.01, 0.005]]);
     // 30% clears both the hard floor (25%) and the sustained floor (5%), in both minutes, with 30
     // errors/minute clearing every evidence gate -- this single (service, operation, metric)
     // satisfies both rules simultaneously.
-    const minute0 = [mkPoint("payments", "charge", T0, { count: 100, error_rate: 0.3 })];
-    const minute1 = [mkPoint("payments", "charge", T0 - MIN, { count: 100, error_rate: 0.3 })];
+    const minute0 = [mkPoint("payments-api", "charge", T0, { count: 100, error_rate: 0.3 })];
+    const minute1 = [mkPoint("payments-api", "charge", T0 - MIN, { count: 100, error_rate: 0.3 })];
 
     const anomalies = evaluate([minute0, minute1], baselines);
 
     expect(anomalies).toHaveLength(1);
-    expect(anomalies[0]).toMatchObject({ fingerprint: "payments:errors", rule: "hard" });
+    expect(anomalies[0]).toMatchObject({ fingerprint: "payments-api:errors", rule: "hard" });
   });
 
   it("multiple operations of one service breaching the same class consolidate to one anomaly, picking the worst", () => {
     const baselines = mkBaselines([
-      ["gateway", "op-a", "error_rate", 0.01, 0.005],
-      ["gateway", "op-b", "error_rate", 0.01, 0.005],
+      ["edge-gateway", "op-a", "error_rate", 0.01, 0.005],
+      ["edge-gateway", "op-b", "error_rate", 0.01, 0.005],
     ]);
     // op-a: 26% (ratio ~26x its 1% baseline). op-b: 60% (ratio ~60x) -- op-b is the worse breach.
     const minute0 = [
-      mkPoint("gateway", "op-a", T0, { count: 100, error_rate: 0.26 }),
-      mkPoint("gateway", "op-b", T0, { count: 100, error_rate: 0.6 }),
+      mkPoint("edge-gateway", "op-a", T0, { count: 100, error_rate: 0.26 }),
+      mkPoint("edge-gateway", "op-b", T0, { count: 100, error_rate: 0.6 }),
     ];
 
     const anomalies = evaluate([minute0], baselines);
 
     expect(anomalies).toHaveLength(1);
     expect(anomalies[0]).toMatchObject({
-      fingerprint: "gateway:errors",
+      fingerprint: "edge-gateway:errors",
       rule: "hard",
       value: 0.6,
       baseline: 0.01,
@@ -491,8 +491,8 @@ describe("evaluate: scenario detection latency (all 4 scenarios x 10 times of da
   /** What "detected" means per scenario — the anomaly must plausibly attribute the fault, not
    * just be any anomaly that happens to fire during the window. */
   const EXPECTED: Record<ScenarioId, (a: Anomaly) => boolean> = {
-    "bad-deploy": (a) => ["payments", "checkout", "gateway"].includes(a.service) && a.metricClass !== "traffic",
-    "dependency-outage": (a) => a.service === "notifications",
+    "bad-deploy": (a) => ["payments-api", "checkout-edge", "edge-gateway"].includes(a.service) && a.metricClass !== "traffic",
+    "dependency-outage": (a) => a.service === "notify",
     "latency-creep": (a) => a.metricClass === "latency",
     "traffic-spike": (a) => a.metricClass === "traffic",
   };

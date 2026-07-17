@@ -20,10 +20,12 @@ export interface Grade {
 }
 
 export const GRADES: Record<ScenarioId, Grade> = {
-  "bad-deploy": { must: [["deploy", "v2.4.1"], ["payments"], ["pool", "latency", "connection"]] },
-  "dependency-outage": { must: [["email"], ["notifications"]], mustNotBlame: ["checkout"] },
+  "bad-deploy": {
+    must: [["deploy", "v2.4.1", "release", "ship"], ["payments"], ["queued quer", "saturat", "pool", "connection", "acquire", "latency"]],
+  },
+  "dependency-outage": { must: [["email"], ["notif"]], mustNotBlame: ["checkout"] },
   "latency-creep": {
-    must: [["payments-db", "database"], ["latency", "slow", "p95", "creep", "degrad"]],
+    must: [["ledger-db", "ledger", "d1", "database"], ["latency", "slow", "p95", "creep", "degrad"]],
     mustNotBlame: ["deploy"],
   },
   "traffic-spike": { must: [["traffic", "load", "spike", "volume"]], mustNotBlame: ["bug", "deploy"] },

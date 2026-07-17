@@ -8,7 +8,7 @@ function makeSpan(i: number): Span {
     trace_id: `trace-${i}`,
     span_id: `span-${i}`,
     parent_span_id: i % 2 === 0 ? null : `span-${i - 1}`,
-    service: "checkout",
+    service: "checkout-edge",
     operation: "POST /checkout",
     start_ms: 1_700_000_000_000 + i,
     duration_ms: 10 + (i % 50),
@@ -20,7 +20,7 @@ function makeSpan(i: number): Span {
 function makeLog(i: number): LogLine {
   return {
     ts_ms: 1_700_000_000_000 + i,
-    service: "checkout",
+    service: "checkout-edge",
     level: "info",
     message: `handled request ${i}`,
     trace_id: `trace-${i}`,
@@ -30,7 +30,7 @@ function makeLog(i: number): LogLine {
 
 function makeRollup(i: number): RollupRow {
   return {
-    service: "checkout",
+    service: "checkout-edge",
     operation: "POST /checkout",
     minute_ts: 1_700_000_000_000 + i * 60_000,
     count: 100 + i,
@@ -117,7 +117,7 @@ describe("insertLogs", () => {
 
   it("stores logs with no trace_id/span_id as NULL", async () => {
     await insertLogs(env.DB, [
-      { ts_ms: 1, service: "catalog", level: "warn", message: "cache miss" },
+      { ts_ms: 1, service: "catalog-kv", level: "warn", message: "cache miss" },
     ]);
     const row = await env.DB.prepare("SELECT * FROM logs WHERE message = 'cache miss'").first<{
       trace_id: string | null;
@@ -151,7 +151,7 @@ describe("insertDeploy", () => {
   it("inserts a single deploy row", async () => {
     const deploy: Deploy = {
       id: "deploy-1",
-      service: "payments",
+      service: "payments-api",
       version: "v2.4.1",
       ts_ms: 1_700_000_000_000,
       note: "bump payment provider SDK",

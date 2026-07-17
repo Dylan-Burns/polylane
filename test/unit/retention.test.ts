@@ -13,7 +13,7 @@ function mkSpan(i: number, startMs: number): Span {
     trace_id: `t-${i}`,
     span_id: `s-${i}`,
     parent_span_id: null,
-    service: "checkout",
+    service: "checkout-edge",
     operation: "place_order",
     start_ms: startMs,
     duration_ms: 10,
@@ -23,11 +23,11 @@ function mkSpan(i: number, startMs: number): Span {
 }
 
 function mkLog(i: number, tsMs: number): LogLine {
-  return { ts_ms: tsMs, service: "checkout", level: "info", message: `line ${i}` };
+  return { ts_ms: tsMs, service: "checkout-edge", level: "info", message: `line ${i}` };
 }
 
 function mkRollup(minuteTs: number): RollupRow {
-  return { service: "checkout", operation: "place_order", minute_ts: minuteTs, count: 10, error_count: 0, p50_ms: 10, p95_ms: 20, p99_ms: 30 };
+  return { service: "checkout-edge", operation: "place_order", minute_ts: minuteTs, count: 10, error_count: 0, p50_ms: 10, p95_ms: 20, p99_ms: 30 };
 }
 
 async function counts() {

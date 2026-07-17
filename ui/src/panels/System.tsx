@@ -1,10 +1,10 @@
 /**
  * Area 1 (spec §11): the six-node service topology with live health coloring and per-service
  * sparklines, the "watchdog scanning…" indicator, and the world-status banner. Fixed-layout SVG —
- * node positions are hand-placed to match `sim/topology.ts`'s own diagram (gateway -> checkout ->
- * payments -> payments-db; checkout -> notifications -> email-provider; gateway -> catalog), not
- * force-directed — and every edge actually drawn comes from `state.topology.edges`, never
- * hardcoded, so this stays correct if the topology ever changes.
+ * node positions are hand-placed to match `sim/topology.ts`'s own diagram (edge-gateway ->
+ * checkout-edge -> payments-api -> ledger-db; checkout-edge -> notify -> email-api; edge-gateway ->
+ * catalog-kv), not force-directed — and every edge actually drawn comes from `state.topology.edges`,
+ * never hardcoded, so this stays correct if the topology ever changes.
  */
 
 import { useState, type ReactNode } from "react";
@@ -24,15 +24,15 @@ interface NodePos {
 }
 
 /** Hand-placed positions mirroring `sim/topology.ts`'s own ASCII diagram — three tiers,
- * gateway on the left fanning out to its two branches. */
+ * edge-gateway on the left fanning out to its two branches. */
 const NODE_POSITIONS: Record<string, NodePos> = {
-  gateway: { x: 20, y: 115, w: 150, h: 108 },
-  checkout: { x: 224, y: 16, w: 150, h: 108 },
-  catalog: { x: 224, y: 216, w: 150, h: 108 },
-  payments: { x: 428, y: 16, w: 150, h: 108 },
-  notifications: { x: 428, y: 216, w: 150, h: 108 },
-  "payments-db": { x: 632, y: 16, w: 150, h: 108 },
-  "email-provider": { x: 632, y: 232, w: 150, h: 76 },
+  "edge-gateway": { x: 20, y: 115, w: 150, h: 108 },
+  "checkout-edge": { x: 224, y: 16, w: 150, h: 108 },
+  "catalog-kv": { x: 224, y: 216, w: 150, h: 108 },
+  "payments-api": { x: 428, y: 16, w: 150, h: 108 },
+  notify: { x: 428, y: 216, w: 150, h: 108 },
+  "ledger-db": { x: 632, y: 16, w: 150, h: 108 },
+  "email-api": { x: 632, y: 232, w: 150, h: 76 },
 };
 const VIEWBOX_W = 802;
 const VIEWBOX_H = 340;

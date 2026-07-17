@@ -17,13 +17,13 @@ const T0 = Date.UTC(2026, 0, 5, 14, 0, 0);
 
 function mkAnomaly(overrides: Partial<Anomaly> = {}): Anomaly {
   return {
-    fingerprint: "payments:errors",
-    service: "payments",
+    fingerprint: "payments-api:errors",
+    service: "payments-api",
     metricClass: "errors",
     rule: "sustained",
     value: 0.3,
     baseline: 0.01,
-    statement: "payments error_rate 30.0% vs baseline 1.0% (sustained) since 14:00Z",
+    statement: "payments-api error_rate 30.0% vs baseline 1.0% (sustained) since 14:00Z",
     ...overrides,
   };
 }
@@ -68,13 +68,13 @@ afterEach(async () => {
 describe("openIncident", () => {
   it("creates a new incident with the opening batch's fingerprints and trigger_json", async () => {
     const anomalies = [
-      mkAnomaly({ fingerprint: "payments:errors", service: "payments", rule: "hard" }),
+      mkAnomaly({ fingerprint: "payments-api:errors", service: "payments-api", rule: "hard" }),
       mkAnomaly({
-        fingerprint: "payments:latency",
-        service: "payments",
+        fingerprint: "payments-api:latency",
+        service: "payments-api",
         metricClass: "latency",
         rule: "hard",
-        statement: "payments p95 900ms vs baseline 100ms (hard trip) since 14:00Z",
+        statement: "payments-api p95 900ms vs baseline 100ms (hard trip) since 14:00Z",
       }),
     ];
 
@@ -92,7 +92,7 @@ describe("openIncident", () => {
     expect(trigger.anomalies).toHaveLength(2);
 
     const fps = await fingerprintRows(id);
-    expect(fps.map((f) => f.fingerprint)).toEqual(["payments:errors", "payments:latency"]);
+    expect(fps.map((f) => f.fingerprint)).toEqual(["payments-api:errors", "payments-api:latency"]);
     expect(fps.every((f) => f.delivered_to_agent === 0)).toBe(true);
     expect(fps.every((f) => f.first_seen_ms === T0)).toBe(true);
   });
@@ -117,8 +117,8 @@ describe("openIncident", () => {
 
   it("severity: >= 2 distinct services, all sustained -> critical", async () => {
     const anomalies = [
-      mkAnomaly({ fingerprint: "payments:errors", service: "payments", rule: "sustained" }),
-      mkAnomaly({ fingerprint: "checkout:errors", service: "checkout", rule: "sustained" }),
+      mkAnomaly({ fingerprint: "payments-api:errors", service: "payments-api", rule: "sustained" }),
+      mkAnomaly({ fingerprint: "checkout-edge:errors", service: "checkout-edge", rule: "sustained" }),
     ];
     const { id } = await openIncident(env.DB, anomalies, T0);
     const row = await incidentRow(id);
@@ -126,13 +126,13 @@ describe("openIncident", () => {
   });
 
   it("severity is fixed at open and not recomputed by appendFingerprints (warning stays warning even once a 2nd service is appended)", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors", service: "payments", rule: "sustained" })], T0);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors", service: "payments-api", rule: "sustained" })], T0);
     expect((await incidentRow(id))?.severity).toBe("warning");
 
     await appendFingerprints(
       env.DB,
       id,
-      [mkAnomaly({ fingerprint: "checkout:errors", service: "checkout", rule: "hard" })],
+      [mkAnomaly({ fingerprint: "checkout-edge:errors", service: "checkout-edge", rule: "hard" })],
       T0 + MIN,
     );
     expect((await incidentRow(id))?.severity).toBe("warning");
@@ -143,10 +143,10 @@ describe("openIncident", () => {
   it.each(["open", "investigating", "reported"] as const)(
     "an incident in status '%s' suppresses a new incident for a covered fingerprint",
     async (status) => {
-      const first = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+      const first = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
       await setStatus(env.DB, first.id, status);
 
-      const second = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0 + MIN);
+      const second = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0 + MIN);
       expect(second.created).toBe(false);
       expect(second.id).toBe(first.id);
       expect(await countIncidents()).toBe(1);
@@ -154,10 +154,10 @@ describe("openIncident", () => {
   );
 
   it("a 'resolved' incident never suppresses, regardless of how recently it resolved", async () => {
-    const first = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    const first = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
     await setStatus(env.DB, first.id, "resolved", { ts: { field: "resolved_at", value: T0 + 1_000 } });
 
-    const second = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0 + 2_000);
+    const second = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0 + 2_000);
     expect(second.created).toBe(true);
     expect(second.id).not.toBe(first.id);
     expect(await countIncidents()).toBe(2);
@@ -166,30 +166,30 @@ describe("openIncident", () => {
   // --- Re-arm timing for 'failed' -----------------------------------------------------------------
 
   it("a 'failed' incident still suppresses 9 minutes after its terminal timestamp (within the 10-min re-arm)", async () => {
-    const first = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    const first = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
     await setStatus(env.DB, first.id, "failed", { ts: { field: "resolved_at", value: T0 } });
 
-    const second = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0 + 9 * MIN);
+    const second = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0 + 9 * MIN);
     expect(second.created).toBe(false);
     expect(second.id).toBe(first.id);
   });
 
   it("a 'failed' incident no longer suppresses 11 minutes after its terminal timestamp (past the 10-min re-arm)", async () => {
-    const first = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    const first = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
     await setStatus(env.DB, first.id, "failed", { ts: { field: "resolved_at", value: T0 } });
 
-    const second = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0 + 11 * MIN);
+    const second = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0 + 11 * MIN);
     expect(second.created).toBe(true);
     expect(second.id).not.toBe(first.id);
     expect(await countIncidents()).toBe(2);
   });
 
   it("batch-level dedupe: a new anomaly batch sharing even one fingerprint with a covering incident is folded in wholesale, not split", async () => {
-    const first = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors", service: "payments" })], T0);
+    const first = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors", service: "payments-api" })], T0);
 
     const secondBatch = [
-      mkAnomaly({ fingerprint: "payments:errors", service: "payments" }), // already covered
-      mkAnomaly({ fingerprint: "payments:latency", service: "payments", metricClass: "latency" }), // new
+      mkAnomaly({ fingerprint: "payments-api:errors", service: "payments-api" }), // already covered
+      mkAnomaly({ fingerprint: "payments-api:latency", service: "payments-api", metricClass: "latency" }), // new
     ];
     const second = await openIncident(env.DB, secondBatch, T0 + MIN);
     expect(second.created).toBe(false);
@@ -199,10 +199,10 @@ describe("openIncident", () => {
 
 describe("appendFingerprints", () => {
   it("INSERT OR IGNORE semantics: an already-tracked fingerprint keeps its original first_seen_ms and delivered flag", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
-    await markDelivered(env.DB, id, ["payments:errors"]);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
+    await markDelivered(env.DB, id, ["payments-api:errors"]);
 
-    await appendFingerprints(env.DB, id, [mkAnomaly({ fingerprint: "payments:errors" })], T0 + MIN);
+    await appendFingerprints(env.DB, id, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0 + MIN);
 
     const fps = await fingerprintRows(id);
     expect(fps).toHaveLength(1);
@@ -211,24 +211,24 @@ describe("appendFingerprints", () => {
   });
 
   it("a genuinely new fingerprint gets its own row with delivered_to_agent = 0 and first_seen_ms = nowMs", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
 
     await appendFingerprints(
       env.DB,
       id,
-      [mkAnomaly({ fingerprint: "payments:latency", service: "payments", metricClass: "latency" })],
+      [mkAnomaly({ fingerprint: "payments-api:latency", service: "payments-api", metricClass: "latency" })],
       T0 + MIN,
     );
 
     const fps = await fingerprintRows(id);
-    const latency = fps.find((f) => f.fingerprint === "payments:latency");
+    const latency = fps.find((f) => f.fingerprint === "payments-api:latency");
     expect(latency?.first_seen_ms).toBe(T0 + MIN);
     expect(latency?.delivered_to_agent).toBe(0);
   });
 
   it("appends to trigger_json's statements/anomalies audit trail", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
-    await appendFingerprints(env.DB, id, [mkAnomaly({ fingerprint: "payments:errors", value: 0.4 })], T0 + MIN);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
+    await appendFingerprints(env.DB, id, [mkAnomaly({ fingerprint: "payments-api:errors", value: 0.4 })], T0 + MIN);
 
     const row = await incidentRow(id);
     const trigger = JSON.parse(row?.trigger_json ?? "{}") as { statements: string[]; anomalies: Anomaly[] };
@@ -237,19 +237,19 @@ describe("appendFingerprints", () => {
   });
 
   it("is a no-op for an empty anomalies array", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
     await appendFingerprints(env.DB, id, [], T0 + MIN);
     expect(await fingerprintRows(id)).toHaveLength(1);
   });
 
   it("does not re-create health rows when appending onto a terminal (failed-within-re-arm) incident, but still records the anomaly", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
     await setStatus(env.DB, id, "failed", { ts: { field: "resolved_at", value: T0 + MIN } });
     // Simulate the terminal-transition cleanup autoResolve/forceFailStuck/the chaos reset perform.
     await env.DB.prepare("DELETE FROM meta WHERE key LIKE 'incident_health:%'").run();
 
     // Within the 10-min re-arm window the failed incident still covers -> the batch folds onto it.
-    await appendFingerprints(env.DB, id, [mkAnomaly({ fingerprint: "payments:errors" })], T0 + 2 * MIN);
+    await appendFingerprints(env.DB, id, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0 + 2 * MIN);
 
     const healthRows = await env.DB
       .prepare("SELECT count(*) as n FROM meta WHERE key LIKE 'incident_health:%'")
@@ -262,40 +262,40 @@ describe("appendFingerprints", () => {
   });
 
   it("does not double-track a fingerprint that belongs to a DIFFERENT, still-active incident when a batch spans two open incidents", async () => {
-    const incidentA = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors", service: "payments" })], T0);
+    const incidentA = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors", service: "payments-api" })], T0);
     const incidentB = await openIncident(
       env.DB,
-      [mkAnomaly({ fingerprint: "checkout:latency", service: "checkout", metricClass: "latency" })],
+      [mkAnomaly({ fingerprint: "checkout-edge:latency", service: "checkout-edge", metricClass: "latency" })],
       T0 + MIN,
     );
 
     // A single sweep tick's batch happens to span both unrelated incidents' fingerprints.
     const batch = [
-      mkAnomaly({ fingerprint: "payments:errors", service: "payments" }),
-      mkAnomaly({ fingerprint: "checkout:latency", service: "checkout", metricClass: "latency" }),
+      mkAnomaly({ fingerprint: "payments-api:errors", service: "payments-api" }),
+      mkAnomaly({ fingerprint: "checkout-edge:latency", service: "checkout-edge", metricClass: "latency" }),
     ];
     const { id: coveringId, created } = await openIncident(env.DB, batch, T0 + 2 * MIN);
     expect(created).toBe(false);
 
     await appendFingerprints(env.DB, coveringId, batch, T0 + 2 * MIN);
 
-    // payments:errors must stay tracked ONLY on incidentA; checkout:latency ONLY on incidentB --
+    // payments-api:errors must stay tracked ONLY on incidentA; checkout-edge:latency ONLY on incidentB --
     // neither incident should have picked up the other's fingerprint.
     const aFps = (await fingerprintRows(incidentA.id)).map((f) => f.fingerprint);
     const bFps = (await fingerprintRows(incidentB.id)).map((f) => f.fingerprint);
-    expect(aFps).toEqual(["payments:errors"]);
-    expect(bFps).toEqual(["checkout:latency"]);
+    expect(aFps).toEqual(["payments-api:errors"]);
+    expect(bFps).toEqual(["checkout-edge:latency"]);
   });
 });
 
 describe("undeliveredUpdates / markDelivered", () => {
   it("returns the fingerprint + latest statement for every undelivered fingerprint, and nothing once delivered", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors", value: 0.3 })], T0);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors", value: 0.3 })], T0);
 
     let undelivered = await undeliveredUpdates(env.DB, id);
     expect(undelivered).toHaveLength(1);
-    expect(undelivered[0]?.fingerprint).toBe("payments:errors");
-    expect(undelivered[0]?.statement).toContain("payments");
+    expect(undelivered[0]?.fingerprint).toBe("payments-api:errors");
+    expect(undelivered[0]?.statement).toContain("payments-api");
 
     await markDelivered(env.DB, id, [undelivered[0]?.fingerprint as string]);
     undelivered = await undeliveredUpdates(env.DB, id);
@@ -303,18 +303,18 @@ describe("undeliveredUpdates / markDelivered", () => {
   });
 
   it("a newly-appended fingerprint shows up as undelivered independently of an already-delivered one", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
-    await markDelivered(env.DB, id, ["payments:errors"]);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
+    await markDelivered(env.DB, id, ["payments-api:errors"]);
 
     await appendFingerprints(
       env.DB,
       id,
-      [mkAnomaly({ fingerprint: "payments:latency", service: "payments", metricClass: "latency", statement: "latency statement" })],
+      [mkAnomaly({ fingerprint: "payments-api:latency", service: "payments-api", metricClass: "latency", statement: "latency statement" })],
       T0 + MIN,
     );
 
     const undelivered = await undeliveredUpdates(env.DB, id);
-    expect(undelivered).toEqual([{ fingerprint: "payments:latency", statement: "latency statement" }]);
+    expect(undelivered).toEqual([{ fingerprint: "payments-api:latency", statement: "latency statement" }]);
   });
 
   it("returns [] for an unknown incident id", async () => {
@@ -353,7 +353,7 @@ describe("setStatus", () => {
 
 describe("autoResolve", () => {
   it("resolves an 'open' incident once every fingerprint has been healthy for 5 consecutive minutes", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
 
     await autoResolve(env.DB, T0 + 4 * MIN + 59_000); // just under 5 min -> not yet
     expect((await incidentRow(id))?.status).toBe("open");
@@ -365,7 +365,7 @@ describe("autoResolve", () => {
   });
 
   it("resolves a 'reported' incident the same way", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
     await setStatus(env.DB, id, "reported", { ts: { field: "reported_at", value: T0 + MIN } });
 
     await autoResolve(env.DB, T0 + 5 * MIN);
@@ -376,23 +376,23 @@ describe("autoResolve", () => {
     const { id } = await openIncident(
       env.DB,
       [
-        mkAnomaly({ fingerprint: "payments:errors", service: "payments" }),
-        mkAnomaly({ fingerprint: "checkout:errors", service: "checkout" }),
+        mkAnomaly({ fingerprint: "payments-api:errors", service: "payments-api" }),
+        mkAnomaly({ fingerprint: "checkout-edge:errors", service: "checkout-edge" }),
       ],
       T0,
     );
-    // payments:errors keeps re-firing (still anomalous); checkout:errors never fires again.
-    await appendFingerprints(env.DB, id, [mkAnomaly({ fingerprint: "payments:errors", service: "payments" })], T0 + 3 * MIN);
+    // payments-api:errors keeps re-firing (still anomalous); checkout-edge:errors never fires again.
+    await appendFingerprints(env.DB, id, [mkAnomaly({ fingerprint: "payments-api:errors", service: "payments-api" })], T0 + 3 * MIN);
 
-    await autoResolve(env.DB, T0 + 3 * MIN + 4 * MIN); // checkout:errors healthy 7min, payments:errors only 4min
+    await autoResolve(env.DB, T0 + 3 * MIN + 4 * MIN); // checkout-edge:errors healthy 7min, payments-api:errors only 4min
     expect((await incidentRow(id))?.status).toBe("open");
 
-    await autoResolve(env.DB, T0 + 3 * MIN + 5 * MIN); // now 5min since payments:errors too
+    await autoResolve(env.DB, T0 + 3 * MIN + 5 * MIN); // now 5min since payments-api:errors too
     expect((await incidentRow(id))?.status).toBe("resolved");
   });
 
   it("never touches an 'investigating' incident (it always runs to its report)", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
     await setStatus(env.DB, id, "investigating");
 
     await autoResolve(env.DB, T0 + 30 * MIN);
@@ -404,7 +404,7 @@ describe("autoResolve", () => {
   });
 
   it("clears the incident's incident_health meta rows once it resolves", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
 
     const before = await env.DB
       .prepare("SELECT count(*) as n FROM meta WHERE key LIKE 'incident_health:%'")
@@ -463,8 +463,8 @@ describe("forceFailStuck", () => {
   });
 
   it("does not touch incidents in other statuses", async () => {
-    const open = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
-    const reported = await openIncident(env.DB, [mkAnomaly({ fingerprint: "checkout:errors", service: "checkout" })], T0);
+    const open = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
+    const reported = await openIncident(env.DB, [mkAnomaly({ fingerprint: "checkout-edge:errors", service: "checkout-edge" })], T0);
     await setStatus(env.DB, reported.id, "reported", { ts: { field: "reported_at", value: T0 } });
 
     await forceFailStuck(env.DB, T0 + 60 * MIN);
@@ -473,7 +473,7 @@ describe("forceFailStuck", () => {
   });
 
   it("clears the incident's incident_health meta rows when it force-fails", async () => {
-    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments:errors" })], T0);
+    const { id } = await openIncident(env.DB, [mkAnomaly({ fingerprint: "payments-api:errors" })], T0);
     await setStatus(env.DB, id, "investigating");
 
     await forceFailStuck(env.DB, T0 + 6 * MIN + 1);

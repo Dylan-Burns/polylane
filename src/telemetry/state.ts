@@ -33,18 +33,21 @@ import { LAST_SWEEP_OK_META_KEY } from "../detect/sweep";
 import { MINUTE_MS } from "../sim/backfill";
 import type { FaultState } from "../sim/scenarios";
 import type { WorldStatus } from "../sim/simulator-do";
-import { EXTERNAL_SERVICE, FLOWS, SERVICES, type Step } from "../sim/topology";
+import { EXTERNAL_SERVICE, FLOWS, SERVICES, SERVICE_KIND, type ServiceKind, type Step } from "../sim/topology";
 import { latestRollupMinute, queryMetrics } from "./read";
 import { RETENTION_WATERMARK_META_KEY } from "./retention";
 
 // --- Topology ----------------------------------------------------------------------------------
 
-/** One node of the topology graph the UI renders — `external: true` marks `email-provider` (spec
+/** One node of the topology graph the UI renders — `external: true` marks `email-api` (spec
  * §6: emits no spans of its own, so it never appears in `health`/`sparklines`, only as an edge
  * target). Named `name` (not `service`) to match the task brief's exact shape,
- * `{name, ...}` alongside `edges`. */
+ * `{name, ...}` alongside `edges`. `kind` is the Cloudflare product type behind the service
+ * (`SERVICE_KIND`, `sim/topology.ts`) — threaded through so the UI can render a typed node card
+ * without hand-duplicating the service->kind mapping. */
 export interface TopologyServiceNode {
   name: string;
+  kind: ServiceKind;
   external?: boolean;
 }
 
@@ -62,10 +65,10 @@ const EDGE_KEY_SEP = "\u0000";
 
 /** Walks every `FLOWS` entry's call tree and records one `(parent.service, child.service)` edge per
  * parent/child pair whose services actually differ — a step whose child shares its own service
- * (e.g. `notifications.send_email` -> `notifications.render_template`) is an intra-service call, not
+ * (e.g. `notify.send_email` -> `notify.render_template`) is an intra-service call, not
  * a graph edge. Recursion covers every node regardless of whether an edge was recorded for it, so a
- * multi-level chain (gateway -> checkout -> payments -> payments-db) is fully walked, not just its
- * first hop. */
+ * multi-level chain (edge-gateway -> checkout-edge -> payments-api -> ledger-db) is fully walked, not
+ * just its first hop. */
 function collectServiceEdges(): Set<string> {
   const edges = new Set<string>();
   function walk(step: Step): void {
@@ -81,14 +84,15 @@ function collectServiceEdges(): Set<string> {
 }
 
 /**
- * The static service topology (spec §6's `gateway -> checkout -> payments -> payments-db` diagram,
- * plus `checkout -> notifications -> email-provider`), derived from `sim/topology.ts`'s `FLOWS`
- * call trees rather than hand-duplicated — a step added/removed there can never silently drift out
- * of sync with the UI's graph. `services` lists every internal service (`SERVICES`' own declared
- * order — a deliberate reading order: gateway first, its two direct dependents (checkout, catalog)
- * next, then their own dependents) plus `email-provider` last, flagged `external`. `edges` are
- * deduped and sorted alphabetically (unlike `services`) purely for a byte-stable JSON response
- * independent of `FLOWS`' own walk order.
+ * The static service topology (spec §6's `edge-gateway -> checkout-edge -> payments-api ->
+ * ledger-db` diagram, plus `checkout-edge -> notify -> email-api`), derived from `sim/topology.ts`'s
+ * `FLOWS` call trees rather than hand-duplicated — a step added/removed there can never silently
+ * drift out of sync with the UI's graph. `services` lists every internal service (`SERVICES`' own
+ * declared order — a deliberate reading order: edge-gateway first, its two direct dependents
+ * (checkout-edge, catalog-kv) next, then their own dependents) plus `email-api` last, flagged
+ * `external`, each carrying its Cloudflare-product `kind` (`SERVICE_KIND`). `edges` are deduped and
+ * sorted alphabetically (unlike `services`) purely for a byte-stable JSON response independent of
+ * `FLOWS`' own walk order.
  */
 export function buildTopology(): TopologyPayload {
   const edgeSet = collectServiceEdges();
@@ -99,9 +103,12 @@ export function buildTopology(): TopologyPayload {
     })
     .sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
 
+  // `SERVICE_KIND` is declared to cover all seven service names (`sim/topology.ts`'s doc comment),
+  // so the lookup is infallible here even under `noUncheckedIndexedAccess`; the `!` documents that
+  // invariant rather than papering over a real possibility of `undefined`.
   const services: TopologyServiceNode[] = [
-    ...SERVICES.map((name): TopologyServiceNode => ({ name })),
-    { name: EXTERNAL_SERVICE, external: true },
+    ...SERVICES.map((name): TopologyServiceNode => ({ name, kind: SERVICE_KIND[name]! })),
+    { name: EXTERNAL_SERVICE, kind: SERVICE_KIND[EXTERNAL_SERVICE]!, external: true },
   ];
 
   return { services, edges };

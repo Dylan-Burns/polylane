@@ -13,7 +13,7 @@
  *
  * Grading semantics: `must` groups are ANY-of-within, ALL-of-across, matched case-insensitively
  * over `summary + root_cause.hypothesis + root_cause.mechanism`. `mustNotBlame` matches over the
- * root_cause fields ONLY — a correct report may legitimately mention the red-herring catalog
+ * root_cause fields ONLY — a correct report may legitimately mention the red-herring catalog-kv
  * deploy or an impacted service by name while ruling it out; what it must not do is *attribute
  * the cause* to it. The rubric itself lives in `grade.ts` (unit-tested with real report fixtures).
  */

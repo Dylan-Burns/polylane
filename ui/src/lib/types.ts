@@ -23,9 +23,14 @@ export type { FaultState, IncidentView, LogLine, PublicDeploy, ScenarioId, Span,
 
 export type HealthStatus = "red" | "amber" | "green";
 
+/** Mirrors `src/sim/topology.ts`'s `ServiceKind` (not imported directly — see this file's header
+ * comment on why D1-typed server modules are hand-mirrored instead). */
+export type ServiceKind = "worker" | "d1" | "kv" | "queue" | "external";
+
 export interface TopologyServiceNode {
   name: string;
   external?: boolean;
+  kind: ServiceKind;
 }
 
 export interface TopologyPayload {

@@ -78,16 +78,16 @@ function parseToolResult(block: ContentBlockParam): unknown {
 }
 
 const GOOD_REPORT = {
-  summary: "Bad deploy caused checkout errors.",
-  timeline: [{ time: "14:32Z", description: "checkout error_rate spiked" }],
-  root_cause: { hypothesis: "connection pool exhaustion", mechanism: "payments pool saturated" },
-  evidence: [{ description: "error_rate 22% vs baseline", trace_id: null, metric: "checkout error_rate", log_excerpt: null }],
-  blast_radius: { affected_services: ["checkout"], customer_impact: "~5% of checkouts failed" },
+  summary: "Bad deploy caused checkout-edge errors.",
+  timeline: [{ time: "14:32Z", description: "checkout-edge error_rate spiked" }],
+  root_cause: { hypothesis: "D1 queued-query saturation", mechanism: "payments-api queries backed up against ledger-db" },
+  evidence: [{ description: "error_rate 22% vs baseline", trace_id: null, metric: "checkout-edge error_rate", log_excerpt: null }],
+  blast_radius: { affected_services: ["checkout-edge"], customer_impact: "~5% of checkouts failed" },
   confidence: { level: "high", why: "reproduced in a single trace" },
-  suggested_action: "roll back the payments SDK bump",
+  suggested_action: "roll back the payments-api Worker deploy",
 };
 
-const INITIAL_MESSAGES: MessageParam[] = [userText("checkout error_rate 22% vs baseline 0.4% since 14:32Z")];
+const INITIAL_MESSAGES: MessageParam[] = [userText("checkout-edge error_rate 22% vs baseline 0.4% since 14:32Z")];
 
 function baseCaps() {
   return { maxSteps: 15, maxWallMs: 4 * 60 * MIN, maxTokensIn: 200_000, maxTokensOut: 16_000 };
@@ -141,13 +141,13 @@ describe("runLoop", () => {
   it("[1] happy path: 3 steps -> submit_report; assistant content echoed verbatim; cache_control breakpoints exact and non-duplicated", async () => {
     const r1 = makeMessage({
       content: [
-        thinking("checking checkout metrics", "sig-1"),
-        toolUse("call-1", "query_metrics", { service: "checkout", operation: null, metrics: null, window: { from: "-30m", to: null }, step: null }),
+        thinking("checking checkout-edge metrics", "sig-1"),
+        toolUse("call-1", "query_metrics", { service: "checkout-edge", operation: null, metrics: null, window: { from: "-30m", to: null }, step: null }),
       ],
       stop_reason: "tool_use",
     });
     const r2 = makeMessage({
-      content: [toolUse("call-2", "search_logs", { service: "checkout", level: "error", contains: null, window: { from: "-30m", to: null }, limit: null })],
+      content: [toolUse("call-2", "search_logs", { service: "checkout-edge", level: "error", contains: null, window: { from: "-30m", to: null }, limit: null })],
       stop_reason: "tool_use",
     });
     const r3 = makeMessage({
@@ -255,8 +255,8 @@ describe("runLoop", () => {
   it("[2a] parallel turn with TWO tool_use blocks -> exactly one following user message with two matching tool_results", async () => {
     const r1 = makeMessage({
       content: [
-        toolUse("par-1", "query_metrics", { service: "checkout", operation: null, metrics: null, window: null, step: null }),
-        toolUse("par-2", "search_logs", { service: "checkout", level: "error", contains: null, window: null, limit: null }),
+        toolUse("par-1", "query_metrics", { service: "checkout-edge", operation: null, metrics: null, window: null, step: null }),
+        toolUse("par-2", "search_logs", { service: "checkout-edge", level: "error", contains: null, window: null, limit: null }),
       ],
       stop_reason: "tool_use",
     });
@@ -478,7 +478,7 @@ describe("runLoop", () => {
   });
 
   it("[5] duplicate-call nudge: 3rd identical call gets synthetic error nudge; 4th (ignored) forces salvage, not infinite", async () => {
-    const sameInput = { service: "checkout", level: "error" as const, contains: null, window: { from: "2026-01-05T13:30:00.000Z", to: "2026-01-05T14:00:00.000Z" }, limit: null };
+    const sameInput = { service: "checkout-edge", level: "error" as const, contains: null, window: { from: "2026-01-05T13:30:00.000Z", to: "2026-01-05T14:00:00.000Z" }, limit: null };
     const r1 = makeMessage({ content: [toolUse("c1", "search_logs", sameInput)], stop_reason: "tool_use" });
     const r2 = makeMessage({ content: [toolUse("c2", "search_logs", sameInput)], stop_reason: "tool_use" });
     const r3 = makeMessage({ content: [toolUse("c3", "search_logs", sameInput)], stop_reason: "tool_use" });
@@ -531,7 +531,7 @@ describe("runLoop", () => {
       submitReportTool: SUBMIT_REPORT,
       checkUpdates: async () => {
         checkCalls += 1;
-        return checkCalls === 2 ? "checkout p95 now 9x baseline" : null;
+        return checkCalls === 2 ? "checkout-edge p95 now 9x baseline" : null;
       },
       nowFn: () => NOW0,
     };
@@ -547,9 +547,9 @@ describe("runLoop", () => {
     const req1Messages = llm.requests[1]?.messages ?? [];
     const lastMsg = req1Messages[req1Messages.length - 1];
     expect(lastMsg?.role).toBe("user");
-    expect(((lastMsg?.content as ContentBlockParam[])[0] as { text: string }).text).toBe("detector update: checkout p95 now 9x baseline");
+    expect(((lastMsg?.content as ContentBlockParam[])[0] as { text: string }).text).toBe("detector update: checkout-edge p95 now 9x baseline");
 
-    expect(result.steps.some((s) => s.kind === "note" && (s.content as { update: string }).update === "checkout p95 now 9x baseline")).toBe(true);
+    expect(result.steps.some((s) => s.kind === "note" && (s.content as { update: string }).update === "checkout-edge p95 now 9x baseline")).toBe(true);
   });
 
   it("[6b] shouldAbort true at an iteration top -> outcome failed with an 'aborted' error step, NO salvage call", async () => {
@@ -584,7 +584,7 @@ describe("runLoop", () => {
   });
 
   it("[7] chat mode (no submitReportTool): end_turn with text -> outcome text", async () => {
-    const r1 = makeMessage({ content: [text("The checkout error rate returned to baseline at 14:45Z.")], stop_reason: "end_turn" });
+    const r1 = makeMessage({ content: [text("The checkout-edge error rate returned to baseline at 14:45Z.")], stop_reason: "end_turn" });
     const llm = scriptedLLM([r1]);
 
     const cfg: LoopConfig = {
@@ -601,7 +601,7 @@ describe("runLoop", () => {
     const result = await runLoop(cfg, INITIAL_MESSAGES);
 
     expect(result.outcome).toBe("text");
-    expect(result.text).toBe("The checkout error rate returned to baseline at 14:45Z.");
+    expect(result.text).toBe("The checkout-edge error rate returned to baseline at 14:45Z.");
     expect(llm.requests).toHaveLength(1); // no salvage attempted without a submit_report tool
     expect(llm.requests[0]?.tools?.map((t) => t.name)).toEqual(TOOLS.map((t) => t.name));
   });

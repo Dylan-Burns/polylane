@@ -32,7 +32,7 @@ function makeSpan(i: number): Span {
     trace_id: `pre-existing-trace-${i}`,
     span_id: `pre-existing-span-${i}`,
     parent_span_id: null,
-    service: "checkout",
+    service: "checkout-edge",
     operation: "place_order",
     start_ms: 1_700_000_000_000 + i,
     duration_ms: 10,
@@ -138,14 +138,14 @@ describe("SimulatorDO fault/restore", () => {
     expect(await secondRes.json()).toEqual({ error: "scenario_active" });
 
     // Advance well past the 30s onset with a wide (5min) window so pool-exhaustion errors are
-    // all but certain to appear (25% error rate on payments once active).
+    // all but certain to appear (25% error rate on payments-api once active).
     await runInDurableObject(stub, async (instance) => {
       instance.setTestNow(PEAK_HOUR_T0 + 5 * MINUTE_MS);
       await instance.alarm();
     });
 
     const faultedErrors = await env.DB.prepare(
-      "SELECT count(*) as n FROM spans WHERE service = 'payments' AND error_type = 'pool_exhausted'",
+      "SELECT count(*) as n FROM spans WHERE service = 'payments-api' AND error_type = 'pool_exhausted'",
     ).first<{ n: number }>();
     expect(faultedErrors?.n).toBeGreaterThan(0);
 
@@ -164,7 +164,7 @@ describe("SimulatorDO fault/restore", () => {
     });
 
     const postRestoreErrors = await env.DB.prepare(
-      "SELECT count(*) as n FROM spans WHERE service = 'payments' AND error_type = 'pool_exhausted' AND start_ms >= ?",
+      "SELECT count(*) as n FROM spans WHERE service = 'payments-api' AND error_type = 'pool_exhausted' AND start_ms >= ?",
     )
       .bind(restoreTickStart)
       .first<{ n: number }>();

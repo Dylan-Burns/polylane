@@ -12,7 +12,7 @@ import { ASYNC_STEP_KEYS, ERROR_LOG_MESSAGES, EXTERNAL_SERVICE, FLOWS, stepKey, 
 
 /** Effects a fault scenario (or the chaos panel) layers onto the baseline generation model. */
 export interface FaultEffects {
-  /** Per-service latency multiplier (e.g. payments x6 during a bad deploy). Missing => 1x. */
+  /** Per-service latency multiplier (e.g. payments-api x6 during a bad deploy). Missing => 1x. */
   latencyMult: Map<string, number>;
   /** Per-service error-rate override, replacing the step's baseline `errorRate` when present. */
   errorRateOverride: Map<string, { rate: number; errorType: string; logMessage: string }>;

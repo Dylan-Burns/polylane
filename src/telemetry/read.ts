@@ -457,7 +457,7 @@ function isCollapsedMarker(span: Span): boolean {
  * under it. Pathological marker saturation like that has no cap-enforcement lever left; it is
  * flagged here rather than silently ignored.
  *
- * Domain caveat this must NOT "fix": async spans (the notifications fire-and-forget subtree, per
+ * Domain caveat this must NOT "fix": async spans (the notify fire-and-forget subtree, per
  * `generator.ts`'s `ASYNC_STEP_KEYS` branch) may legitimately end *after* their parent ends — the
  * parent doesn't wait for them. Nothing below assumes end_ms <= parent's end_ms, orders siblings
  * by wall-clock overlap, or otherwise treats that as malformed; span identity is entirely

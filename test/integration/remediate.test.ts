@@ -37,8 +37,8 @@ async function seedIncident(id: string, status: string, reportJson: string | nul
 
 /** A report body shaped like a real submitted report's remediation-relevant slice. */
 const REPORT_JSON = JSON.stringify({
-  root_cause: "payments v2.4.1 deploy",
-  suggested_action: "roll back payments to v2.4.0",
+  root_cause: "payments-api v2.4.1 deploy",
+  suggested_action: "roll back payments-api to v2.4.0",
 });
 
 afterEach(async () => {
@@ -109,7 +109,7 @@ describe("POST /api/incidents/:id/remediate", () => {
     expect(step?.kind).toBe("note");
     expect(step?.step_no).toBe(1);
     expect(step?.content_json).toContain("Remediation approved by operator");
-    expect(step?.content_json).toContain("roll back payments to v2.4.0");
+    expect(step?.content_json).toContain("roll back payments-api to v2.4.0");
   });
 
   it("409s a stale approval: the active fault started AFTER this incident opened, so it isn't this report's fault", async () => {

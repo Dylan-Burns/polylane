@@ -126,7 +126,7 @@ afterEach(async () => {
 
 describe("runSweep: bad-deploy end-to-end", () => {
   it(
-    "opens exactly one critical incident with a payments fingerprint and exactly one INVESTIGATOR /start call across two sweeps",
+    "opens exactly one critical incident with a payments-api fingerprint and exactly one INVESTIGATOR /start call across two sweeps",
     async () => {
       await insertHealthyHistory(env.DB, ANCHOR, DAY_MIN);
       await computeBaselines(env.DB, ANCHOR);
@@ -164,7 +164,7 @@ describe("runSweep: bad-deploy end-to-end", () => {
         .bind(incident.id)
         .all<{ fingerprint: string }>();
       const fingerprints = (fpRows.results ?? []).map((r) => r.fingerprint);
-      expect(fingerprints.some((f) => f === "payments:errors" || f === "payments:latency")).toBe(true);
+      expect(fingerprints.some((f) => f === "payments-api:errors" || f === "payments-api:latency")).toBe(true);
 
       expect(started).toHaveLength(1);
       expect(started[0]?.incidentId).toBe(incident.id);
@@ -434,8 +434,8 @@ describe("runSweep: last-sweep-ok watermark", () => {
 describe("runSweep: batch spanning two concurrently-open incidents (review FIX 1 regression)", () => {
   function mkAnomaly(overrides: Partial<Anomaly>): Anomaly {
     return {
-      fingerprint: "payments:errors",
-      service: "payments",
+      fingerprint: "payments-api:errors",
+      service: "payments-api",
       metricClass: "errors",
       rule: "hard",
       value: 0.5,
@@ -452,26 +452,26 @@ describe("runSweep: batch spanning two concurrently-open incidents (review FIX 1
     const BASE = Date.UTC(2026, 0, 21, 10, 0, 0);
     const T0 = BASE + ((15 - (Math.floor(BASE / MIN) % 15)) % 15) * MIN;
 
-    // Baselines: only checkout latency rows (p95 + p50), inserted directly with known medians so
-    // the checkout:latency hard rule fires deterministically. payments:errors needs NO baseline
+    // Baselines: only checkout-edge latency rows (p95 + p50), inserted directly with known medians so
+    // the checkout-edge:latency hard rule fires deterministically. payments-api:errors needs NO baseline
     // row at all (the missing-baseline fallback is the absolute 25% floor), and with no req_rate
     // rows anywhere the traffic rules stay silent -- so evaluate() yields EXACTLY
-    // [checkout:latency, payments:errors] each minute.
+    // [checkout-edge:latency, payments-api:errors] each minute.
     await env.DB.batch([
       env.DB
-        .prepare("REPLACE INTO baselines (service, operation, metric, median, mad, computed_at) VALUES ('checkout', 'place_order', 'p95', 100, 10, ?)")
+        .prepare("REPLACE INTO baselines (service, operation, metric, median, mad, computed_at) VALUES ('checkout-edge', 'place_order', 'p95', 100, 10, ?)")
         .bind(T0),
       env.DB
-        .prepare("REPLACE INTO baselines (service, operation, metric, median, mad, computed_at) VALUES ('checkout', 'place_order', 'p50', 20, 2, ?)")
+        .prepare("REPLACE INTO baselines (service, operation, metric, median, mad, computed_at) VALUES ('checkout-edge', 'place_order', 'p50', 20, 2, ?)")
         .bind(T0),
     ]);
 
-    // Two distinct incidents already open BEFORE the sweeps: A on payments:errors, B on
-    // checkout:latency -- the reviewer's exact scenario (a residual FP + a real fault, both open).
+    // Two distinct incidents already open BEFORE the sweeps: A on payments-api:errors, B on
+    // checkout-edge:latency -- the reviewer's exact scenario (a residual FP + a real fault, both open).
     const incidentA = await openIncident(env.DB, [mkAnomaly({})], T0 - 3 * MIN);
     const incidentB = await openIncident(
       env.DB,
-      [mkAnomaly({ fingerprint: "checkout:latency", service: "checkout", metricClass: "latency", value: 800, baseline: 100 })],
+      [mkAnomaly({ fingerprint: "checkout-edge:latency", service: "checkout-edge", metricClass: "latency", value: 800, baseline: 100 })],
       T0 - 2 * MIN,
     );
     expect(incidentA.created).toBe(true);
@@ -481,10 +481,10 @@ describe("runSweep: batch spanning two concurrently-open incidents (review FIX 1
     // minutes T0 .. T0+5 (minute0 of the sweep at T0+m is the minute starting at T0+(m-1)).
     const rows: RollupRow[] = [];
     for (let m = 0; m < 6; m++) {
-      // payments errors hard trip: rate 0.5 >= max(25%, --) with 20 errors >= 3.
-      rows.push({ service: "payments", operation: "charge", minute_ts: T0 + m * MIN, count: 40, error_count: 20, p50_ms: 25, p95_ms: 60, p99_ms: 80 });
-      // checkout latency hard trip: p95 8x baseline (>= 4x), p50 10x baseline (>= 2x), count >= 5.
-      rows.push({ service: "checkout", operation: "place_order", minute_ts: T0 + m * MIN, count: 40, error_count: 0, p50_ms: 200, p95_ms: 800, p99_ms: 900 });
+      // payments-api errors hard trip: rate 0.5 >= max(25%, --) with 20 errors >= 3.
+      rows.push({ service: "payments-api", operation: "charge", minute_ts: T0 + m * MIN, count: 40, error_count: 20, p50_ms: 25, p95_ms: 60, p99_ms: 80 });
+      // checkout-edge latency hard trip: p95 8x baseline (>= 4x), p50 10x baseline (>= 2x), count >= 5.
+      rows.push({ service: "checkout-edge", operation: "place_order", minute_ts: T0 + m * MIN, count: 40, error_count: 0, p50_ms: 200, p95_ms: 800, p99_ms: 900 });
     }
     await insertRollups(env.DB, rows);
 
@@ -514,7 +514,7 @@ describe("runSweep: batch spanning two concurrently-open incidents (review FIX 1
     expect(statusById.get(incidentA.id)).toBe("open");
     expect(statusById.get(incidentB.id)).toBe("open");
 
-    // Fingerprint attribution stayed put: payments:errors ONLY on A, checkout:latency ONLY on B.
+    // Fingerprint attribution stayed put: payments-api:errors ONLY on A, checkout-edge:latency ONLY on B.
     const fpRows = await env.DB
       .prepare("SELECT incident_id, fingerprint FROM incident_fingerprints ORDER BY incident_id, fingerprint")
       .all<{ incident_id: string; fingerprint: string }>();
@@ -524,15 +524,15 @@ describe("runSweep: batch spanning two concurrently-open incidents (review FIX 1
       if (arr) arr.push(row.fingerprint);
       else byIncident.set(row.incident_id, [row.fingerprint]);
     }
-    expect(byIncident.get(incidentA.id)).toEqual(["payments:errors"]);
-    expect(byIncident.get(incidentB.id)).toEqual(["checkout:latency"]);
+    expect(byIncident.get(incidentA.id)).toEqual(["payments-api:errors"]);
+    expect(byIncident.get(incidentB.id)).toEqual(["checkout-edge:latency"]);
 
     // Both health clocks read the LAST sweep's timestamp -- direct evidence the refresh decoupled
     // from the fold decision (pre-fix, one of these would still read its open-time stamp).
     const lastSweepMs = String(T0 + 6 * MIN);
     for (const [incidentId, fingerprint] of [
-      [incidentA.id, "payments:errors"],
-      [incidentB.id, "checkout:latency"],
+      [incidentA.id, "payments-api:errors"],
+      [incidentB.id, "checkout-edge:latency"],
     ] as const) {
       const healthRow = await env.DB
         .prepare("SELECT value FROM meta WHERE key = ?")

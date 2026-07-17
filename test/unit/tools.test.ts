@@ -87,45 +87,49 @@ const CTX = { db: env.DB, nowMs: T0 + 30 * MIN };
 
 async function seedFixture(): Promise<void> {
   const rollups: RollupRow[] = [
-    { service: "checkout", operation: "POST /checkout", minute_ts: T0, count: 100, error_count: 5, p50_ms: 40, p95_ms: 150, p99_ms: 250 },
-    { service: "payments", operation: "charge", minute_ts: T0, count: 80, error_count: 1, p50_ms: 30, p95_ms: 90, p99_ms: 140 },
+    { service: "checkout-edge", operation: "POST /checkout", minute_ts: T0, count: 100, error_count: 5, p50_ms: 40, p95_ms: 150, p99_ms: 250 },
+    { service: "payments-api", operation: "charge", minute_ts: T0, count: 80, error_count: 1, p50_ms: 30, p95_ms: 90, p99_ms: 140 },
   ];
   await insertRollups(env.DB, rollups);
 
   await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO baselines (service, operation, metric, median, mad, computed_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).bind("checkout", "POST /checkout", "req_rate", 50, 10, T0),
+    ).bind("checkout-edge", "POST /checkout", "req_rate", 50, 10, T0),
     env.DB.prepare(
       "INSERT INTO baselines (service, operation, metric, median, mad, computed_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).bind("checkout", "POST /checkout", "error_rate", 0.025, 0.01, T0),
+    ).bind("checkout-edge", "POST /checkout", "error_rate", 0.025, 0.01, T0),
     env.DB.prepare(
       "INSERT INTO baselines (service, operation, metric, median, mad, computed_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).bind("checkout", "POST /checkout", "p95", 10, 2, T0),
+    ).bind("checkout-edge", "POST /checkout", "p95", 10, 2, T0),
   ]);
 
-  // A small error-cascade trace (round-trips find_traces + get_trace + search_logs).
+  // A small error-cascade trace (round-trips find_traces + get_trace + search_logs). Narrates a
+  // bad-deploy-flavored regression: the payments-api Worker's own charge span fails with the
+  // D1 queued-query saturation symptom (ledger-db's established phrasing surfaces on the
+  // caller's span, per scenarios.ts's establishedLogMessage), which edge-gateway observes as a
+  // downstream failure on its own POST /checkout span.
   const cascadeStart = T0 + 5 * MIN;
   const cascadeSpans: Span[] = [
-    { trace_id: "trace-cascade", span_id: "root", parent_span_id: null, service: "gateway", operation: "POST /checkout", start_ms: cascadeStart, duration_ms: 800, status: "error", error_type: "downstream" },
-    { trace_id: "trace-cascade", span_id: "payments", parent_span_id: "root", service: "payments", operation: "charge", start_ms: cascadeStart + 10, duration_ms: 700, status: "error", error_type: "pool_exhausted" },
+    { trace_id: "trace-cascade", span_id: "root", parent_span_id: null, service: "edge-gateway", operation: "POST /checkout", start_ms: cascadeStart, duration_ms: 800, status: "error", error_type: "downstream" },
+    { trace_id: "trace-cascade", span_id: "payments-api", parent_span_id: "root", service: "payments-api", operation: "charge", start_ms: cascadeStart + 10, duration_ms: 700, status: "error", error_type: "pool_exhausted" },
   ];
   const cascadeLogs: LogLine[] = [
-    { ts_ms: cascadeStart + 10 + 700, service: "payments", level: "error", message: "connection pool exhausted: 25/25 in use", trace_id: "trace-cascade", span_id: "payments" },
+    { ts_ms: cascadeStart + 10 + 700, service: "payments-api", level: "error", message: "D1_ERROR: too many queued queries — 25 in flight, acquire timed out after 5000ms", trace_id: "trace-cascade", span_id: "payments-api" },
   ];
 
   // A 90-span trace built to exceed get_trace's 40-span cap (mirrors Task 2.1's fixture shape),
   // so the "oversized ask -> truncated: true passthrough" test has something to exercise.
   const capStart = T0 + 10 * MIN;
   const capSpans: Span[] = [
-    { trace_id: "trace-cap", span_id: "cap-root", parent_span_id: null, service: "gateway", operation: "GET /catalog", start_ms: capStart, duration_ms: 900, status: "error", error_type: "downstream" },
+    { trace_id: "trace-cap", span_id: "cap-root", parent_span_id: null, service: "edge-gateway", operation: "GET /catalog", start_ms: capStart, duration_ms: 900, status: "error", error_type: "downstream" },
   ];
   for (let i = 0; i < 89; i++) {
     capSpans.push({
       trace_id: "trace-cap",
       span_id: `cap-leaf-${i}`,
       parent_span_id: "cap-root",
-      service: "catalog",
+      service: "catalog-kv",
       operation: "list_items",
       start_ms: capStart + 1 + i,
       duration_ms: 20,
@@ -139,16 +143,16 @@ async function seedFixture(): Promise<void> {
 
   const noiseLogs: LogLine[] = Array.from({ length: 60 }, (_, i) => ({
     ts_ms: T0 + i * 1_000,
-    service: "catalog",
+    service: "catalog-kv",
     level: "info" as const,
     message: `noise log ${i}`,
   }));
   await insertLogs(env.DB, [...cascadeLogs, ...noiseLogs]);
 
-  await insertDeploy(env.DB, { id: "deploy-1", service: "payments", version: "v2.4.1", ts_ms: T0 + 1 * MIN, note: "bump payment provider SDK" });
+  await insertDeploy(env.DB, { id: "deploy-1", service: "payments-api", version: "v2.4.1", ts_ms: T0 + 1 * MIN, note: "routine release" });
 
-  const trigger = { statement: "checkout error_rate 22% vs baseline", fingerprints: ["checkout:errors"] };
-  const report = { summary: "Bad deploy caused checkout errors." };
+  const trigger = { statement: "checkout-edge error_rate 22% vs baseline", fingerprints: ["checkout-edge:errors"] };
+  const report = { summary: "Bad Worker deploy caused checkout-edge errors." };
   await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO incidents (id, status, severity, opened_at, reported_at, resolved_at, trigger_json, report_json, follow_up_of) VALUES (?, 'resolved', 'critical', ?, ?, ?, ?, ?, NULL)",
@@ -157,7 +161,7 @@ async function seedFixture(): Promise<void> {
   await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES (?, ?, ?, ?)",
-    ).bind("incident-1", "checkout:errors", T0 + 1 * MIN, 1),
+    ).bind("incident-1", "checkout-edge:errors", T0 + 1 * MIN, 1),
   ]);
 }
 
@@ -302,15 +306,15 @@ describe("SUBMIT_REPORT", () => {
   });
 
   const goodReport = {
-    summary: "Bad deploy caused checkout errors.",
-    timeline: [{ time: "14:32Z", description: "checkout error_rate spiked" }],
-    root_cause: { hypothesis: "connection pool exhaustion", mechanism: "payments pool saturated under load" },
+    summary: "Bad Worker deploy caused checkout-edge errors.",
+    timeline: [{ time: "14:32Z", description: "checkout-edge error_rate spiked" }],
+    root_cause: { hypothesis: "D1 queued-query saturation on ledger-db", mechanism: "payments-api's ledger-db queries queued up and timed out under load" },
     evidence: [
-      { description: "error_rate 22% vs baseline 0.4%", trace_id: "trace-cascade", metric: "checkout error_rate", log_excerpt: null },
+      { description: "error_rate 22% vs baseline 0.4%", trace_id: "trace-cascade", metric: "checkout-edge error_rate", log_excerpt: null },
     ],
-    blast_radius: { affected_services: ["checkout", "payments"], customer_impact: "~5% of checkouts failed for 12 minutes" },
-    confidence: { level: "high", why: "reproduced in a single trace and confirmed by pool-exhaustion logs" },
-    suggested_action: "roll back the payments SDK bump",
+    blast_radius: { affected_services: ["checkout-edge", "payments-api"], customer_impact: "~5% of checkouts failed for 12 minutes" },
+    confidence: { level: "high", why: "reproduced in a single trace and confirmed by D1 queued-query saturation logs" },
+    suggested_action: "roll back the payments-api Worker deploy",
   };
 
   it("validates a well-formed report object", () => {
@@ -350,19 +354,19 @@ describe("executeTool", () => {
   it("query_metrics round-trips with baseline/delta attached", async () => {
     const result = (await executeTool(
       "query_metrics",
-      { service: "checkout", operation: null, metrics: null, window: { from: "-30m", to: null }, step: null },
+      { service: "checkout-edge", operation: null, metrics: null, window: { from: "-30m", to: null }, step: null },
       CTX,
     )) as { points: Array<{ service: string; delta?: Record<string, number> }>; count: number };
 
     expect(result.count).toBe(1);
-    expect(result.points[0]?.service).toBe("checkout");
+    expect(result.points[0]?.service).toBe("checkout-edge");
     expect(result.points[0]?.delta).toEqual({ req_rate: 2, error_rate: 2, p95: 15 });
   });
 
   it("query_metrics `metrics` narrows the baseline/delta overlay without touching raw values", async () => {
     const result = (await executeTool(
       "query_metrics",
-      { service: "checkout", operation: null, metrics: ["p95"], window: { from: "-30m", to: null }, step: null },
+      { service: "checkout-edge", operation: null, metrics: ["p95"], window: { from: "-30m", to: null }, step: null },
       CTX,
     )) as { points: Array<{ p50: number; delta?: Record<string, number> }> };
 
@@ -374,7 +378,7 @@ describe("executeTool", () => {
   it("search_logs round-trips a contains filter with trace linkage and an exact total", async () => {
     const result = (await executeTool(
       "search_logs",
-      { service: null, level: "error", contains: "pool exhausted", window: { from: "-30m", to: null }, limit: null },
+      { service: null, level: "error", contains: "queued queries", window: { from: "-30m", to: null }, limit: null },
       CTX,
     )) as { logs: Array<{ trace_id?: string }>; count: number; total: number; truncated: boolean; note?: string };
 
@@ -388,7 +392,7 @@ describe("executeTool", () => {
   it("search_logs clamps an oversized limit and reports exact truncation with a showing-N-of-M note", async () => {
     const result = (await executeTool(
       "search_logs",
-      { service: "catalog", level: "info", contains: null, window: { from: "-30m", to: null }, limit: 1000 },
+      { service: "catalog-kv", level: "info", contains: null, window: { from: "-30m", to: null }, limit: 1000 },
       CTX,
     )) as { logs: unknown[]; count: number; total: number; truncated: boolean; note?: string };
 
@@ -401,7 +405,7 @@ describe("executeTool", () => {
   it("search_logs with count exactly at the caller's limit is NOT truncated when total matches (old heuristic's false positive)", async () => {
     const result = (await executeTool(
       "search_logs",
-      { service: null, level: "error", contains: "pool exhausted", window: { from: "-30m", to: null }, limit: 1 },
+      { service: null, level: "error", contains: "queued queries", window: { from: "-30m", to: null }, limit: 1 },
       CTX,
     )) as { count: number; total: number; truncated: boolean };
 
@@ -468,7 +472,7 @@ describe("executeTool", () => {
       count: number;
     };
     expect(result.count).toBe(1);
-    expect(result.deploys.map((d) => `${d.service}@${d.version}`)).toEqual(["payments@v2.4.1"]);
+    expect(result.deploys.map((d) => `${d.service}@${d.version}`)).toEqual(["payments-api@v2.4.1"]);
     // Deploy ids embed the scenario name (`deploy-<scenario>-…`) — exposing one would hand the
     // agent the injected fault's name, defeating the simulation honesty boundary.
     expect(result.deploys[0]).not.toHaveProperty("id");
@@ -480,7 +484,7 @@ describe("executeTool", () => {
     };
     expect(result.incidents).toHaveLength(1);
     expect(result.incidents[0]?.id).toBe("incident-1");
-    expect(result.incidents[0]?.report).toEqual({ summary: "Bad deploy caused checkout errors." });
+    expect(result.incidents[0]?.report).toEqual({ summary: "Bad Worker deploy caused checkout-edge errors." });
   });
 
   it("get_incidents by window returns matching incidents newest first", async () => {

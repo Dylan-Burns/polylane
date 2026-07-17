@@ -40,35 +40,35 @@ describe("effectsFor", () => {
       expect(effects).toEqual(identityEffects());
     });
 
-    it("applies payments latency x6 + 25% pool-exhaustion errors at t=2min (after onset)", () => {
+    it("applies payments-api latency x6 + 25% pool-exhaustion errors at t=2min (after onset)", () => {
       const effects = effectsFor(fault, START + 2 * MIN);
-      expect(effects.latencyMult.get("payments")).toBe(6);
-      expect(effects.errorRateOverride.get("payments")).toEqual({
+      expect(effects.latencyMult.get("payments-api")).toBe(6);
+      expect(effects.errorRateOverride.get("payments-api")).toEqual({
         rate: 0.25,
         errorType: "pool_exhausted",
-        logMessage: "connection pool exhausted: 25/25 in use, acquire timeout 5000ms",
+        logMessage: "D1_ERROR: too many queued queries — 25 in flight, acquire timed out after 5000ms",
       });
       expect(effects.trafficMult).toBe(1);
 
-      // The checkout-timeout / gateway-5xx cascade must come free from generator propagation —
-      // no explicit overrides on payments-db, checkout, or gateway.
-      expect(effects.latencyMult.has("payments-db")).toBe(false);
-      expect(effects.latencyMult.has("checkout")).toBe(false);
-      expect(effects.latencyMult.has("gateway")).toBe(false);
-      expect(effects.errorRateOverride.has("payments-db")).toBe(false);
-      expect(effects.errorRateOverride.has("checkout")).toBe(false);
-      expect(effects.errorRateOverride.has("gateway")).toBe(false);
+      // The checkout-edge-timeout / edge-gateway-5xx cascade must come free from generator
+      // propagation — no explicit overrides on ledger-db, checkout-edge, or edge-gateway.
+      expect(effects.latencyMult.has("ledger-db")).toBe(false);
+      expect(effects.latencyMult.has("checkout-edge")).toBe(false);
+      expect(effects.latencyMult.has("edge-gateway")).toBe(false);
+      expect(effects.errorRateOverride.has("ledger-db")).toBe(false);
+      expect(effects.errorRateOverride.has("checkout-edge")).toBe(false);
+      expect(effects.errorRateOverride.has("edge-gateway")).toBe(false);
     });
 
     it("still applies at t=10min (no self-healing)", () => {
       const effects = effectsFor(fault, START + 10 * MIN);
-      expect(effects.latencyMult.get("payments")).toBe(6);
-      expect(effects.errorRateOverride.get("payments")?.rate).toBe(0.25);
+      expect(effects.latencyMult.get("payments-api")).toBe(6);
+      expect(effects.errorRateOverride.get("payments-api")?.rate).toBe(0.25);
     });
 
     it("never names the scenario/deploy/fault in the error logMessage (honesty calibration)", () => {
       const effects = effectsFor(fault, START + 2 * MIN);
-      const message = effects.errorRateOverride.get("payments")?.logMessage ?? "";
+      const message = effects.errorRateOverride.get("payments-api")?.logMessage ?? "";
       for (const pattern of [/deploy/i, /v2\.4\.1/i, /scenario/i, /\bfault\b/i, /chaos/i, /bad-deploy/i, /root cause/i]) {
         expect(message).not.toMatch(pattern);
       }
@@ -78,7 +78,7 @@ describe("effectsFor", () => {
   describe("dependency-outage", () => {
     const fault: FaultState = { scenario: "dependency-outage", startedMs: START };
 
-    it("sets email-provider errors to 100% immediately at t=0, latency/traffic untouched", () => {
+    it("sets email-api errors to 100% immediately at t=0, latency/traffic untouched", () => {
       const effects = effectsFor(fault, START);
       expect(effects.errorRateOverride.get(EXTERNAL_SERVICE)?.rate).toBe(1);
       expect(effects.latencyMult.size).toBe(0);
@@ -101,22 +101,22 @@ describe("effectsFor", () => {
 
     it("is x1 at t=0 and never overrides error rates (log-silent by design)", () => {
       const effects = effectsFor(fault, START);
-      expect(effects.latencyMult.get("payments-db")).toBe(1);
+      expect(effects.latencyMult.get("ledger-db")).toBe(1);
       expect(effects.errorRateOverride.size).toBe(0);
       expect(effects.trafficMult).toBe(1);
     });
 
     it("ramps to exactly x2.5 at t=2min (halfway through the 4-minute ramp)", () => {
       const effects = effectsFor(fault, START + 2 * MIN);
-      expect(effects.latencyMult.get("payments-db")).toBe(2.5);
+      expect(effects.latencyMult.get("ledger-db")).toBe(2.5);
       expect(effects.errorRateOverride.size).toBe(0);
     });
 
     it("reaches x4 at t=4min and holds x4 at t=10min", () => {
       const at4 = effectsFor(fault, START + 4 * MIN);
-      expect(at4.latencyMult.get("payments-db")).toBe(4);
+      expect(at4.latencyMult.get("ledger-db")).toBe(4);
       const at10 = effectsFor(fault, START + 10 * MIN);
-      expect(at10.latencyMult.get("payments-db")).toBe(4);
+      expect(at10.latencyMult.get("ledger-db")).toBe(4);
       expect(at10.errorRateOverride.size).toBe(0);
     });
   });
@@ -140,17 +140,17 @@ describe("deployEventsFor", () => {
     expect(deployEventsFor(null)).toEqual([]);
   });
 
-  it("bad-deploy emits both the real payments deploy and the red-herring catalog deploy", () => {
+  it("bad-deploy emits both the real payments-api deploy and the red-herring catalog-kv deploy", () => {
     const fault: FaultState = { scenario: "bad-deploy", startedMs: START };
     const deploys = deployEventsFor(fault);
     expect(deploys).toHaveLength(2);
 
-    const payments = deploys.find((d) => d.service === "payments");
+    const payments = deploys.find((d) => d.service === "payments-api");
     expect(payments).toBeDefined();
     expect(payments?.version).toBe("v2.4.1");
     expect(payments?.ts_ms).toBe(START);
 
-    const catalog = deploys.find((d) => d.service === "catalog");
+    const catalog = deploys.find((d) => d.service === "catalog-kv");
     expect(catalog).toBeDefined();
     expect(catalog?.version).toBe("v1.8.3");
     expect(catalog?.ts_ms).toBe(START + 90_000);
@@ -160,13 +160,13 @@ describe("deployEventsFor", () => {
     expect(catalog?.id.length).toBeGreaterThan(0);
   });
 
-  it("every non-bad-deploy scenario emits only the benign red-herring catalog deploy", () => {
+  it("every non-bad-deploy scenario emits only the benign red-herring catalog-kv deploy", () => {
     const others: ScenarioId[] = ["dependency-outage", "latency-creep", "traffic-spike"];
     for (const scenario of others) {
       const fault: FaultState = { scenario, startedMs: START };
       const deploys = deployEventsFor(fault);
       expect(deploys).toHaveLength(1);
-      expect(deploys[0]?.service).toBe("catalog");
+      expect(deploys[0]?.service).toBe("catalog-kv");
       expect(deploys[0]?.version).toBe("v1.8.3");
       expect(deploys[0]?.ts_ms).toBe(START + 90_000);
     }
@@ -181,8 +181,8 @@ describe("deployEventsFor", () => {
   it("gives different scenarios distinct catalog-deploy ids (no cross-scenario collision)", () => {
     const badDeploy = deployEventsFor({ scenario: "bad-deploy", startedMs: START });
     const trafficSpike = deployEventsFor({ scenario: "traffic-spike", startedMs: START });
-    const badDeployCatalogId = badDeploy.find((d) => d.service === "catalog")?.id;
-    const trafficSpikeCatalogId = trafficSpike.find((d) => d.service === "catalog")?.id;
+    const badDeployCatalogId = badDeploy.find((d) => d.service === "catalog-kv")?.id;
+    const trafficSpikeCatalogId = trafficSpike.find((d) => d.service === "catalog-kv")?.id;
     expect(badDeployCatalogId).toBeDefined();
     expect(trafficSpikeCatalogId).toBeDefined();
     expect(badDeployCatalogId).not.toBe(trafficSpikeCatalogId);
@@ -199,7 +199,7 @@ describe("deployEventsFor", () => {
 });
 
 describe("bad-deploy cascade via the real generator (no explicit upstream overrides)", () => {
-  it("propagates payments' pool-exhaustion errors up to checkout and gateway for free", () => {
+  it("propagates payments-api' pool-exhaustion errors up to checkout-edge and edge-gateway for free", () => {
     const fault: FaultState = { scenario: "bad-deploy", startedMs: START };
     // Well past the 30s onset so effects are active for the whole window.
     const from = START + 2 * MIN;
@@ -208,23 +208,25 @@ describe("bad-deploy cascade via the real generator (no explicit upstream overri
     const batch = generateWindow(from, to, effects, mulberry32(17), 1);
 
     const paymentsErrors = batch.spans.filter(
-      (s) => s.service === "payments" && s.status === "error" && s.error_type === "pool_exhausted",
+      (s) => s.service === "payments-api" && s.status === "error" && s.error_type === "pool_exhausted",
     );
     expect(paymentsErrors.length).toBeGreaterThan(0);
 
     const paymentsErrorLogs = batch.logs.filter(
-      (l) => l.service === "payments" && l.message === "connection pool exhausted: 25/25 in use, acquire timeout 5000ms",
+      (l) =>
+        l.service === "payments-api" &&
+        l.message === "D1_ERROR: too many queued queries — 25 in flight, acquire timed out after 5000ms",
     );
     expect(paymentsErrorLogs.length).toBeGreaterThan(0);
 
-    // scenarios.ts never sets an override on checkout/gateway/payments-db — this propagation is
-    // purely generator.ts's own downstream-error walk.
+    // scenarios.ts never sets an override on checkout-edge/edge-gateway/ledger-db — this
+    // propagation is purely generator.ts's own downstream-error walk.
     let sawDownstreamCheckout = false;
     let sawDownstreamGateway = false;
     for (const span of paymentsErrors) {
       const traceSpans = batch.spans.filter((s) => s.trace_id === span.trace_id);
-      const checkoutErr = traceSpans.find((s) => s.service === "checkout" && s.status === "error");
-      const gatewayErr = traceSpans.find((s) => s.service === "gateway" && s.status === "error");
+      const checkoutErr = traceSpans.find((s) => s.service === "checkout-edge" && s.status === "error");
+      const gatewayErr = traceSpans.find((s) => s.service === "edge-gateway" && s.status === "error");
       if (checkoutErr) {
         expect(checkoutErr.error_type).toBe("downstream");
         sawDownstreamCheckout = true;

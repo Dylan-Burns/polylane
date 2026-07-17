@@ -18,8 +18,8 @@ import { FLOWS, type Step } from "../sim/topology";
 /** Renders the service topology as `parent -> child` edges, walked from `topology.ts`'s own
  * `FLOWS` data (never hand-copied) so the prompt can never silently drift from the simulated
  * world it's actually describing. Deduped/sorted since several flows share the same sub-trees
- * (e.g. every flow enters through `gateway`, both payments operations hit the same payments-db
- * steps). Exported so `chat-prompt.ts` (Task 6.1) renders the identical topology summary rather
+ * (e.g. every flow enters through `edge-gateway`, both payments-api operations hit the same
+ * ledger-db steps). Exported so `chat-prompt.ts` (Task 6.1) renders the identical topology summary rather
  * than hand-copying a second version that could silently drift from this one. */
 export function renderTopology(): string {
   const edges = new Set<string>();
@@ -58,8 +58,8 @@ export function buildInvestigatorSystemPrompt(params: SystemPromptParams): Syste
     "## Service topology",
     renderTopology(),
     "",
-    "email-provider is an external dependency notifications calls; it emits no internal spans of " +
-      "its own, only a latency/error outcome folded into the calling step.",
+    "email-api is an external SaaS dependency the notify Worker calls; it emits no internal spans " +
+      "of its own, only a latency/error outcome folded into the calling step.",
     "",
     "## Investigation protocol",
     "Work through these in order, adapting to what you find rather than following it mechanically:",

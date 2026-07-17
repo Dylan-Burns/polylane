@@ -9,7 +9,7 @@
  *   cluster and a quiet service shrinks to a wisp.
  * - **Hue = service identity**, one fixed assignment per service (never cycled), light/dark
  *   variants validated with the dataviz palette checker. Blue↔violet is the one CVD-weak pair, so
- *   they're pinned to opposite ends of the canvas (gateway far-left, payments-db far-right) and
+ *   they're pinned to opposite ends of the canvas (edge-gateway far-left, ledger-db far-right) and
  *   every cluster carries a permanent mono label — identity never rides on hue alone.
  * - A slice of each cluster's particles turns **status-red in proportion to its error rate** —
  *   errors literally circulate inside the service.
@@ -45,29 +45,29 @@ interface GalaxyProps {
   stats: Record<string, GalaxyServiceStat>;
 }
 
-/** Anchor positions as canvas fractions — same three-tier story as the Grid view (gateway fans
+/** Anchor positions as canvas fractions — same three-tier story as the Grid view (edge-gateway fans
  * out left→right), loosened into an organic cloud. Unknown future services fall back to a
  * golden-angle ring so a topology change degrades gracefully instead of stacking at 0,0. */
 const ANCHORS: Record<string, { x: number; y: number }> = {
-  gateway: { x: 0.12, y: 0.48 },
-  checkout: { x: 0.37, y: 0.3 },
-  catalog: { x: 0.4, y: 0.74 },
-  payments: { x: 0.62, y: 0.24 },
-  notifications: { x: 0.65, y: 0.72 },
-  "payments-db": { x: 0.87, y: 0.34 },
-  "email-provider": { x: 0.88, y: 0.76 },
+  "edge-gateway": { x: 0.12, y: 0.48 },
+  "checkout-edge": { x: 0.37, y: 0.3 },
+  "catalog-kv": { x: 0.4, y: 0.74 },
+  "payments-api": { x: 0.62, y: 0.24 },
+  notify: { x: 0.65, y: 0.72 },
+  "ledger-db": { x: 0.87, y: 0.34 },
+  "email-api": { x: 0.88, y: 0.76 },
 };
 
 /** Fixed per-service hue assignment (categorical, never cycled). Light steps validated on white,
  * dark steps on #141414 with `scripts/validate_palette.js` — see the file header for the one
  * documented weak pair and its mitigation. */
 const SERVICE_HUE: Record<string, { light: string; dark: string }> = {
-  gateway: { light: "#2a78d6", dark: "#4c94ea" },
-  checkout: { light: "#eb6834", dark: "#e0713d" },
-  payments: { light: "#1baf7a", dark: "#1f9e6e" },
-  "payments-db": { light: "#4a3aa7", dark: "#a493f2" },
-  catalog: { light: "#eda100", dark: "#d9a217" },
-  notifications: { light: "#e87ba4", dark: "#ea86ad" },
+  "edge-gateway": { light: "#2a78d6", dark: "#4c94ea" },
+  "checkout-edge": { light: "#eb6834", dark: "#e0713d" },
+  "payments-api": { light: "#1baf7a", dark: "#1f9e6e" },
+  "ledger-db": { light: "#4a3aa7", dark: "#a493f2" },
+  "catalog-kv": { light: "#eda100", dark: "#d9a217" },
+  notify: { light: "#e87ba4", dark: "#ea86ad" },
 };
 const HUE_FALLBACKS = Object.values(SERVICE_HUE);
 
@@ -407,10 +407,10 @@ export function GalaxyView({ services, edges, health, stats }: GalaxyProps) {
         }
 
         // Permanent labels — the relief that keeps identity off hue alone. The x is clamped so
-        // edge-anchored clusters (payments-db lives at the far right by design — CVD separation)
+        // edge-anchored clusters (ledger-db lives at the far right by design — CVD separation)
         // keep their full label inside the canvas on narrow phones instead of clipping. The
         // external ghost's label sits ABOVE its ring: it shares the bottom-row corridor with
-        // notifications, and on a phone-width canvas their below-labels must collide.
+        // notify, and on a phone-width canvas their below-labels must collide.
         ctx!.globalAlpha = clusterAlpha;
         ctx!.textAlign = "center";
         ctx!.fillStyle = chrome.ink;
