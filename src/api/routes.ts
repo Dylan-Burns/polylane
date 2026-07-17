@@ -1,7 +1,8 @@
 /**
  * The public GET data-surface (spec §10): `/api/health` (moved here from `index.ts`, which now just
  * mounts this app), `/api/state`, `/api/analytics`, `/api/incidents`, `/api/incidents/:id`,
- * `/api/incidents/:id/metrics`, `/api/traces/:id`, `/api/logs`, `/api/deploys` — every GET endpoint
+ * `/api/incidents/:id/metrics`, `/api/incidents/:id/logs`, `/api/traces/:id`, `/api/logs`,
+ * `/api/deploys` — every GET endpoint
  * the UI polls or drills into. POST routes (chaos, admin reset, chat) stay in their own files
  * (`api/chaos.ts`, future `api/chat.ts`) since they're a fundamentally different shape (proxies /
  * SSE, not a query layer passthrough); this file is specifically the read side, mirroring
@@ -21,9 +22,9 @@ import { Hono } from "hono";
 import { getBaselines, median } from "../detect/baselines";
 import type { Env } from "../env";
 import { fetchWorldStatus as fetchWorldStatusFromDO } from "../sim/simulator-do";
-import { getIncidents, getTrace, listDeploys, listInvestigationSteps, queryMetrics, searchLogs, type StepView } from "../telemetry/read";
+import { getIncidents, getTrace, listDeploys, listInvestigationSteps, queryMetrics, searchLogs, SEARCH_LOGS_MAX_LIMIT, type StepView } from "../telemetry/read";
 import { buildTopology, getAnalytics, getOpsHealth, serviceHealth, sparklineSeries, type StateResponse, type WorldStatusView } from "../telemetry/state";
-import type { IncidentView, MetricPoint } from "../telemetry/types";
+import type { IncidentView, LogLine, MetricPoint } from "../telemetry/types";
 import { parseWindow, WindowError } from "../agent/window";
 
 const LOG_LEVELS = ["info", "warn", "error"] as const;
@@ -38,6 +39,23 @@ const INCIDENTS_DEFAULT_FROM = "-24h";
  * `INCIDENTS_DEFAULT_FROM` (a deploy older than the incident panel's own horizon has nothing on
  * screen to correlate with), not `parseWindow`'s generic 30-minute telemetry default. */
 const DEPLOYS_DEFAULT_FROM = "-24h";
+
+// --- Incident logs (GET /api/incidents/:id/logs) --------------------------------------------
+
+/** Pre-incident context window for `GET /api/incidents/:id/logs` — shorter than
+ * `INCIDENT_METRICS_PRE_MS`'s 30-minute baseline lookback since raw log lines (unlike rollups)
+ * aren't being charted for trend context, just read for the handful of lines immediately preceding
+ * the breach that opened the incident. */
+const INCIDENT_LOGS_PRE_MS = 5 * 60_000;
+
+/** `GET /api/incidents/:id/logs`' response shape: `searchLogs`-backed, merged across every service
+ * the incident's fingerprints named. `truncated` mirrors `SearchLogsResult`'s `total > logs.length`
+ * signal, computed post-merge since no single per-service call knows the cross-service total. */
+export interface IncidentLogsResponse {
+  logs: LogLine[];
+  total: number;
+  truncated: boolean;
+}
 
 /** `GET /api/incidents/:id`'s response shape (spec §10: "incident + steps") — exported alongside
  * `StateResponse` so Task 5.2's UI (which polls this at 2s during an investigation) types against
@@ -354,6 +372,40 @@ routes.get("/incidents/:id/metrics", async (c) => {
   }
 
   const body: IncidentMetricsResponse = { windowFromMs: fromMs, windowToMs: toMs, tiles };
+  return c.json(body);
+});
+
+// Registered BEFORE `/incidents/:id` for the same reason as `/metrics` above (Hono's
+// registration-order resolution among same-specificity param routes).
+routes.get("/incidents/:id/logs", async (c) => {
+  const nowMs = Date.now();
+  const { incidents } = await getIncidents(c.env.DB, { id: c.req.param("id") });
+  const incident = incidents[0];
+  if (incident === undefined) {
+    return c.json({ error: "not_found" }, 404);
+  }
+
+  const fromMs = incident.opened_at - INCIDENT_LOGS_PRE_MS;
+  const toMs = incident.resolved_at ?? nowMs;
+
+  // Fingerprints are `service:metricClass` (detect/rules.ts) — the unique service prefixes are
+  // exactly the services this incident's evidence implicates.
+  const services = [...new Set(incident.fingerprints.map((fp) => fp.split(":")[0] ?? fp))];
+
+  // searchLogs filters by one service at a time; per-service results (each already capped +
+  // newest-first) are merged, re-sorted newest-first across services, and sliced to the same
+  // 50-row TOTAL cap searchLogs enforces per call — `total` sums every call's own total so
+  // `truncated` stays honest even though no single query saw the cross-service count.
+  const perService = await Promise.all(
+    services.map((service) => searchLogs(c.env.DB, { service, fromMs, toMs, limit: SEARCH_LOGS_MAX_LIMIT })),
+  );
+  const merged = perService
+    .flatMap((r) => r.logs)
+    .sort((a, b) => b.ts_ms - a.ts_ms)
+    .slice(0, SEARCH_LOGS_MAX_LIMIT);
+  const total = perService.reduce((sum, r) => sum + r.total, 0);
+
+  const body: IncidentLogsResponse = { logs: merged, total, truncated: total > merged.length };
   return c.json(body);
 });
 

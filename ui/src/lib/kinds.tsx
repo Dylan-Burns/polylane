@@ -32,8 +32,8 @@ export const KIND_META: Readonly<Record<ServiceKind, { label: string; icon: Reac
     label: "Cloudflare Worker",
     icon: (
       <Icon>
-        <rect x="3" y="3" width="18" height="18" rx="4" />
-        <path d="m9.5 9-3 3 3 3M14.5 9l3 3-3 3" />
+        <path d="M12 2.5 20 7v10l-8 4.5L4 17V7l8-4.5Z" />
+        <path d="m12.8 7.5-3.3 4.7h2.6l-1 4.3 3.4-4.8h-2.6l.9-4.2Z" strokeWidth="1.6" />
       </Icon>
     ),
   },
@@ -51,8 +51,8 @@ export const KIND_META: Readonly<Record<ServiceKind, { label: string; icon: Reac
     label: "Worker + KV",
     icon: (
       <Icon>
-        <circle cx="8.5" cy="8.5" r="4.5" />
-        <path d="m11.8 11.8 8.2 8.2M17 17l-2 2M19.5 14.5l-2 2" />
+        <circle cx="7.5" cy="15.5" r="4" />
+        <path d="m10.4 12.6 9.1-9.1M16 7l3 3M13 10l2 2" />
       </Icon>
     ),
   },

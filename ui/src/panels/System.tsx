@@ -11,6 +11,7 @@ import { useState, type ReactNode } from "react";
 import { SCENARIOS } from "../../../src/sim/scenarios";
 import { Sparkline } from "../components/Sparkline";
 import { relativeTime } from "../lib/format";
+import { KIND_META } from "../lib/kinds";
 import { HEALTH_COLOR, HEALTH_LABEL } from "../lib/status";
 import { storageGet, storageSet } from "../lib/storage";
 import type { IncidentView, OpsHealth, SparklinePoint, StateResponse, TopologyServiceNode, WorldStatusView } from "../lib/types";
@@ -25,17 +26,20 @@ interface NodePos {
 
 /** Hand-placed positions mirroring `sim/topology.ts`'s own ASCII diagram — three tiers,
  * edge-gateway on the left fanning out to its two branches. */
+/** Card heights are +20 over the pre-typed-grid baseline to fit the new kind-sublabel row (added
+ * uniformly so `edgePath`'s vertical-center math — which derives straight from these positions —
+ * keeps every curve landing on the right edge). */
 const NODE_POSITIONS: Record<string, NodePos> = {
-  "edge-gateway": { x: 20, y: 115, w: 150, h: 108 },
-  "checkout-edge": { x: 224, y: 16, w: 150, h: 108 },
-  "catalog-kv": { x: 224, y: 216, w: 150, h: 108 },
-  "payments-api": { x: 428, y: 16, w: 150, h: 108 },
-  notify: { x: 428, y: 216, w: 150, h: 108 },
-  "ledger-db": { x: 632, y: 16, w: 150, h: 108 },
-  "email-api": { x: 632, y: 232, w: 150, h: 76 },
+  "edge-gateway": { x: 20, y: 115, w: 150, h: 128 },
+  "checkout-edge": { x: 224, y: 16, w: 150, h: 128 },
+  "catalog-kv": { x: 224, y: 216, w: 150, h: 128 },
+  "payments-api": { x: 428, y: 16, w: 150, h: 128 },
+  notify: { x: 428, y: 216, w: 150, h: 128 },
+  "ledger-db": { x: 632, y: 16, w: 150, h: 128 },
+  "email-api": { x: 632, y: 232, w: 150, h: 96 },
 };
 const VIEWBOX_W = 802;
-const VIEWBOX_H = 340;
+const VIEWBOX_H = 360;
 
 const SPARKLINE_SLOTS = 30;
 const MINUTE_MS = 60_000;
@@ -115,8 +119,11 @@ function NodeCard({
     return (
       <foreignObject x={pos.x} y={pos.y} width={pos.w} height={pos.h}>
         <div className="flex h-full flex-col justify-center gap-1 rounded-xl border border-dashed border-hairline-bright bg-panel/50 px-3 py-2">
-          <span className="font-mono text-[9px] uppercase tracking-wider text-ink-faint">external dependency</span>
-          <span className="font-mono text-xs text-ink-dim">{node.name}</span>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="shrink-0 text-ink-dim">{KIND_META[node.kind].icon}</span>
+            <span className="truncate font-mono text-xs text-ink-dim">{node.name}</span>
+          </div>
+          <span className="font-mono text-[9px] uppercase tracking-wider text-ink-faint">{KIND_META[node.kind].label}</span>
         </div>
       </foreignObject>
     );
@@ -136,13 +143,17 @@ function NodeCard({
         style={{ borderColor: status === "green" ? "var(--color-hairline)" : HEALTH_COLOR[status] }}
       >
         <div className="flex items-center justify-between gap-2">
-          <span className="truncate font-mono text-xs font-medium text-ink">{node.name}</span>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="shrink-0 text-ink-dim">{KIND_META[node.kind].icon}</span>
+            <span className="truncate font-mono text-xs font-medium text-ink">{node.name}</span>
+          </div>
           <span
             className={`h-2 w-2 shrink-0 rounded-full ${status !== "green" ? "animate-scan-pulse" : ""}`}
             style={{ backgroundColor: HEALTH_COLOR[status] }}
             title={HEALTH_LABEL[status]}
           />
         </div>
+        <span className="-mt-1 font-mono text-[9px] uppercase tracking-wider text-ink-faint">{KIND_META[node.kind].label}</span>
         <SparkRow label="rate" color="var(--color-signal)" values={rateSlots} format={(v) => `${v.toFixed(0)}/m`} />
         <SparkRow label="err" color="var(--color-status-red)" values={errSlots} format={(v) => `${v.toFixed(1)}%`} />
         <SparkRow label="p95" color="var(--color-status-amber)" values={p95Slots} format={(v) => `${v.toFixed(0)}ms`} />
@@ -246,7 +257,7 @@ export function WorldStatusBanner({ worldStatus }: { worldStatus: WorldStatusVie
 function TopologyGrid({ state, latestMinuteTs }: { state: StateResponse; latestMinuteTs: number }) {
   const { edges } = state.topology;
   return (
-    <div className="overflow-x-auto">
+    <div className="mx-auto w-full max-w-[980px] overflow-x-auto">
       <svg
         viewBox={`0 0 ${VIEWBOX_W} ${VIEWBOX_H}`}
         width="100%"

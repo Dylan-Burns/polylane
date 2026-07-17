@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
-import type { IncidentMetricsResponse } from "../../src/api/routes";
+import type { IncidentLogsResponse, IncidentMetricsResponse } from "../../src/api/routes";
 import { insertInvestigationStep } from "../../src/telemetry/incidents";
 import { insertDeploy, insertLogs, insertRollups, insertSpans } from "../../src/telemetry/queries";
 import type { StepView } from "../../src/telemetry/read";
@@ -530,5 +530,110 @@ describe("GET /api/incidents/:id/metrics", () => {
     const res = await SELF.fetch("https://example.com/api/incidents/does-not-exist/metrics");
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: "not_found" });
+  });
+});
+
+describe("GET /api/incidents/:id/logs", () => {
+  it("404s an unknown incident id", async () => {
+    const res = await SELF.fetch("https://example.com/api/incidents/does-not-exist/logs");
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "not_found" });
+  });
+
+  it("returns logs from the incident's fingerprinted services, newest first, within [opened_at - 5m, resolved_at)", async () => {
+    const openedAt = 60_000_000;
+    const resolvedAt = openedAt + 300_000;
+    await env.DB.batch([
+      env.DB
+        .prepare(
+          "INSERT INTO incidents (id, status, severity, opened_at, resolved_at, trigger_json) VALUES ('inc-logs', 'resolved', 'critical', ?, ?, '{}')",
+        )
+        .bind(openedAt, resolvedAt),
+      env.DB
+        .prepare(
+          "INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES ('inc-logs', 'payments-api:errors', ?, 1)",
+        )
+        .bind(openedAt),
+      env.DB
+        .prepare(
+          "INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES ('inc-logs', 'checkout-edge:latency', ?, 1)",
+        )
+        .bind(openedAt),
+    ]);
+
+    await insertLogs(env.DB, [
+      // Inside the window, on a fingerprinted service -- included.
+      { ts_ms: openedAt - 60_000, service: "payments-api", level: "error", message: "payment authorization failed: card issuer declined" },
+      { ts_ms: openedAt + 60_000, service: "checkout-edge", level: "error", message: "checkout processing failed: invalid cart state" },
+      // Before the window (opened_at - 5min) -- excluded.
+      { ts_ms: openedAt - 6 * 60_000, service: "payments-api", level: "error", message: "too early" },
+      // At/after resolved_at -- excluded (window is half-open at the top).
+      { ts_ms: resolvedAt, service: "payments-api", level: "error", message: "too late" },
+      // Inside the window but on a service this incident never fingerprinted -- excluded.
+      { ts_ms: openedAt, service: "catalog-kv", level: "info", message: "irrelevant service" },
+    ]);
+
+    const res = await SELF.fetch("https://example.com/api/incidents/inc-logs/logs");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as IncidentLogsResponse;
+
+    expect(body.logs.map((l) => l.message)).toEqual([
+      "checkout processing failed: invalid cart state", // newest first
+      "payment authorization failed: card issuer declined",
+    ]);
+    expect(body.logs.map((l) => l.service)).toEqual(["checkout-edge", "payments-api"]);
+    expect(body.total).toBe(2);
+    expect(body.truncated).toBe(false);
+  });
+
+  it("merges + truncates across services when the combined total exceeds the 50-row cap", async () => {
+    const openedAt = 70_000_000;
+    await env.DB.batch([
+      env.DB
+        .prepare(
+          "INSERT INTO incidents (id, status, severity, opened_at, trigger_json) VALUES ('inc-logs-cap', 'investigating', 'critical', ?, '{}')",
+        )
+        .bind(openedAt),
+      env.DB
+        .prepare(
+          "INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES ('inc-logs-cap', 'payments-api:errors', ?, 1)",
+        )
+        .bind(openedAt),
+      env.DB
+        .prepare(
+          "INSERT INTO incident_fingerprints (incident_id, fingerprint, first_seen_ms, delivered_to_agent) VALUES ('inc-logs-cap', 'checkout-edge:errors', ?, 1)",
+        )
+        .bind(openedAt),
+    ]);
+
+    // 40 payments-api rows + 40 checkout-edge rows, all inside the window -- 80 total, so the
+    // merged, sorted, sliced result must land at exactly 50 with truncated: true.
+    const logs: LogLine[] = [
+      ...Array.from({ length: 40 }, (_, i) => ({
+        ts_ms: openedAt + i,
+        service: "payments-api" as const,
+        level: "error" as const,
+        message: `payments burst ${i}`,
+      })),
+      ...Array.from({ length: 40 }, (_, i) => ({
+        ts_ms: openedAt + i,
+        service: "checkout-edge" as const,
+        level: "error" as const,
+        message: `checkout burst ${i}`,
+      })),
+    ];
+    await insertLogs(env.DB, logs);
+
+    const res = await SELF.fetch("https://example.com/api/incidents/inc-logs-cap/logs");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as IncidentLogsResponse;
+
+    expect(body.logs).toHaveLength(50);
+    expect(body.total).toBe(80);
+    expect(body.truncated).toBe(true);
+    // Newest-first across the merged set.
+    for (let i = 1; i < body.logs.length; i++) {
+      expect(body.logs[i - 1]!.ts_ms).toBeGreaterThanOrEqual(body.logs[i]!.ts_ms);
+    }
   });
 });

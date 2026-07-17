@@ -109,6 +109,15 @@ export interface DeployListResponse {
   deploys: PublicDeploy[];
 }
 
+// --- /api/incidents/:id/logs (mirrors src/api/routes.ts's IncidentLogsResponse — hand-mirrored,
+// not imported, for the same D1-typed-source reason as this file's header comment) ---------------
+
+export interface IncidentLogsResponse {
+  logs: LogLine[];
+  total: number;
+  truncated: boolean;
+}
+
 // --- /api/incidents/:id/metrics (mirrors src/api/routes.ts's IncidentMetricsResponse) -----------
 
 export interface IncidentMetricTile {

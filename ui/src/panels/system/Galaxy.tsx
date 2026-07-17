@@ -29,6 +29,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { KIND_META } from "../../lib/kinds";
 import { HEALTH_LABEL } from "../../lib/status";
 import type { HealthStatus, TopologyServiceNode } from "../../lib/types";
 
@@ -413,16 +414,24 @@ export function GalaxyView({ services, edges, health, stats }: GalaxyProps) {
         // notify, and on a phone-width canvas their below-labels must collide.
         ctx!.globalAlpha = clusterAlpha;
         ctx!.textAlign = "center";
-        ctx!.fillStyle = chrome.ink;
         ctx!.font = '500 11px "JetBrains Mono", ui-monospace, monospace';
         const nameHalf = ctx!.measureText(node.name).width / 2;
-        const labelX = Math.min(Math.max(anchor.x, nameHalf + 4), w - nameHalf - 4);
+        const kindLabel = KIND_META[node.kind].label;
+        const rateLabel = stat?.rate !== null && stat?.rate !== undefined ? `${stat.rate.toFixed(0)}/m` : "—";
+        const sub = node.external ? kindLabel : `${rateLabel} · ${kindLabel}`;
+        ctx!.font = '400 9px "JetBrains Mono", ui-monospace, monospace';
+        const subHalf = ctx!.measureText(sub).width / 2;
+        // Clamp against whichever line is wider — the sub-label (kind-tagged, e.g. "42/m ·
+        // Cloudflare Worker") now regularly outmeasures the name, and both lines share one labelX.
+        const widestHalf = Math.max(nameHalf, subHalf);
+        const labelX = Math.min(Math.max(anchor.x, widestHalf + 4), w - widestHalf - 4);
         const nameY = node.external ? anchor.y - anchor.r - 24 : anchor.y + anchor.r + 20;
         const subY = node.external ? anchor.y - anchor.r - 12 : anchor.y + anchor.r + 32;
+        ctx!.fillStyle = chrome.ink;
+        ctx!.font = '500 11px "JetBrains Mono", ui-monospace, monospace';
         ctx!.fillText(node.name, labelX, nameY);
         ctx!.fillStyle = chrome.inkFaint;
         ctx!.font = '400 9px "JetBrains Mono", ui-monospace, monospace';
-        const sub = node.external ? "external" : stat?.rate !== null && stat?.rate !== undefined ? `${stat.rate.toFixed(0)}/m` : "—";
         ctx!.fillText(sub, labelX, subY);
       });
 
@@ -521,7 +530,7 @@ export function GalaxyView({ services, edges, health, stats }: GalaxyProps) {
               top: Math.max(8, tooltip.y - 20),
             }}
           >
-            <p className="font-mono text-[9px] uppercase tracking-wider text-ink-faint">acme-shop · {tooltipNode.external ? "external dependency" : "service"}</p>
+            <p className="font-mono text-[9px] uppercase tracking-wider text-ink-faint">acme-shop · {KIND_META[tooltipNode.kind].label}</p>
             <p className="mt-1 flex items-center gap-1.5 font-mono text-xs font-medium text-ink">
               <span
                 className="h-2 w-2 rounded-full"
