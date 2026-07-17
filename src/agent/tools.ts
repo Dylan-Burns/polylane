@@ -93,7 +93,7 @@ const WINDOW_SCHEMA: JSONSchema = {
 const QUERY_METRICS_SCHEMA: JSONSchema = {
   type: "object",
   properties: {
-    service: { type: ["string", "null"], description: "Restrict to one service (e.g. \"checkout\"). Omit/null for all services." },
+    service: { type: ["string", "null"], description: "Restrict to one service (e.g. \"checkout-edge\"). Omit/null for all services." },
     operation: { type: ["string", "null"], description: "Restrict to one operation within a service (e.g. \"POST /checkout\"). Omit/null for all operations." },
     metrics: {
       type: ["array", "null"],
@@ -245,7 +245,7 @@ export const SUBMIT_REPORT: ToolDef = {
         type: "object",
         description: "The proposed cause and the mechanism by which it produced the observed symptoms.",
         properties: {
-          hypothesis: { type: "string", description: "The proposed root cause, stated plainly (e.g. \"payments connection pool exhaustion\")." },
+          hypothesis: { type: "string", description: "The proposed root cause, stated plainly (e.g. \"ledger-db queued-query saturation\")." },
           mechanism: { type: "string", description: "How the hypothesis causally led to the observed symptoms." },
         },
         required: ["hypothesis", "mechanism"],
@@ -259,7 +259,7 @@ export const SUBMIT_REPORT: ToolDef = {
           properties: {
             description: { type: "string", description: "What this piece of evidence shows and why it's relevant." },
             trace_id: { type: ["string", "null"], description: "A trace_id this evidence references, if any." },
-            metric: { type: ["string", "null"], description: "A metric/delta this evidence references (e.g. \"payments p95: 8.2x baseline\"), if any." },
+            metric: { type: ["string", "null"], description: "A metric/delta this evidence references (e.g. \"payments-api p95: 8.2x baseline\"), if any." },
             log_excerpt: { type: ["string", "null"], description: "A log line or short excerpt this evidence references, if any." },
           },
           required: ["description", "trace_id", "metric", "log_excerpt"],

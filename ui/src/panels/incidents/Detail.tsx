@@ -30,6 +30,19 @@ import { TraceDrawer } from "./TraceDrawer";
 
 const LIVE_POLL_MS = 2000;
 
+/** `report_json` fields are schema-validated at submit time, but hand-seeded or legacy rows can
+ * carry non-string values — coerce instead of letting one malformed field crash the whole modal
+ * render (the removed ReportView's `asString ?? prettyJson` convention, kept in miniature). */
+function safeText(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (v === null || v === undefined) return "";
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
 function Timestamp({ label, ms }: { label: string; ms: number | null }) {
   if (ms === null) return null;
   return (
@@ -270,8 +283,8 @@ function OverviewTab({
 function OtherEvidenceCard({ entry }: { entry: ReportEvidenceEntry }) {
   return (
     <div className="flex flex-col gap-1 rounded-lg border border-hairline bg-panel px-3 py-2 text-xs">
-      <p className="text-ink-dim">{entry.description}</p>
-      {entry.metric && <span className="font-mono text-[10px] text-ink-faint">{entry.metric}</span>}
+      <p className="text-ink-dim">{safeText(entry.description)}</p>
+      {entry.metric && <span className="font-mono text-[10px] text-ink-faint">{safeText(entry.metric)}</span>}
     </div>
   );
 }
@@ -302,7 +315,7 @@ function TracesTab({ report, onOpenEvidence }: { report: Report | null; onOpenEv
               onClick={() => onOpenEvidence(entry)}
               className="flex flex-col gap-1 rounded-lg border border-hairline bg-panel px-3 py-2 text-left text-xs transition-colors hover:border-hairline-bright hover:bg-panel-raised"
             >
-              <p className="text-ink-dim">{entry.description}</p>
+              <p className="text-ink-dim">{safeText(entry.description)}</p>
               <span className="font-mono text-[10px] text-signal-glow">trace {entry.trace_id?.slice(0, 12)}… →</span>
               {entry.metric && <span className="font-mono text-[10px] text-ink-faint">{entry.metric}</span>}
             </button>
@@ -343,8 +356,8 @@ function TimelineTab({
           <ol className="mt-2 flex flex-col gap-1.5">
             {report.timeline.map((entry, i) => (
               <li key={i} className="flex gap-3 text-xs">
-                <span className="w-24 shrink-0 font-mono text-ink-faint">{entry.time || "—"}</span>
-                <span className="text-ink-dim">{entry.description}</span>
+                <span className="w-24 shrink-0 font-mono text-ink-faint">{safeText(entry.time) || "—"}</span>
+                <span className="text-ink-dim">{safeText(entry.description)}</span>
               </li>
             ))}
           </ol>

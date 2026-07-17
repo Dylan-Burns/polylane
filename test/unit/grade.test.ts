@@ -3,7 +3,9 @@ import { gradeReport, type GradableReport } from "../../scripts/grade";
 
 /**
  * Regression fixtures for the eval rubric (`scripts/grade.ts`). The two PASS fixtures are REAL
- * reports the deployed agent produced on 2026-07-15 (incidents inc-f596d500…, inc-8aaa20b4…) that
+ * reports the deployed agent produced on 2026-07-15 (incidents inc-f596d500…, inc-8aaa20b4…),
+ * transposed to the CF-native service names during the 2026-07-17 rename (structure and rhetoric
+ * unchanged from the originals — the 2026-07-15 agent wrote them under the old names), that
  * the pre-exoneration grader mis-scored as FAIL: each names a `mustNotBlame` term only to rule it
  * out (dependency-outage exonerates checkout-edge; traffic-spike notes the red-herring deploy as
  * correlated timing, not cause). The FAIL fixtures guard the other direction: reports that

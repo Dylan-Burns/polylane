@@ -26,7 +26,7 @@
  * overlapping with a still-resolving false-positive from a different service — spec §8's documented
  * residual FP rate) never merges their evidence together; each fingerprint stays attributed to its
  * own incident. A batch containing one covered fingerprint and one genuinely new one (the common
- * "same cascade" case, e.g. bad-deploy's `payments:errors` opens the incident, `payments:latency`
+ * "same cascade" case, e.g. bad-deploy's `payments-api:errors` opens the incident, `payments-api:latency`
  * breaches a minute later) still folds the new fingerprint onto the same incident, since only the
  * genuinely-new one has no owner yet.
  *

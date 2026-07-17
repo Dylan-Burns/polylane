@@ -100,7 +100,10 @@ function extendedSlots(state: StateResponse, serviceName: string, latestMinuteTs
   let errLive = false;
   let p95Live = false;
 
-  if (live && liveStat) {
+  // minuteTs guard: /api/state reads D1 sparklines and DO status concurrently, so the poll that
+  // straddles a rollup write can see `live` still reporting the minute the sparklines just closed
+  // — appending it then would draw a transient duplicate point until the next poll.
+  if (live && liveStat && live.minuteTs > latestMinuteTs) {
     err.push(liveStat.errPct);
     errLive = true;
     p95.push(liveStat.p95);
