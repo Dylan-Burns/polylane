@@ -38,13 +38,17 @@ export function NavRail({
       {NAV_ITEMS.map((item) => {
         const active = item.id === view;
         const badge = item.id === "incidents" && liveIncidents > 0;
+        // The live count is otherwise encoded only visually (a red pill, or a bare aria-hidden dot
+        // when collapsed) — fold it into the accessible name so assistive tech announces it on
+        // every rail state, not just the expanded pill a sighted user sees.
+        const accessibleName = badge ? `${item.label}, ${liveIncidents} live` : item.label;
         return (
           <button
             key={item.id}
             type="button"
             onClick={() => onNavigate(item.id)}
             aria-current={active ? "page" : undefined}
-            aria-label={collapsed ? item.label : undefined}
+            aria-label={collapsed || badge ? accessibleName : undefined}
             title={collapsed ? item.label : undefined}
             className={`relative flex items-center gap-2.5 rounded-xl py-2 font-sans text-[13px] font-medium transition-colors ${
               collapsed ? "w-10 justify-center px-0" : "w-full px-3"

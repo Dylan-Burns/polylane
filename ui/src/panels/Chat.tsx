@@ -310,8 +310,8 @@ export function ChatPanel() {
   }, [messages]);
 
   // Abort any in-flight turn if the whole app unmounts (tab close/navigation away) — the panel
-  // itself stays mounted across the Dashboard/Chat tab switch (see App.tsx) specifically so a
-  // still-streaming turn is never interrupted just by glancing at the dashboard.
+  // itself stays mounted-but-hidden across view navigation (see App.tsx) specifically so a
+  // still-streaming turn is never interrupted just by switching to another view.
   useEffect(() => {
     return () => abortRef.current?.abort();
   }, []);

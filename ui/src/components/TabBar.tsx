@@ -22,12 +22,16 @@ export function TabBar({
     >
       {NAV_ITEMS.map((item) => {
         const active = item.id === view;
+        const badge = item.id === "incidents" && liveIncidents > 0;
         return (
           <button
             key={item.id}
             type="button"
             onClick={() => onNavigate(item.id)}
             aria-current={active ? "page" : undefined}
+            // The badge is an aria-hidden dot, so the count only reaches assistive tech through the
+            // accessible name — mirror NavRail and fold it in.
+            aria-label={badge ? `${item.label}, ${liveIncidents} live` : undefined}
             className={`relative flex flex-col items-center gap-0.5 py-2 transition-colors ${
               active ? "text-ink" : "text-ink-faint hover:text-ink-dim"
             }`}
