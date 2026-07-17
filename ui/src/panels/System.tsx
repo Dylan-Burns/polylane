@@ -30,15 +30,15 @@ interface NodePos {
  * uniformly so `edgePath`'s vertical-center math — which derives straight from these positions —
  * keeps every curve landing on the right edge). */
 const NODE_POSITIONS: Record<string, NodePos> = {
-  "edge-gateway": { x: 20, y: 115, w: 172, h: 128 },
-  "checkout-edge": { x: 224, y: 16, w: 172, h: 128 },
-  "catalog-kv": { x: 224, y: 216, w: 172, h: 128 },
-  "payments-api": { x: 428, y: 16, w: 172, h: 128 },
-  notify: { x: 428, y: 216, w: 172, h: 128 },
-  "ledger-db": { x: 632, y: 16, w: 172, h: 128 },
-  "email-api": { x: 632, y: 232, w: 172, h: 96 },
+  "edge-gateway": { x: 20, y: 115, w: 182, h: 128 },
+  "checkout-edge": { x: 224, y: 16, w: 182, h: 128 },
+  "catalog-kv": { x: 224, y: 216, w: 182, h: 128 },
+  "payments-api": { x: 428, y: 16, w: 182, h: 128 },
+  notify: { x: 428, y: 216, w: 182, h: 128 },
+  "ledger-db": { x: 632, y: 16, w: 182, h: 128 },
+  "email-api": { x: 632, y: 232, w: 182, h: 96 },
 };
-const VIEWBOX_W = 824;
+const VIEWBOX_W = 834;
 const VIEWBOX_H = 360;
 
 const SPARKLINE_SLOTS = 30;
