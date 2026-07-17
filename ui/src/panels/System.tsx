@@ -7,7 +7,7 @@
  * never hardcoded, so this stays correct if the topology ever changes.
  */
 
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { SCENARIOS } from "../../../src/sim/scenarios";
 import { Sparkline } from "../components/Sparkline";
 import { relativeTime } from "../lib/format";
@@ -69,6 +69,56 @@ function lastKnown(values: (number | null)[]): number | null {
   return null;
 }
 
+/** Minimum elapsed time into the open minute before its accumulated count is trustworthy enough to
+ * extrapolate into a per-minute rate — below this the projection is mostly noise (spec Canonical
+ * Table 7), so the rate row omits the live point entirely while err/p95 (raw, no extrapolation)
+ * still show it. */
+const LIVE_RATE_MIN_ELAPSED_MS = 10_000;
+
+interface ExtendedSlots {
+  rate: (number | null)[];
+  err: (number | null)[];
+  p95: (number | null)[];
+  rateLive: boolean;
+  errLive: boolean;
+  p95Live: boolean;
+}
+
+/** Builds each row's closed-minute slots via `alignSlots`, then — when `state.live` carries this
+ * service — appends ONE live slot per Canonical Table 7: err%/p95 raw, rate only once the open
+ * minute has run long enough to extrapolate. Both `NodeCard` (grid) and `galaxyStats` (galaxy) call
+ * this so the two views always agree on the freshest point. */
+function extendedSlots(state: StateResponse, serviceName: string, latestMinuteTs: number): ExtendedSlots {
+  const slots = alignSlots(state.sparklines[serviceName], latestMinuteTs);
+  const rate: (number | null)[] = slots.map((p) => (p ? p.count : null));
+  const err: (number | null)[] = slots.map((p) => (p ? p.error_rate * 100 : null));
+  const p95: (number | null)[] = slots.map((p) => (p ? p.p95 : null));
+
+  const live = state.live;
+  const liveStat = live?.services[serviceName];
+  let rateLive = false;
+  let errLive = false;
+  let p95Live = false;
+
+  if (live && liveStat) {
+    err.push(liveStat.errPct);
+    errLive = true;
+    p95.push(liveStat.p95);
+    p95Live = true;
+    if (live.elapsedMs >= LIVE_RATE_MIN_ELAPSED_MS) {
+      rate.push((liveStat.count * 60_000) / live.elapsedMs);
+      rateLive = true;
+    } else {
+      // Placeholder keeps all three rows the same length: Sparkline derives its x-scale from
+      // array length, so omitting (rather than nulling) this slot made the rate line render at a
+      // different horizontal scale than err/p95 for the first seconds of every minute.
+      rate.push(null);
+    }
+  }
+
+  return { rate, err, p95, rateLive, errLive, p95Live };
+}
+
 /** A smooth flow-diagram curve (horizontal tangents at both ends) between two node boxes' facing
  * edges — a small aesthetic investment over a straight line, in keeping with "hand-rolled SVG". */
 function edgePath(from: NodePos, to: NodePos): string {
@@ -85,17 +135,19 @@ function SparkRow({
   color,
   values,
   format,
+  live = false,
 }: {
   label: string;
   color: string;
   values: (number | null)[];
   format: (v: number) => string;
+  live?: boolean;
 }) {
   const last = lastKnown(values);
   return (
     <div className="flex items-center gap-1.5">
       <span className="w-6 shrink-0 font-mono text-[9px] uppercase tracking-wide text-ink-faint">{label}</span>
-      <Sparkline values={values} width={60} height={15} color={color} ariaLabel={`${label} sparkline`} />
+      <Sparkline values={values} width={60} height={15} color={color} ariaLabel={`${label} sparkline`} live={live} />
       <span className="ml-auto shrink-0 font-mono text-[10px] text-ink-dim">{last !== null ? format(last) : "—"}</span>
     </div>
   );
@@ -103,13 +155,11 @@ function SparkRow({
 
 function NodeCard({
   node,
-  health,
-  sparklines,
+  state,
   latestMinuteTs,
 }: {
   node: TopologyServiceNode;
-  health: Record<string, string>;
-  sparklines: Record<string, SparklinePoint[]>;
+  state: StateResponse;
   latestMinuteTs: number;
 }) {
   const pos = NODE_POSITIONS[node.name];
@@ -129,12 +179,8 @@ function NodeCard({
     );
   }
 
-  const status = (health[node.name] as "red" | "amber" | "green" | undefined) ?? "green";
-  const series = sparklines[node.name];
-  const slots = alignSlots(series, latestMinuteTs);
-  const rateSlots = slots.map((p) => (p ? p.count : null));
-  const errSlots = slots.map((p) => (p ? p.error_rate * 100 : null));
-  const p95Slots = slots.map((p) => (p ? p.p95 : null));
+  const status = (state.health[node.name] as "red" | "amber" | "green" | undefined) ?? "green";
+  const ext = extendedSlots(state, node.name, latestMinuteTs);
 
   return (
     <foreignObject x={pos.x} y={pos.y} width={pos.w} height={pos.h}>
@@ -154,9 +200,9 @@ function NodeCard({
           />
         </div>
         <span className="-mt-1 font-mono text-[9px] uppercase tracking-wider text-ink-faint">{KIND_META[node.kind].label}</span>
-        <SparkRow label="rate" color="var(--color-signal)" values={rateSlots} format={(v) => `${v.toFixed(0)}/m`} />
-        <SparkRow label="err" color="var(--color-status-red)" values={errSlots} format={(v) => `${v.toFixed(1)}%`} />
-        <SparkRow label="p95" color="var(--color-status-amber)" values={p95Slots} format={(v) => `${v.toFixed(0)}ms`} />
+        <SparkRow label="rate" color="var(--color-signal)" values={ext.rate} format={(v) => `${v.toFixed(0)}/m`} live={ext.rateLive} />
+        <SparkRow label="err" color="var(--color-status-red)" values={ext.err} format={(v) => `${v.toFixed(1)}%`} live={ext.errLive} />
+        <SparkRow label="p95" color="var(--color-status-amber)" values={ext.p95} format={(v) => `${v.toFixed(0)}ms`} live={ext.p95Live} />
       </div>
     </foreignObject>
   );
@@ -279,7 +325,7 @@ function TopologyGrid({ state, latestMinuteTs }: { state: StateResponse; latestM
           })}
         </g>
         {state.topology.services.map((node) => (
-          <NodeCard key={node.name} node={node} health={state.health} sparklines={state.sparklines} latestMinuteTs={latestMinuteTs} />
+          <NodeCard key={node.name} node={node} state={state} latestMinuteTs={latestMinuteTs} />
         ))}
       </svg>
     </div>
@@ -321,20 +367,43 @@ function ViewToggle({ mode, onChange }: { mode: TopologyViewMode; onChange: (mod
 function galaxyStats(state: StateResponse, latestMinuteTs: number): Record<string, GalaxyServiceStat> {
   const stats: Record<string, GalaxyServiceStat> = {};
   for (const node of state.topology.services) {
-    const slots = alignSlots(state.sparklines[node.name], latestMinuteTs);
+    const ext = extendedSlots(state, node.name, latestMinuteTs);
     stats[node.name] = {
-      rate: lastKnown(slots.map((p) => (p ? p.count : null))),
-      errPct: lastKnown(slots.map((p) => (p ? p.error_rate * 100 : null))),
-      p95: lastKnown(slots.map((p) => (p ? p.p95 : null))),
+      rate: lastKnown(ext.rate),
+      errPct: lastKnown(ext.err),
+      p95: lastKnown(ext.p95),
     };
   }
   return stats;
+}
+
+/** Tracks wall-clock "when did the state poll last land" — a plain `useState` timestamp set
+ * whenever the `state` object reference changes (a new poll resolved), per Canonical Table 7's
+ * freshness line. Ticks a 1s re-render only while there's a live point to caption; otherwise the
+ * header never re-renders on its own between polls. */
+function useFreshnessLabel(state: StateResponse): string {
+  const [updatedAtMs, setUpdatedAtMs] = useState(() => Date.now());
+  useEffect(() => {
+    setUpdatedAtMs(Date.now());
+  }, [state]);
+
+  const hasLive = state.live !== undefined;
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!hasLive) return;
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [hasLive]);
+
+  const seconds = Math.max(0, Math.round((nowMs - updatedAtMs) / 1000));
+  return `live · updated ${seconds}s ago`;
 }
 
 export function SystemView({ state, incidents }: { state: StateResponse; incidents: IncidentView[] }) {
   const scanning = isScanning(state.worldStatus, incidents);
   const latestMinuteTs = latestMinuteFromSparklines(state.sparklines);
   const [viewMode, setViewMode] = useState<TopologyViewMode>(initialViewMode);
+  const freshnessLabel = useFreshnessLabel(state);
 
   function changeViewMode(mode: TopologyViewMode) {
     setViewMode(mode);
@@ -349,7 +418,10 @@ export function SystemView({ state, incidents }: { state: StateResponse; inciden
     <section className="flex flex-col gap-4 rounded-2xl border border-hairline bg-panel/40 p-5">
       <header className="flex items-center justify-between gap-3">
         <h2 className="font-display text-lg font-semibold tracking-tight text-ink">System</h2>
-        <OpsHealthNote opsHealth={state.opsHealth} />
+        <div className="flex items-center gap-3">
+          {state.live !== undefined && <span className="font-mono text-[10px] text-ink-faint">{freshnessLabel}</span>}
+          <OpsHealthNote opsHealth={state.opsHealth} />
+        </div>
       </header>
 
       {scanning && <ScanningIndicator worldStatus={state.worldStatus} />}

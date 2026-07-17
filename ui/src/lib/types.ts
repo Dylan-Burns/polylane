@@ -61,12 +61,22 @@ export interface OpsHealth {
   retentionWatermarkAgeMs?: number;
 }
 
+/** The open (not-yet-closed) minute's accumulated per-service stats — mirrors
+ * `src/sim/simulator-do.ts`'s `handleStatus` live aggregation. Omitted when the world isn't
+ * running. See `docs/plans/2026-07-17-cf-native-revamp.md` Canonical Table 7. */
+export interface LiveMetrics {
+  minuteTs: number;
+  elapsedMs: number;
+  services: Record<string, { count: number; errPct: number; p95: number }>;
+}
+
 export interface StateResponse {
   topology: TopologyPayload;
   health: Record<string, HealthStatus>;
   sparklines: Record<string, SparklinePoint[]>;
   worldStatus: WorldStatusView;
   opsHealth: OpsHealth;
+  live?: LiveMetrics;
 }
 
 // --- /api/incidents/:id (mirrors src/telemetry/read.ts's StepView + src/api/routes.ts's

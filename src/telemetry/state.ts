@@ -32,7 +32,7 @@ import { breachesSustainedThreshold } from "../detect/rules";
 import { LAST_SWEEP_OK_META_KEY } from "../detect/sweep";
 import { MINUTE_MS } from "../sim/backfill";
 import type { FaultState } from "../sim/scenarios";
-import type { WorldStatus } from "../sim/simulator-do";
+import type { LiveMetrics, WorldStatus } from "../sim/simulator-do";
 import { EXTERNAL_SERVICE, FLOWS, SERVICES, SERVICE_KIND, type ServiceKind, type Step } from "../sim/topology";
 import { latestRollupMinute, queryMetrics } from "./read";
 import { RETENTION_WATERMARK_META_KEY } from "./retention";
@@ -465,6 +465,12 @@ export interface WorldStatusView {
   fault: FaultState;
   generation: number;
   seedProgress?: number;
+  /** Table 7's near-real-time point: a per-service aggregate of the still-open minute, absent
+   * whenever the world isn't running or that minute has no traffic yet (`SimulatorDO`'s
+   * `buildLiveMetrics`). Passed through verbatim here (like every other field on this view) and
+   * also surfaced at the top level as `StateResponse.live` — see `src/api/routes.ts`'s `/state`
+   * handler. */
+  live?: LiveMetrics;
 }
 
 /** The full `GET /api/state` response shape (spec §10) — exported so `src/api/routes.ts`'s handler
@@ -476,4 +482,8 @@ export interface StateResponse {
   sparklines: Record<string, SparklinePoint[]>;
   worldStatus: WorldStatusView;
   opsHealth: OpsHealth;
+  /** Table 7: mirrors `worldStatus.live` at the top level (the shape the UI's sparkline actually
+   * reads) — omitted (`undefined`, dropped by `JSON.stringify`) under the same conditions as
+   * `WorldStatusView.live`. */
+  live?: LiveMetrics;
 }

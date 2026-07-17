@@ -271,6 +271,9 @@ routes.get("/state", async (c) => {
     sparklines,
     worldStatus: world ?? FALLBACK_WORLD_STATUS,
     opsHealth,
+    // Table 7: mirrors `worldStatus.live` at the top level; `world?.live` is already `undefined`
+    // whenever SimulatorDO omitted it (not running / empty open minute) or the DO was unreachable.
+    live: world?.live,
   };
   return c.json(body);
 });

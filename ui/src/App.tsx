@@ -18,6 +18,9 @@ import { IncidentsPanel } from "./panels/Incidents";
 import { SystemView, WorldStatusBanner } from "./panels/System";
 
 const STATE_POLL_MS = 5000;
+/** Faster while the Systems view is up so the live-metrics point (Canonical Table 7) reads as
+ * near-real-time; other views don't render it, so the extra request isn't worth the cost there. */
+const STATE_POLL_MS_SYSTEMS = 3000;
 const INCIDENTS_POLL_MS = 10_000;
 
 type Theme = "light" | "dark";
@@ -106,7 +109,8 @@ function Shell() {
   // the results, and a chat turn is already competing for the same worker. `usePoll` re-fetches
   // immediately when the interval flips back on. The five non-chat views all consume these two
   // polls (directly or via the badge), so they poll whenever any of them is up.
-  const state = usePoll(getState, onChat ? null : STATE_POLL_MS);
+  const statePollMs = view === "systems" ? STATE_POLL_MS_SYSTEMS : STATE_POLL_MS;
+  const state = usePoll(getState, onChat ? null : statePollMs);
   const incidentsPoll = usePoll(getIncidents, onChat ? null : INCIDENTS_POLL_MS);
   const incidents = incidentsPoll.data?.incidents ?? [];
   const liveIncidents = incidents.filter((i) => LIVE_INCIDENT_STATUSES.has(i.status)).length;

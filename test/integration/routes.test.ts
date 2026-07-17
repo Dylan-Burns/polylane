@@ -60,6 +60,51 @@ describe("GET /api/state", () => {
     const body = (await res.json()) as { worldStatus: { worldStatus: string } };
     expect(body.worldStatus.worldStatus).toBe("unseeded");
   });
+
+  it("surfaces `live` (Table 7) at the top level, aggregated from SimulatorDO's open-minute partialMinute, while running", async () => {
+    const simStub = env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
+    const minuteTs = 1_700_000_000_000;
+    await runInDurableObject(simStub, async (instance, state) => {
+      await state.storage.put("worldStatus", "running");
+      await state.storage.put("generation", 1);
+      await state.storage.put("partialMinute", {
+        minuteTs,
+        stats: [
+          { service: "payments-api", operation: "charge", duration_ms: 100, isError: false },
+          { service: "payments-api", operation: "charge", duration_ms: 300, isError: true },
+        ],
+      });
+      instance.setTestNow(minuteTs + 8_000);
+    });
+
+    const res = await SELF.fetch("https://example.com/api/state");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      worldStatus: { worldStatus: string };
+      live?: { minuteTs: number; elapsedMs: number; services: Record<string, { count: number; errPct: number; p95: number }> };
+    };
+
+    expect(body.worldStatus.worldStatus).toBe("running");
+    expect(body.live).toEqual({
+      minuteTs,
+      elapsedMs: 8_000,
+      services: { "payments-api": { count: 2, errPct: 50, p95: 300 } },
+    });
+  });
+
+  it("omits `live` entirely when the world isn't running (no phantom point on a fresh/seeding world)", async () => {
+    const simStub = env.SIMULATOR.get(env.SIMULATOR.idFromName("world"));
+    await runInDurableObject(simStub, async (_instance, state) => {
+      await state.storage.put("worldStatus", "seeding");
+      await state.storage.put("generation", 1);
+      await state.storage.delete("partialMinute");
+    });
+
+    const res = await SELF.fetch("https://example.com/api/state");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { live?: unknown };
+    expect(body.live).toBeUndefined();
+  });
 });
 
 describe("GET /api/incidents", () => {
